@@ -9,25 +9,18 @@
 
     <div v-if="currentStep === 0" class="step-content">
       <h2>欢迎使用 TSMusicBot</h2>
-      <p class="subtitle">请设置管理员密码以保护你的 WebUI</p>
-      <div class="form-group">
-        <label>管理员密码</label>
-        <input type="password" v-model="adminPassword" placeholder="设置密码" class="input" />
-      </div>
-      <div class="form-group">
-        <label>语言</label>
-        <select v-model="locale" class="input">
-          <option value="zh">中文</option>
-          <option value="en">English</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label>主题</label>
-        <select v-model="theme" class="input">
-          <option value="dark">深色</option>
-          <option value="light">浅色</option>
-        </select>
-      </div>
+      <!--
+        This step used to collect an "管理员密码" plus language/theme and then
+        throw all three away: nothing called /api/session/setup and no API
+        received the password, so a user could believe the WebUI was protected
+        when it was not. Account creation lives in the first-run flow
+        (/first-run), which the router guard already forces whenever no account
+        exists yet. This screen is now purely informational.
+      -->
+      <p class="subtitle">
+        WebUI 账号在首次运行时创建（见「首次配置」）。若你已经初始化过，请直接登录；
+        这里只负责配置机器人连接的音乐源。
+      </p>
       <button class="btn-primary" @click="currentStep = 1">下一步</button>
     </div>
 
@@ -121,9 +114,6 @@ import axios from 'axios';
 const currentStep = ref(0);
 const stepLabels = ['欢迎', 'TS 服务器', 'Jellyfin', '完成'];
 
-const adminPassword = ref('');
-const locale = ref('zh');
-const theme = ref('dark');
 const serverAddress = ref('');
 const serverPort = ref(9987);
 const nickname = ref('MusicBot');

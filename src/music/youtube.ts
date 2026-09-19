@@ -66,6 +66,25 @@ async function checkYtDlpAvailable(): Promise<boolean> {
   return pendingCheck;
 }
 
+const YOUTUBE_HOSTS = new Set([
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "music.youtube.com",
+  "youtu.be",
+]);
+
+/** True only for an http(s) URL whose host is a known YouTube domain. */
+export function isYouTubeUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+    return YOUTUBE_HOSTS.has(u.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
 /** Force re-detection on the next call (for tests). */
 export function resetYtDlpAvailabilityCache(): void {
   cachedAvailable = false;
@@ -193,9 +212,20 @@ export class YouTubeProvider implements MusicProvider {
 
   async getPlaylistSongs(playlistId: string): Promise<Song[]> {
     try {
-      const url = playlistId.startsWith("http")
-        ? playlistId
-        : `https://www.youtube.com/playlist?list=${playlistId}`;
+      // SSRF guard: a raw "http…" id used to be handed to yt-dlp verbatim, so a
+      // caller could make the host fetch http://127.0.0.1:<port>/, link-local
+      // metadata endpoints, or file:// paths. Accept a URL only when it points
+      // at a YouTube host; otherwise treat the value as a bare playlist id.
+      let url: string;
+      if (playlistId.startsWith("http")) {
+        const allowed = isYouTubeUrl(playlistId);
+        if (!allowed) {
+          return [];
+        }
+        url = playlistId;
+      } else {
+        url = `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`;
+      }
       const raw = await runYtDlp([
         url,
         "--dump-json",

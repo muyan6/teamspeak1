@@ -37,6 +37,7 @@ export class BiliBiliProvider implements MusicProvider {
   private cidCache = new Map<string, number>();
   private buvidCookie = ""; // anonymous session cookie (buvid3) for anti-412
   private buvidInitialized = false;
+  private buvidInFlight: Promise<void> | null = null;
   private wbiMixinKey = "";
   private wbiKeyFetchedAt = 0;
 
@@ -56,20 +57,33 @@ export class BiliBiliProvider implements MusicProvider {
   /** Fetch buvid3 via SPI API (required by search API to avoid 412) */
   private async ensureBuvidCookie(): Promise<void> {
     if (this.buvidInitialized) return;
-    this.buvidInitialized = true;
-    try {
-      const res = await axios.get(
-        "https://api.bilibili.com/x/frontend/finger/spi",
-        { headers: BILIBILI_HEADERS, timeout: 10000 }
-      );
-      const b3 = res.data?.data?.b_3;
-      const b4 = res.data?.data?.b_4;
-      if (b3) {
-        this.buvidCookie = `buvid3=${b3}; buvid4=${b4 ?? ""}`;
-      }
-    } catch {
-      // If it fails, continue without — view/playurl APIs work without buvid
+    // Deduplicate concurrent callers on the in-flight promise, but only latch
+    // `buvidInitialized` once the cookie is actually in hand. Setting the flag
+    // up-front meant a single transient timeout disabled buvid3 for the whole
+    // process lifetime, so every later search() hit the 412 anti-bot path with
+    // no way to recover.
+    if (!this.buvidInFlight) {
+      this.buvidInFlight = (async () => {
+        try {
+          const res = await axios.get(
+            "https://api.bilibili.com/x/frontend/finger/spi",
+            { headers: BILIBILI_HEADERS, timeout: 10000 }
+          );
+          const b3 = res.data?.data?.b_3;
+          const b4 = res.data?.data?.b_4;
+          if (b3) {
+            this.buvidCookie = `buvid3=${b3}; buvid4=${b4 ?? ""}`;
+            this.buvidInitialized = true;
+          }
+        } catch {
+          // If it fails, continue without — view/playurl APIs work without
+          // buvid. The next search retries (the flag stays false).
+        } finally {
+          this.buvidInFlight = null;
+        }
+      })();
     }
+    await this.buvidInFlight;
   }
 
   private get cookieHeaders(): Record<string, string> {

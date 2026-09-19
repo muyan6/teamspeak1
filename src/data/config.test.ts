@@ -229,6 +229,7 @@ describe("config", () => {
       bilibili: "high",
       kugou: "128",
       jellyfin: "direct",
+      spotify: "320",
     });
   });
 
@@ -250,6 +251,7 @@ describe("config", () => {
       bilibili: "high",
       kugou: "flac",
       jellyfin: "320",
+      spotify: "160",
     };
     saveConfig(path, config);
     const loaded = loadConfig(path);
@@ -271,6 +273,7 @@ describe("config", () => {
       bilibili: "high", // non-string → default
       kugou: "128", // missing → default
       jellyfin: "192",
+      spotify: "320", // missing → default
     });
   });
 
@@ -533,7 +536,7 @@ describe("saveConfig atomic write", () => {
   it("round-trips (save then load equals) and leaves NO .tmp file behind", () => {
     const dir = makeTmpDir();
     const path = join(dir, "config.json");
-    const config = { ...getDefaultConfig(), webPort: 4567, adminPassword: "pw" };
+    const config = { ...getDefaultConfig(), webPort: 4567, theme: "light" as const };
 
     saveConfig(path, config);
 
@@ -558,13 +561,13 @@ describe("saveConfig atomic write", () => {
   it("does not corrupt a pre-existing valid config when saving over it", () => {
     const dir = makeTmpDir();
     const path = join(dir, "config.json");
-    saveConfig(path, { ...getDefaultConfig(), adminPassword: "first", webPort: 1234 });
+    saveConfig(path, { ...getDefaultConfig(), theme: "light" as const, webPort: 1234 });
 
     // Overwrite with a different, fully-formed config.
-    saveConfig(path, { ...getDefaultConfig(), adminPassword: "second", webPort: 9999 });
+    saveConfig(path, { ...getDefaultConfig(), theme: "dark" as const, webPort: 9999 });
 
     const loaded = loadConfig(path);
-    expect(loaded.adminPassword).toBe("second");
+    expect(loaded.theme).toBe("dark");
     expect(loaded.webPort).toBe(9999);
     // The on-disk file is a single complete JSON document (no partial/truncated write).
     expect(() => JSON.parse(readFileSync(path, "utf-8"))).not.toThrow();
@@ -611,7 +614,7 @@ describe("loadConfig error handling", () => {
     const path = join(dir, "config.json");
     // A REAL config exists on disk; a transient lock must NOT collapse to defaults
     // (the caller would otherwise overwrite this real config with defaults).
-    saveConfig(path, { ...getDefaultConfig(), adminPassword: "keep-me" });
+    saveConfig(path, { ...getDefaultConfig(), theme: "light" as const });
     vi.mocked(readFileSync).mockImplementationOnce(() => {
       const err = new Error("EBUSY: resource busy or locked") as NodeJS.ErrnoException;
       err.code = "EBUSY";
@@ -620,7 +623,7 @@ describe("loadConfig error handling", () => {
 
     expect(() => loadConfig(path)).toThrow(/EBUSY/);
     // The on-disk config is untouched and still readable once the lock clears.
-    expect(loadConfig(path).adminPassword).toBe("keep-me");
+    expect(loadConfig(path).theme).toBe("light");
   });
 
   it("(c) corrupt JSON returns defaults AND backs up the original to *.corrupt-*", () => {

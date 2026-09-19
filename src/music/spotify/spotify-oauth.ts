@@ -149,6 +149,33 @@ export class SpotifyOAuth {
   // Collapse concurrent refreshes into one POST (rotation invalidates the token
   // a second in-flight refresh would send); cleared in .finally().
   private refreshInFlight: Promise<string | null> | null = null;
+  /**
+   * In-memory mirror of the token file. `undefined` means "not read yet".
+   *
+   * The store's load() is existsSync + readFileSync + JSON.parse, all SYNCHRONOUS,
+   * and isAuthorized() is on the /api/spotify/status path plus every
+   * ensureStarted(). Caching it keeps those off the disk. Every write goes
+   * through this class (save/clear below), which updates the mirror in the same
+   * statement, so the cache cannot drift from the file.
+   */
+  private cachedTokens: OAuthTokens | null | undefined = undefined;
+
+  private loadTokens(): OAuthTokens | null {
+    if (this.cachedTokens === undefined) {
+      this.cachedTokens = this.store.load();
+    }
+    return this.cachedTokens;
+  }
+
+  private persistTokens(t: OAuthTokens): void {
+    this.store.save(t);
+    this.cachedTokens = t;
+  }
+
+  private dropTokens(): void {
+    this.store.clear();
+    this.cachedTokens = null;
+  }
 
   constructor(o: SpotifyOAuthOptions) {
     this.clientId = o.clientId ?? "";
@@ -190,13 +217,20 @@ export class SpotifyOAuth {
 
   isAuthorized(): boolean {
     // C3.2: no client_id means we could never refresh, so treat as unauthorized.
-    return !!this.clientId && !!this.store.load()?.refreshToken;
+    return !!this.clientId && !!this.loadTokens()?.refreshToken;
   }
 
   buildAuthorizeUrl(): { url: string; state: string } {
     if (!this.clientId) {
       // C3.2: cannot start OAuth against nobody's app.
       throw new Error("Set your Spotify Client ID in settings first");
+    }
+    // An empty redirect_uri reaches Spotify as `redirect_uri=` and the user sees
+    // an opaque Spotify error page instead of an actionable message.
+    if (!/^https?:\/\/.+/i.test(this.redirectUri ?? "")) {
+      throw new Error(
+        "Spotify redirect URI is not configured (set publicUrl so the callback URL can be derived)",
+      );
     }
     const state = randomBytes(16).toString("hex");
     const verifier = generateCodeVerifier();
@@ -239,7 +273,7 @@ export class SpotifyOAuth {
         headers: FORM_HEADERS,
       });
       if (!data?.access_token || !data?.refresh_token) return false;
-      this.store.save(this.toTokens(data, data.refresh_token, data.scope));
+      this.persistTokens(this.toTokens(data, data.refresh_token, data.scope));
       return true;
     } catch {
       return false;
@@ -250,7 +284,7 @@ export class SpotifyOAuth {
 
   async getAccessToken(): Promise<string | null> {
     if (!this.clientId) return null; // C3.2: no app => nothing to mint against
-    const tokens = this.store.load();
+    const tokens = this.loadTokens();
     if (!tokens?.refreshToken) return null; // unauthorized
     if (tokens.accessToken && this.now() < tokens.expiresAt) {
       return tokens.accessToken;
@@ -278,11 +312,11 @@ export class SpotifyOAuth {
       // PKCE rotates the refresh token; fall back to the current one if omitted.
       const rotated = data.refresh_token || current.refreshToken;
       const saved = this.toTokens(data, rotated, data.scope ?? current.scope);
-      this.store.save(saved);
+      this.persistTokens(saved);
       return saved.accessToken;
     } catch (err: any) {
       // invalid_grant => refresh token revoked/expired: discard, force re-login.
-      if (err?.response?.data?.error === "invalid_grant") this.store.clear();
+      if (err?.response?.data?.error === "invalid_grant") this.dropTokens();
       return null;
     }
   }

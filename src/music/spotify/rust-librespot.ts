@@ -293,9 +293,14 @@ export class RustLibrespotBackend extends EventEmitter implements SpotifyAudioBa
     this.pollTimer = setInterval(() => {
       if (generation !== this.pollGeneration || this.pollInFlight) return;
       this.pollInFlight = true;
-      void this.pollState(generation).finally(() => {
-        this.pollInFlight = false;
-      });
+      // pollState emits "trackEnded"/"metadata"; a throwing listener would
+      // reject it, and .finally() re-propagates — i.e. an unhandled rejection
+      // that can kill the process. Swallow + log instead.
+      void this.pollState(generation)
+        .catch((err) => this.log.error({ err }, "librespot pollState failed"))
+        .finally(() => {
+          this.pollInFlight = false;
+        });
     }, interval);
     // Don't keep the event loop / test process alive on account of the poll timer.
     this.pollTimer.unref?.();

@@ -52,6 +52,7 @@ export interface AudioQualityConfig {
   bilibili: string;
   kugou: string;
   jellyfin: string;
+  spotify: string;
 }
 
 export interface VoiceDuckingConfig {
@@ -74,6 +75,23 @@ export const GATEABLE_PROVIDERS = [
   "kugou",
 ] as const;
 export type GateableProvider = (typeof GATEABLE_PROVIDERS)[number];
+
+/**
+ * Build the Spotify OAuth redirect URI for this deployment.
+ *
+ * MUST be byte-identical to the URI registered in the Spotify developer
+ * dashboard, so it honours `publicUrl` (the operator-configured external base
+ * URL used behind a reverse proxy / non-default port) and only falls back to
+ * the loopback form when no public URL is set. Returns `undefined` when no
+ * Client ID is configured — `SpotifyOAuth.configure(id, undefined)` disables
+ * OAuth rather than registering a redirect nobody can reach.
+ */
+export function spotifyRedirectUri(config: BotConfig): string | undefined {
+  const clientId = (config.spotify.clientId ?? "").trim();
+  if (!clientId) return undefined;
+  const base = (config.publicUrl ?? "").trim().replace(/\/+$/, "");
+  return `${base || `http://127.0.0.1:${config.webPort}`}/api/spotify/callback`;
+}
 
 /** Whether a platform may be used for search/playback under the current config. */
 export function isProviderEnabled(config: BotConfig, platform: string): boolean {
@@ -115,9 +133,7 @@ export interface BotConfig {
   commandAliases: Record<string, string>;
   neteaseApiPort: number;
   qqMusicApiPort: number;
-  adminPassword: string;
   adminGroups: number[];
-  autoReturnDelay: number;
   autoPauseOnEmpty: boolean;
   /** Lower music volume while voice from another client is being received. */
   voiceDucking: VoiceDuckingConfig;
@@ -191,9 +207,7 @@ export function getDefaultConfig(): BotConfig {
     commandAliases: { p: "play", s: "skip", n: "next" },
     neteaseApiPort: 3001,
     qqMusicApiPort: 3200,
-    adminPassword: "",
     adminGroups: [],
-    autoReturnDelay: 300,
     // Default OFF: occupancy detection relies on the full-client `clientlist`
     // command, which is unreliable on some servers (it can time out when other
     // clients are present). Users can opt in from the web UI.
@@ -249,6 +263,7 @@ export function getDefaultConfig(): BotConfig {
       bilibili: "high",
       kugou: "128",
       jellyfin: "direct",
+      spotify: "320",
     },
     enabledProviders: ["netease", "qq", "bilibili", "youtube", "kugou"],
     defaultPlatform: null,
@@ -280,7 +295,7 @@ export function loadConfig(path: string): BotConfig {
 
   // Distinguish the three failure modes so a *real* on-disk config is NEVER
   // silently replaced with defaults (the caller saveConfig()s right after load,
-  // which would otherwise erase spotify creds / adminPassword / adminGroups /
+  // which would otherwise erase spotify creds / adminGroups /
   // guestMode permanently):
   //   (a) file ABSENT (ENOENT) — normal first run → defaults.
   //   (b) any OTHER read error (EBUSY/EACCES/EPERM/EISDIR/…) on an existing file —
@@ -461,6 +476,7 @@ export function loadConfig(path: string): BotConfig {
       bilibili: coerceQuality(partialAq.bilibili, defaults.audioQuality.bilibili),
       kugou: coerceQuality(partialAq.kugou, defaults.audioQuality.kugou),
       jellyfin: coerceQuality(partialAq.jellyfin, defaults.audioQuality.jellyfin),
+      spotify: coerceQuality(partialAq.spotify, defaults.audioQuality.spotify),
     };
 
     const loudnessNormalization =
@@ -508,13 +524,7 @@ export function loadConfig(path: string): BotConfig {
         partial.qqMusicApiPort <= 65535
           ? partial.qqMusicApiPort
           : defaults.qqMusicApiPort,
-      adminPassword:
-        typeof partial.adminPassword === "string" ? partial.adminPassword : defaults.adminPassword,
       adminGroups,
-      autoReturnDelay:
-        typeof partial.autoReturnDelay === "number" && partial.autoReturnDelay >= 0
-          ? partial.autoReturnDelay
-          : defaults.autoReturnDelay,
       autoPauseOnEmpty:
         typeof partial.autoPauseOnEmpty === "boolean"
           ? partial.autoPauseOnEmpty

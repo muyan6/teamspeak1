@@ -6,6 +6,28 @@ import type { Logger } from "../../logger.js";
 import type { BotConfig, JellyfinConfig } from "../../data/config.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
+import { requireAdmin } from "../middleware/requireAdmin.js";
+
+/**
+ * True only for an http(s) URL. The "test connection" probe issues an
+ * authenticated request, so a `file:` / `gopher:` / other scheme must never
+ * reach the provider.
+ *
+ * Note there is deliberately NO private-range block here: a self-hosted
+ * Jellyfin normally lives on a LAN address, and the operator configuring that
+ * is the intended use. The containment for the grantable `platform.auth`
+ * capability is that a NON-admin may only re-test the URL the operator already
+ * saved (see the route below) — so no request-supplied host is ever fetched
+ * with anything less than admin authority.
+ */
+export function isHttpUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 export function createAuthRouter(
   neteaseProvider: MusicProvider,
@@ -45,7 +67,9 @@ export function createAuthRouter(
     }
   });
 
-  router.post("/qrcode", requirePermission("platform.auth"), async (req, res) => {
+  // Starting a QR login ultimately persists a credential (see /qrcode/status),
+  // so it carries the same admin gate as POST /cookie.
+  router.post("/qrcode", requireAdmin, async (req, res) => {
     try {
       const { platform } = req.body;
       const provider = getProvider(platform);
@@ -109,8 +133,36 @@ export function createAuthRouter(
       const stored = config?.jellyfin;
       const str = (v: unknown, fallback: string) =>
         typeof v === "string" && v.trim() !== "" ? v.trim() : fallback;
+
+      // SSRF containment: an admin may point the probe anywhere (self-hosted
+      // Jellyfin normally lives on a private address). A non-admin holding the
+      // grantable `platform.auth` capability may only re-test the URL the
+      // OPERATOR already saved — otherwise they could aim this authenticated
+      // request at loopback / link-local / any intranet host and read the
+      // upstream ServerName/Version/error back out of the response.
+      const isAdmin = req.user?.role === "admin";
+      let serverUrl = str(body.serverUrl, stored?.serverUrl ?? "");
+      if (!isAdmin) {
+        const requestedUrl = str(body.serverUrl, "");
+        const storedUrl = stored?.serverUrl ?? "";
+        if (requestedUrl && requestedUrl !== storedUrl) {
+          res.status(403).json({ error: "admin required to test a new server URL" });
+          return;
+        }
+        serverUrl = storedUrl;
+        if (!serverUrl) {
+          res.status(400).json({ error: "no stored Jellyfin server URL to test" });
+          return;
+        }
+      } else if (!isHttpUrl(serverUrl)) {
+        // An admin can still typo their way into a non-http scheme; that is a
+        // configuration error rather than an attack, so answer 400 plainly.
+        res.status(400).json({ error: "serverUrl must be an http(s) URL" });
+        return;
+      }
+
       const candidate: JellyfinConfig = {
-        serverUrl: str(body.serverUrl, stored?.serverUrl ?? ""),
+        serverUrl,
         authMode:
           body.authMode === "apikey" || body.authMode === "userpass"
             ? body.authMode
@@ -168,7 +220,10 @@ export function createAuthRouter(
     }
   });
 
-  router.post("/cookie", requirePermission("platform.auth"), (req, res) => {
+  // Credential WRITE. Admin-only: this replaces the process-wide music account
+  // cookie that every user of the bot plays through, so a mere `platform.auth`
+  // grant was enough to hijack the operator's logged-in account.
+  router.post("/cookie", requireAdmin, (req, res) => {
     const { platform, cookie } = req.body;
     if (!cookie) {
       res.status(400).json({ error: "cookie is required" });

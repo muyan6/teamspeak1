@@ -101,6 +101,21 @@ export type GoLibrespotEventType =
   | "volume"
   | "playback_ready";
 
+/** Runtime allow-list matching GoLibrespotEventType — see handleMessage(). */
+const GO_LIBRESPOT_EVENT_TYPES: ReadonlySet<string> = new Set<GoLibrespotEventType>([
+  "metadata",
+  "playing",
+  "paused",
+  "not_playing",
+  "stopped",
+  "will_play",
+  "seek",
+  "active",
+  "inactive",
+  "volume",
+  "playback_ready",
+]);
+
 interface WsLike {
   on(event: string, cb: (...args: any[]) => void): void;
   close(): void;
@@ -218,8 +233,16 @@ export class GoLibrespotEventClient extends EventEmitter {
     } catch {
       return;
     }
-    if (parsed && typeof (parsed as any).type === "string") {
-      this.emit((parsed as any).type, (parsed as any).data ?? {});
+    // Only forward event names we actually model. `type` arrives from the
+    // sidecar's socket, so emitting it verbatim let a buggy/compromised
+    // backend raise arbitrary events — including "error" or EventEmitter's own
+    // "newListener"/"removeListener" meta events.
+    if (parsed && typeof (parsed as { type?: unknown }).type === "string") {
+      const type = (parsed as { type: string }).type;
+      if (!GO_LIBRESPOT_EVENT_TYPES.has(type)) {
+        return;
+      }
+      this.emit(type, (parsed as { data?: unknown }).data ?? {});
     }
   }
 
@@ -231,5 +254,8 @@ export class GoLibrespotEventClient extends EventEmitter {
       this.reconnectTimer = null;
       this.connect();
     }, delay);
+    // Without unref the reconnect timer keeps the event loop alive after the
+    // rest of the process has shut down, delaying exit until stop() runs.
+    (this.reconnectTimer as { unref?: () => void }).unref?.();
   }
 }

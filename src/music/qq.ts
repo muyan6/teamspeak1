@@ -391,26 +391,46 @@ export class QQMusicProvider implements MusicProvider {
     if (songIds.length === 0) return new Set();
 
     const CHUNK = 100;          // ~14 chars/mid * 100 + commas ≈ 1.5KB
+    // The chunks are independent upstream calls, but they used to be awaited
+    // strictly one after another: a 500-track playlist spent 5 × ~2-3s of dead
+    // time (~10-15s) before playback could start. Run a few at a time instead.
+    // 3 keeps the burst modest for the sidecar while cutting the wall time to
+    // roughly a third. Chunk-level failures keep their existing semantics
+    // (skip that chunk; only "every chunk failed" reports null).
+    const CONCURRENCY = 3;
+    const slices: string[][] = [];
+    for (let i = 0; i < songIds.length; i += CHUNK) {
+      slices.push(songIds.slice(i, i + CHUNK));
+    }
+
     const playable = new Set<string>();
     let allChunksFailed = true;
-    for (let i = 0; i < songIds.length; i += CHUNK) {
-      const slice = songIds.slice(i, i + CHUNK);
-      try {
-        const res = await this.api.get("/getMusicPlay", {
-          params: { songmid: slice.join(","), quality: this.quality, ...this.cookieParams },
-        });
-        const playUrlMap: Record<string, { url?: string }> | undefined =
-          res.data?.data?.playUrl;
-        if (!playUrlMap) continue; // chunk-level failure, try next
-        allChunksFailed = false;
-        for (const [mid, info] of Object.entries(playUrlMap)) {
-          if (info?.url) playable.add(mid);
+    // Shared cursor: JS is single-threaded and there is no await between reading
+    // and incrementing `next`, so workers never claim the same slice.
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < slices.length) {
+        const slice = slices[next++];
+        try {
+          const res = await this.api.get("/getMusicPlay", {
+            params: { songmid: slice.join(","), quality: this.quality, ...this.cookieParams },
+          });
+          const playUrlMap: Record<string, { url?: string }> | undefined =
+            res.data?.data?.playUrl;
+          if (!playUrlMap) continue; // chunk-level failure, try next
+          allChunksFailed = false;
+          for (const [mid, info] of Object.entries(playUrlMap)) {
+            if (info?.url) playable.add(mid);
+          }
+        } catch {
+          // chunk-level failure — keep going so a transient error on one
+          // chunk doesn't poison the whole batch.
         }
-      } catch {
-        // chunk-level failure — keep going so a transient error on one
-        // chunk doesn't poison the whole batch.
       }
-    }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, slices.length) }, () => worker()),
+    );
     return allChunksFailed ? null : playable;
   }
 

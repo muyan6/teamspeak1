@@ -1,12 +1,22 @@
 import { ref, onUnmounted } from 'vue';
 import { usePlayerStore } from '../stores/player.js';
+import { devLog, devWarn } from '../utils/log.js';
 
 export function useWebSocket() {
   const connected = ref(false);
   let ws: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Set by disconnect(). Without it, closing the socket fires onclose, whose
+  // handler re-arms the 3s reconnect — so a deliberate teardown (route change /
+  // unmount) silently resurrected the connection and leaked a socket + timer.
+  let disposed = false;
 
   function connect() {
+    if (disposed) return;
+    // Never leave a previous socket open: a second connect() (e.g. a manual
+    // retry) used to overwrite `ws` while the old one stayed subscribed.
+    if (ws && ws.readyState !== WebSocket.CLOSED) return;
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws`;
 
@@ -14,11 +24,20 @@ export function useWebSocket() {
 
     ws.onopen = () => {
       connected.value = true;
-      console.log('WebSocket connected');
+      devLog('WebSocket connected');
     };
 
     ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+      // A malformed/unexpected frame must not abort the handler mid-switch.
+      // The payload shape is server-defined and consumed field-by-field below,
+      // so keep the existing untyped access the rest of the handler relies on.
+      let data: any;
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        devWarn('Ignoring non-JSON WebSocket frame');
+        return;
+      }
       const store = usePlayerStore();
 
       switch (data.type) {
@@ -68,7 +87,10 @@ export function useWebSocket() {
 
     ws.onclose = () => {
       connected.value = false;
+      ws = null;
+      if (disposed) return;
       // Reconnect after 3 seconds
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(connect, 3000);
     };
 
@@ -78,8 +100,14 @@ export function useWebSocket() {
   }
 
   function disconnect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
+    disposed = true;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     ws?.close();
+    ws = null;
+    connected.value = false;
   }
 
   onUnmounted(disconnect);

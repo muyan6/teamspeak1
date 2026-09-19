@@ -37,10 +37,15 @@ export class LRUCache<K, V> {
     if (this.map.has(key)) {
       this.map.delete(key);
     } else if (this.map.size >= this.maxSize) {
-      // Evict oldest (first key in map iteration order)
-      const oldestKey = this.map.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.map.delete(oldestKey);
+      // Reclaim expired entries FIRST: without this the map can sit at maxSize
+      // full of stale entries while evicting live values (get() only removes an
+      // expired entry when that exact key is read again). If nothing was
+      // expired, fall back to evicting the oldest (first key in iteration order).
+      if (this.pruneExpired() === 0) {
+        const oldestKey = this.map.keys().next().value;
+        if (oldestKey !== undefined) {
+          this.map.delete(oldestKey);
+        }
       }
     }
 

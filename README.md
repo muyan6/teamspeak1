@@ -246,7 +246,7 @@ sqlite3 data/tsmusicbot.db "UPDATE users SET passwordHash='<paste-hash-here>' WH
 
 **反向代理用户特别注意**：如果通过 nginx / Caddy / Cloudflare 暴露 WebUI，**必须**在 `config.json` 中设置 `"trustProxy": true`，否则 Cookie 不会带 `Secure` 标志，且登录限流会把所有用户合并到同一个桶。详见下方 [反向代理部署注意事项](#反向代理部署注意事项)。
 
-**`config.adminGroups`（现已启用）**：用于限制管理类聊天命令（`stop`/`clear`/`remove`/`move`/`vol`/`mode`）只能由指定 TeamSpeak 服务器组的成员运行；为空时不做任何限制（向后兼容）。详见 [TeamSpeak 命令权限](#teamspeak-命令权限管理类命令限制)。`config.adminPassword` 则是旧版预留字段，当前版本未使用，保留以兼容旧 `config.json`，可以放心忽略。
+**`config.adminGroups`**：用于限制管理类聊天命令（`stop`/`clear`/`remove`/`move`/`vol`/`mode`）只能由指定 TeamSpeak 服务器组的成员运行；为空时不做任何限制（向后兼容）。详见 [TeamSpeak 命令权限](#teamspeak-命令权限管理类命令限制)。WebUI 登录使用数据库用户账号（首次访问时创建），`config.json` 里不需要也不存在密码字段——旧版本遗留的 `adminPassword` 会被忽略。
 
 ### Windows 用户
 
@@ -770,9 +770,7 @@ OAuth 相关端点：`/api/spotify/login`、`/api/spotify/callback`、`/api/spot
   "commandAliases": { "p": "play", "s": "skip", "n": "next" },
   "neteaseApiPort": 3001,
   "qqMusicApiPort": 3200,
-  "adminPassword": "",
   "adminGroups": [],
-  "autoReturnDelay": 300,
   "autoPauseOnEmpty": false,
   "idleTimeoutMinutes": 0,
   "publicUrl": "",
@@ -782,7 +780,7 @@ OAuth 相关端点：`/api/spotify/login`、`/api/spotify/callback`、`/api/spot
 
 > **配置文件位置变更**：旧版本把 `config.json` 写在项目根目录（不在 Docker 挂载卷内，导致重启丢失、手动编辑不生效）。现在统一放在 `data/config.json`。升级时若检测到根目录存在旧的 `config.json`，会在首次启动时自动迁移到 `data/` 并保留你的设置，无需手动操作。
 
-> **关于 `adminPassword` 和 `adminGroups`**：`adminGroups` 现已启用，用于限制管理类聊天命令只能由指定 TeamSpeak 服务器组运行（为空 = 不限制），详见 [TeamSpeak 命令权限](#teamspeak-命令权限管理类命令限制)。`adminPassword` 仍为旧版预留字段、当前版本未使用——WebUI 鉴权改为基于数据库的用户账号系统（见 [首次配置](#首次配置)），无需在 `config.json` 中设置密码。
+> **关于 `adminGroups`**：`adminGroups` 用于限制管理类聊天命令只能由指定 TeamSpeak 服务器组运行（为空 = 不限制），详见 [TeamSpeak 命令权限](#teamspeak-命令权限管理类命令限制)。WebUI 鉴权基于数据库的用户账号系统（见 [首次配置](#首次配置)），无需在 `config.json` 中设置密码；旧版遗留的 `adminPassword` / `autoReturnDelay` 字段已从代码中移除，如果你手上还有旧 `config.json`，这两个键会被直接忽略（不影响启动）。
 
 ### 反向代理部署注意事项
 
@@ -1010,7 +1008,7 @@ A：本项目内置 `/login` 限流（每 IP 每分钟 5 次），但生产部�
 - **登录限流**：每 IP 每分钟 5 次 `/login` + 3 次 `/setup`，命中返回 429 + `Retry-After`。
 - **CSRF & 安全头**：所有 mutating 请求强制 `Origin`/`Referer` 同源；响应携带 `X-Frame-Options: DENY` 和 `Content-Security-Policy: frame-ancestors 'none'`（防点击劫持）。
 - **搜索引擎隐身（防止实例被收录，issue #128）**：为避免部署实例的 WebUI 被搜索引擎收录、被陌生人搜到控制页，采用纵深防御——所有响应携带 `X-Robots-Tag: noindex, nofollow`，`/robots.txt` 返回 `User-agent: * / Disallow: /`，`index.html` 内置 `<meta name="robots" content="noindex, nofollow">`（专属链接 `/bot/<id>` 等所有页面同样覆盖）。这些只阻止「被索引」，不是访问控制——**请不要把自己的 WebUI 链接发到公开网页 / 论坛 / 聊天群**，真正的防护来自登录鉴权与反向代理。
-- **配置变更**：反向代理部署务必 `"trustProxy": true`（详见 [反向代理部署注意事项](#反向代理部署注意事项)）。`config.adminGroups` 现已启用，用于限制管理类聊天命令只能由指定 TeamSpeak 服务器组运行（为空 = 不限制，详见 [TeamSpeak 命令权限](#teamspeak-命令权限管理类命令限制)）；`config.adminPassword` 仍为旧版预留字段，保留以兼容旧 `config.json`，当前未使用。
+- **配置变更**：反向代理部署务必 `"trustProxy": true`（详见 [反向代理部署注意事项](#反向代理部署注意事项)）。`config.adminGroups` 现已启用，用于限制管理类聊天命令只能由指定 TeamSpeak 服务器组运行（为空 = 不限制，详见 [TeamSpeak 命令权限](#teamspeak-命令权限管理类命令限制)）；旧版遗留的 `config.adminPassword` / `config.autoReturnDelay` 已从代码中移除，旧 `config.json` 中残留的这两个键会被忽略。
 
 ### v0.x — Bot Profile 自动更新与协议层升级
 

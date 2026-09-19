@@ -20,9 +20,24 @@ export function createUsersRouter(
   sessions: SessionStore,
   audit: AuditStore,
   logger: Logger,
-  permissions: PermissionStore
+  permissions: PermissionStore,
+  /**
+   * Called after an operation that invalidates a user's authorisation. A
+   * WebSocket authenticates ONCE at upgrade and stamps the member's bot scope
+   * at that moment, so without this a revoked bot kept streaming state to the
+   * still-open socket until the client happened to reconnect.
+   */
+  onAccessRevoked?: (userId: string) => void
 ): Router {
   const router = Router();
+
+  const revoke = (userId: string): void => {
+    try {
+      onAccessRevoked?.(userId);
+    } catch (err) {
+      logger.warn({ err, userId }, "failed to close revoked user sockets");
+    }
+  };
 
   router.get("/", (_req, res) => {
     res.json({ users: users.listUsers() });
@@ -85,6 +100,7 @@ export function createUsersRouter(
     }
     // FK CASCADE removes sessions; explicit call is belt-and-suspenders
     sessions.deleteAllForUser(targetId);
+    revoke(targetId);
     try {
       audit.record({
         actorId: req.user!.id, actorUsername: req.user!.username,
@@ -117,6 +133,7 @@ export function createUsersRouter(
       ? (extractSessionToken(req.headers.cookie) ?? undefined)
       : undefined;
     sessions.deleteAllForUser(targetId, exceptToken);
+    if (targetId !== req.user!.id) revoke(targetId);
     try {
       audit.record({
         actorId: req.user!.id, actorUsername: req.user!.username,
@@ -194,9 +211,28 @@ export function createUsersRouter(
     const caps: string[] = Array.isArray(body.capabilities)
       ? body.capabilities.filter(isCapability)
       : [];
+    // Cap the array and de-duplicate: setPermissions inserts one row per entry
+    // inside a transaction, so an unbounded body was a cheap write amplification
+    // / DB-bloat vector. 500 is far above any realistic bot count.
+    const MAX_BOT_GRANTS = 500;
+    const requestedBots: unknown[] = Array.isArray(body.bots) ? (body.bots as unknown[]) : [];
     const bots: "all" | string[] =
-      body.bots === "all" ? "all" : Array.isArray(body.bots) ? body.bots.map(String) : [];
+      body.bots === "all"
+        ? "all"
+        : Array.isArray(body.bots)
+          ? [
+              ...new Set(
+                requestedBots
+                  .filter((b): b is string => typeof b === "string")
+                  .map((b) => b.trim())
+                  .filter((b) => b.length > 0),
+              ),
+            ].slice(0, MAX_BOT_GRANTS)
+          : [];
     permissions.setPermissions(user.id, { capabilities: caps, bots });
+    // The member's open sockets still carry the scope resolved at upgrade.
+    // Closing them forces a reconnect that re-resolves from the new grants.
+    revoke(user.id);
     try {
       audit.record({
         actorId: req.user!.id, actorUsername: req.user!.username,

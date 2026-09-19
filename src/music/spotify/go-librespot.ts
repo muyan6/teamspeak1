@@ -321,9 +321,14 @@ export class GoLibrespotBackend extends EventEmitter implements SpotifyAudioBack
     ev.on("stopped", (d: any) => {
       this.emitTrackEnded({ uri: typeof d?.uri === "string" ? d.uri : "", reason: "stopped" });
     });
-    // R4-3: reconcile any track-end missed while the WS was down.
+    // R4-3: reconcile any track-end missed while the WS was down. The handler
+    // ends in EventEmitter.emit(), so a throwing listener would reject this
+    // promise; without the catch that becomes an unhandled rejection and, under
+    // Node's default policy, kills the process.
     ev.on("reconnected", () => {
-      void this.reconcileAfterReconnect();
+      void this.reconcileAfterReconnect().catch((err) =>
+        this.log.warn({ err }, "Spotify reconnect reconciliation failed"),
+      );
     });
   }
 

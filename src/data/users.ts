@@ -4,6 +4,17 @@ import bcrypt from "bcryptjs";
 
 const BCRYPT_ROUNDS = 12;
 
+/**
+ * A real bcrypt hash of an unguessable random string, compared against when the
+ * requested username does not exist. Without it the login path skipped bcrypt
+ * entirely for unknown users, so "user does not exist" returned noticeably
+ * faster than "wrong password" — a username-enumeration oracle.
+ */
+export const DUMMY_PASSWORD_HASH = bcrypt.hashSync(
+  "tsmusicbot-nonexistent-user-placeholder",
+  BCRYPT_ROUNDS,
+);
+
 export type UserRole = "admin" | "member" | "guest";
 
 /** Reserved synthetic principal for login-less guest sessions. The username is

@@ -6,14 +6,13 @@ import {
   type TS3VoiceActivity,
 } from "../ts-protocol/client.js";
 import { AudioPlayer } from "../audio/player.js";
-import { PlayQueue, PlayMode, type QueuedSong } from "../audio/queue.js";
+import { PlayQueue, PlayMode, parsePlayMode, type QueuedSong } from "../audio/queue.js";
 import type { MusicProvider, Platform, Song } from "../music/provider.js";
 import {
   parseCommand,
   canRunCommand,
   type ParsedCommand,
 } from "./commands.js";
-import { parseSongRef, parseSelectionIndex } from "./song-ref.js";
 import { splitTextIntoChunks } from "./text-chunk.js";
 import type { Logger } from "../logger.js";
 import { SHARED_QUEUE_OWNER, type BotDatabase, type ProfileConfig, type StoredSong } from "../data/database.js";
@@ -31,7 +30,6 @@ import { BotCommandHandler } from "./command-handler.js";
 import type { AvatarStore } from "../data/avatars.js";
 import {
   decideOccupancyAction,
-  occupancyFromClientList,
   shouldResumeOnReturn,
 } from "./auto-pause.js";
 import { isSpotifyUri } from "../music/spotify/webapi.js";
@@ -58,15 +56,6 @@ interface ReconnectSnapshot {
   fmPlatform: string;
   wasPlaying: boolean;
 }
-
-/** Maps the persisted / command-line play-mode string to the PlayMode enum.
- *  Shared by the !mode command and the restart-restore path (#125). */
-const PLAY_MODE_BY_VALUE: Record<string, PlayMode> = {
-  seq: PlayMode.Sequential,
-  loop: PlayMode.Loop,
-  random: PlayMode.Random,
-  rloop: PlayMode.RandomLoop,
-};
 
 // Keep a disconnected bot id classified as managed briefly so UDP packets
 // already in flight cannot make another local bot duck during teardown.
@@ -222,8 +211,6 @@ export class BotInstance extends EventEmitter {
   fmProvider: MusicProvider | null = null;
   fmRequesterName: string | undefined;
   readonly commandHandler: BotCommandHandler;
-  /** Results of the most recent !search, for "#N" selection (issue #90). */
-  private lastSearchResults: Song[] = [];
   /** 当前曲实际播放时长（试听片段秒数或完整 duration）；resolveAndPlay 赋值。 */
   private effectiveDuration: number | undefined;
   private playGate: Promise<unknown> = Promise.resolve();
@@ -280,7 +267,7 @@ export class BotInstance extends EventEmitter {
     try {
       const settings = this.database.getPlayerSettings(this.id);
       this.player.setVolume(settings.volume);
-      const restoredMode = PLAY_MODE_BY_VALUE[settings.playMode];
+      const restoredMode = parsePlayMode(settings.playMode);
       if (restoredMode) this.queue.setMode(restoredMode);
     } catch (err) {
       this.logger.warn({ err }, "Failed to restore player settings — using defaults");
@@ -466,6 +453,10 @@ export class BotInstance extends EventEmitter {
       this.connected = false;
       this.occupancyGeneration++;
       this.occupancyRefreshPending = false;
+      // Reset the backoff counter: it drives the next poller's delay, and a
+      // fresh connection must probe at the normal 30s cadence instead of
+      // inheriting a 5-minute backoff from the previous session's failures.
+      this.occupancyConsecutiveFailures = 0;
       this._clearLifecycleTimers();
       this.unregisterManagedVoiceClient(MANAGED_VOICE_CLIENT_RELEASE_GRACE_MS);
       this.voiceDucking.reset(true);
@@ -520,6 +511,13 @@ export class BotInstance extends EventEmitter {
     // React near-instantly to channel membership changes. The 30s idle
     // poller remains the fallback if any of these events are missed.
     this.tsClient.on("clientEnter", () => {
+      // A returning listener must resume IMMEDIATELY, not after the next 30s
+      // occupancy poll. The full-client `clientlist` query is exactly what
+      // times out while another client is present, so relying on it here would
+      // leave an auto-paused track silent for up to half a minute. The push
+      // event is authoritative for "someone appeared", and _resumeIfReturning
+      // only ever resumes (never pauses), so a spurious enter is harmless.
+      this._resumeIfReturning();
       void this.refreshOccupancy();
     });
     this.tsClient.on("clientLeave", (event: { id: number }) => {
@@ -652,7 +650,9 @@ export class BotInstance extends EventEmitter {
       }
     } catch (err) {
       this.occupancyConsecutiveFailures++;
-      const backoffSec = Math.min(300, 30 * Math.pow(2, Math.min(4, this.occupancyConsecutiveFailures - 1)));
+      // The next poll's delay is derived from this counter by
+      // _occupancyPollDelayMs(); log the same value so the two can't drift.
+      const backoffSec = this._occupancyPollDelayMs() / 1000;
       this.logger.warn({ err, consecutiveFailures: this.occupancyConsecutiveFailures, backoffSec }, "refreshOccupancy failed");
     } finally {
       this.occupancyRefreshInFlight = false;
@@ -781,15 +781,37 @@ export class BotInstance extends EventEmitter {
   private _startIdlePoller(): void {
     // 每 30 秒检查一次频道人数
     if (this.idlePollTimer) return;
-    const poll = () => {
-      this.idlePollTimer = null;
-      if (!this.connected) return;
-      void this.refreshOccupancy();
-      this.idlePollTimer = setTimeout(poll, 30_000);
-      this.idlePollTimer.unref?.();
-    };
-    this.idlePollTimer = setTimeout(poll, 30_000);
+    this.idlePollTimer = setTimeout(() => this._runIdlePoll(), this._occupancyPollDelayMs());
     this.idlePollTimer.unref?.();
+  }
+
+  /**
+   * Delay before the NEXT occupancy poll.
+   *
+   * The base cadence is 30s, but a failing `clientlist` (the documented
+   * library limitation when other clients are connected) must not be retried
+   * at full rate forever: every consecutive failure backs off exponentially up
+   * to 5 minutes. The previous implementation computed this backoff, logged it,
+   * and then threw it away — the poller unconditionally rescheduled at 30s.
+   * Success resets the counter, so recovery is immediate.
+   */
+  private _occupancyPollDelayMs(): number {
+    if (this.occupancyConsecutiveFailures <= 0) return 30_000;
+    const backoffSec = Math.min(
+      300,
+      30 * Math.pow(2, Math.min(4, this.occupancyConsecutiveFailures - 1)),
+    );
+    return backoffSec * 1000;
+  }
+
+  private _runIdlePoll(): void {
+    this.idlePollTimer = null;
+    if (!this.connected) return;
+    void this.refreshOccupancy().finally(() => {
+      if (!this.connected) return;
+      this.idlePollTimer = setTimeout(() => this._runIdlePoll(), this._occupancyPollDelayMs());
+      this.idlePollTimer.unref?.();
+    });
   }
 
   async returnToDefaultChannel(): Promise<boolean> {

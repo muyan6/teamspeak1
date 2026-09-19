@@ -1245,6 +1245,7 @@ import CustomAvatarRow from '../components/CustomAvatarRow.vue';
 import QRCode from 'qrcode';
 import { usePlayerStore } from '../stores/player.js';
 import { useSession } from '../composables/useSession.js';
+import { devWarn } from '../utils/log.js';
 import {
   buildSpotifyPayload,
   parseSpotifyRedirect,
@@ -1638,7 +1639,7 @@ async function createBot() {
       try {
         await axios.put(`/api/bot/${res.data.id}/avatar`, { dataUrl: newBotAvatar.value });
       } catch (err) {
-        console.warn('failed to set avatar on new bot', err);
+        devWarn('failed to set avatar on new bot', err);
       }
     }
     newBotName.value = '';

@@ -273,6 +273,28 @@ export class LocalMusicProvider implements MusicProvider {
    *  ffmpeg on Windows still releasing a just-stopped track). */
   private retrying = new Set<string>();
   private indexLock = Promise.resolve();
+  /**
+   * Lazily-filled "does this file still exist" cache for the READ paths.
+   *
+   * `search()` used to call existsSync() once per record per request — one stat
+   * syscall for every uploaded file, on every search. With a few thousand
+   * uploads that is thousands of syscalls to render a 20-row page.
+   *
+   * Only the read paths consult this. The DELETION paths (unlinkRecordAt,
+   * sweepUnreferenced, enforceQuota) deliberately keep doing a real stat: for
+   * them "the file is still present" is the signal that it is merely locked
+   * (ffmpeg on Windows holding a just-stopped track) and must be retried later,
+   * so caching that answer would make the retry loop give up immediately.
+   *
+   * Only POSITIVE results are cached, and only for FILE_EXISTS_TTL_MS: a file
+   * removed by something other than this class (an operator cleaning the upload
+   * dir, a container restart with a different volume) would otherwise stay in
+   * search results forever and then fail at play time. Negative results are
+   * never cached — they are already the cheap path (one failing stat) and
+   * caching them would make a just-restored file invisible.
+   */
+  private readonly fileExistsCache = new Map<string, number>();
+  private static readonly FILE_EXISTS_TTL_MS = 60_000;
 
   constructor(uploadDir: string, options: LocalMusicProviderOptions = {}) {
     this.uploadDir = uploadDir;
@@ -328,7 +350,29 @@ export class LocalMusicProvider implements MusicProvider {
 
   private rebuildSearchIndex(): void {
     this.searchTextById.clear();
+    // The index was just (re)read from disk — any cached answer may predate it.
+    this.fileExistsCache.clear();
     for (const record of this.records) this.indexSearchRecord(record);
+  }
+
+  /** Cached existence for the read paths. See fileExistsCache. */
+  private fileExists(record: LocalSongRecord): boolean {
+    const cachedAt = this.fileExistsCache.get(record.id);
+    if (cachedAt !== undefined && Date.now() - cachedAt < LocalMusicProvider.FILE_EXISTS_TTL_MS) {
+      return true; // only positive results are cached
+    }
+    const exists = existsSync(record.filePath);
+    if (exists) {
+      this.fileExistsCache.set(record.id, Date.now());
+    } else {
+      this.fileExistsCache.delete(record.id);
+    }
+    return exists;
+  }
+
+  /** Mark a record as present without a stat (used right after a write). */
+  private markFilePresent(id: string): void {
+    this.fileExistsCache.set(id, Date.now());
   }
 
   private indexSearchRecord(record: LocalSongRecord): void {
@@ -339,9 +383,20 @@ export class LocalMusicProvider implements MusicProvider {
   }
 
   private saveIndex(): void {
-    const tempPath = `${this.indexPath}.tmp`;
-    writeFileSync(tempPath, JSON.stringify(this.records, null, 2), "utf8");
-    renameSync(tempPath, this.indexPath);
+    // pid + timestamp keep concurrent writers (or a leftover temp from a crash)
+    // from colliding; a failed rename cleans up after itself.
+    const tempPath = `${this.indexPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      writeFileSync(tempPath, JSON.stringify(this.records, null, 2), "utf8");
+      renameSync(tempPath, this.indexPath);
+    } catch (err) {
+      try {
+        rmSync(tempPath, { force: true });
+      } catch {
+        /* best-effort */
+      }
+      throw err;
+    }
   }
 
   async uploadAudio(input: {
@@ -444,6 +499,7 @@ export class LocalMusicProvider implements MusicProvider {
     await this.withIndexLock(() => {
       this.records.unshift(song);
       this.indexSearchRecord(song);
+      this.markFilePresent(id); // just written — skip the stat on the next read
       this.saveIndex();
       // Never evict the file we just accepted, even if every older file is still
       // queued — returning success for a file we deleted would be a phantom entry.
@@ -460,7 +516,7 @@ export class LocalMusicProvider implements MusicProvider {
   async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
     const q = query.trim().toLowerCase();
     const songs = this.records
-      .filter((r) => existsSync(r.filePath))
+      .filter((r) => this.fileExists(r))
       .filter((r) => !q || this.searchTextById.get(r.id)?.includes(q))
       .slice(offset, offset + limit)
       .map((r) => this.toSong(r));
@@ -469,7 +525,7 @@ export class LocalMusicProvider implements MusicProvider {
 
   async getSongUrl(songId: string): Promise<SongUrlResult | null> {
     const record = this.records.find((r) => r.id === songId);
-    if (!record || !existsSync(record.filePath)) return null;
+    if (!record || !this.fileExists(record)) return null;
     // A song that is actually resolved for playback becomes eligible for
     // cleanup once it is no longer referenced by any queue.
     this.playedIds.add(songId);
@@ -478,7 +534,7 @@ export class LocalMusicProvider implements MusicProvider {
 
   async getSongDetail(songId: string): Promise<Song | null> {
     const record = this.records.find((r) => r.id === songId);
-    return record && existsSync(record.filePath) ? this.toSong(record) : null;
+    return record && this.fileExists(record) ? this.toSong(record) : null;
   }
 
   /**
@@ -556,6 +612,7 @@ export class LocalMusicProvider implements MusicProvider {
     this.searchTextById.delete(r.id);
     this.playedIds.delete(r.id);
     this.retrying.delete(r.id);
+    this.fileExistsCache.delete(r.id);
     return true;
   }
 

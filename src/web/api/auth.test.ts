@@ -71,4 +71,51 @@ describe("auth router POST /jellyfin/test", () => {
     expect(res.status).toBe(403);
     expect(testConnection).not.toHaveBeenCalled();
   });
+
+  // `platform.auth` is grantable, so without this a member could point the
+  // authenticated probe at loopback / link-local / intranet hosts and use the
+  // bot as an SSRF proxy. Non-admins may only re-test the saved URL.
+  it("403s a non-admin who supplies a different serverUrl", async () => {
+    const { app, testConnection } = mount(
+      { serverUrl: "https://stored.example.com" },
+      { role: "member", capabilities: new Set(["platform.auth"]) },
+    );
+    const res = await request(app)
+      .post("/api/auth/jellyfin/test")
+      .send({ serverUrl: "http://169.254.169.254/latest/meta-data/" });
+    expect(res.status).toBe(403);
+    expect(testConnection).not.toHaveBeenCalled();
+  });
+
+  it("lets a non-admin re-test the stored URL", async () => {
+    const { app, testConnection } = mount(
+      { serverUrl: "https://stored.example.com" },
+      { role: "member", capabilities: new Set(["platform.auth"]) },
+    );
+    const res = await request(app).post("/api/auth/jellyfin/test").send({});
+    expect(res.status).toBe(200);
+    expect(testConnection).toHaveBeenCalledWith(
+      expect.objectContaining({ serverUrl: "https://stored.example.com" }),
+    );
+  });
+
+  it("rejects a non-http(s) scheme for an admin", async () => {
+    const { app, testConnection } = mount({}, { role: "admin" });
+    const res = await request(app)
+      .post("/api/auth/jellyfin/test")
+      .send({ serverUrl: "file:///etc/passwd" });
+    expect(res.status).toBe(400);
+    expect(testConnection).not.toHaveBeenCalled();
+  });
+
+  // An admin legitimately runs Jellyfin on a LAN address, so private ranges are
+  // allowed for them — only the scheme is validated.
+  it("allows an admin to probe a private-range URL", async () => {
+    const { app, testConnection } = mount({}, { role: "admin" });
+    const res = await request(app)
+      .post("/api/auth/jellyfin/test")
+      .send({ serverUrl: "http://192.168.1.10:8096" });
+    expect(res.status).toBe(200);
+    expect(testConnection).toHaveBeenCalled();
+  });
 });

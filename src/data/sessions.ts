@@ -1,10 +1,18 @@
 import { createHash, randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
+import { GUEST_USER_ID } from "./users.js";
 
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 export const GUEST_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 1 day — guests are short-lived
 export const SESSION_TOUCH_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 export const MAX_SESSIONS_PER_USER = 10;
+/**
+ * Cap for the SHARED guest principal. Guests are login-less and all share one
+ * synthetic userId, so the per-user cap cannot apply (it would evict other
+ * people's sessions). Without any cap, though, a guest-login loop grew the
+ * table without bound until the hourly cleanup ran.
+ */
+export const MAX_GUEST_SESSIONS = 1000;
 
 export interface SessionValidation {
   userId: string;
@@ -58,10 +66,18 @@ export function createSessionStore(db: Database.Database): SessionStore {
       const now = Date.now();
       const expiresAt = now + (opts?.ttlMs ?? SESSION_TTL_MS);
       const tx = db.transaction(() => {
-        if (!opts?.skipCap) {
+        // Guests all share one synthetic principal, so `skipCap` still applies
+        // the per-user cap semantics to a DIFFERENT limit: evicting another
+        // guest's session is harmless (they can re-enter), whereas letting the
+        // count grow without bound is not.
+        const cap = userId === GUEST_USER_ID && opts?.skipCap
+          ? MAX_GUEST_SESSIONS
+          : MAX_SESSIONS_PER_USER;
+        const exempt = userId !== GUEST_USER_ID && opts?.skipCap;
+        if (!exempt) {
           const existing = (countForUserStmt.get(userId) as { n: number }).n;
-          if (existing >= MAX_SESSIONS_PER_USER) {
-            deleteOldestForUserStmt.run(userId, existing - MAX_SESSIONS_PER_USER + 1);
+          if (existing >= cap) {
+            deleteOldestForUserStmt.run(userId, existing - cap + 1);
           }
         }
         insertStmt.run(id, userId, now, expiresAt, now);

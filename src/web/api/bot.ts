@@ -1,7 +1,7 @@
 import { Router } from "express";
 import type { BotManager } from "../../bot/manager.js";
 import type { BotConfig, GuestModeConfig, SpotifyConfig, JellyfinConfig, GateableProvider } from "../../data/config.js";
-import { saveConfig, GATEABLE_PROVIDERS } from "../../data/config.js";
+import { saveConfig, GATEABLE_PROVIDERS, spotifyRedirectUri } from "../../data/config.js";
 import type { Logger } from "../../logger.js";
 import type { BotDatabase } from "../../data/database.js";
 import type { AvatarStore } from "../../data/avatars.js";
@@ -139,9 +139,44 @@ export function createBotRouter(
     });
   });
 
-  // POST /api/bot/settings — 保存全局 bot 行为设置 (gated: changing global bot
-  // behavior is a bot.manage operation, consistent with PR #80's permission model)
+  /**
+   * Settings blocks that rewrite PROCESS-WIDE security state rather than
+   * cosmetic bot behaviour. `bot.manage` is a grantable capability, so allowing
+   * it to write these let a non-admin member open guest mode, change the
+   * enabled-source set / default platform, edit the admin TS groups, or replace
+   * the Spotify secret and the Jellyfin URL + credentials.
+   */
+  // NOTE: `defaultPlatform` and `enabledProviders` are deliberately NOT in this
+  // list. The Settings UI exposes the "默认音源" picker to every `bot.manage`
+  // holder (Settings.vue), so gating those here would 403 a legitimate member
+  // action. Every remaining key lives in a section the UI already hides behind
+  // `platform.auth` or `session.isAdmin`, so this gate is defence-in-depth
+  // against a future grant rather than a change to any reachable action.
+  const ADMIN_ONLY_SETTINGS_KEYS = [
+    "guestMode",
+    "adminGroups",
+    "spotify",
+    "jellyfin",
+  ] as const;
+
+  // POST /api/bot/settings — 保存全局 bot 行为设置
+  // A bot.manage member may toggle cosmetic playback behaviour; anything that
+  // touches credentials, guest policy, provider gating or admin groups is
+  // admin-only.
   router.post("/settings", requirePermission("bot.manage"), (req, res) => {
+    const isAdmin = req.user?.role === "admin";
+    if (!isAdmin) {
+      const touched = ADMIN_ONLY_SETTINGS_KEYS.filter(
+        (k) => req.body?.[k] !== undefined,
+      );
+      if (touched.length > 0) {
+        res.status(403).json({
+          error: `admin required to change: ${touched.join(", ")}`,
+        });
+        return;
+      }
+    }
+
     const {
       idleTimeoutMinutes,
       autoPauseOnEmpty,
@@ -314,9 +349,9 @@ export function createBotRouter(
     // Client ID into the live process-wide OAuth so Connect works without a
     // restart. Empty clientId => undefined redirect => configure() disables OAuth.
     if (sp && typeof sp === "object") {
-      const redirectUri = config.spotify.clientId
-        ? `http://127.0.0.1:${config.webPort}/api/spotify/callback`
-        : undefined;
+      // Shared builder so this redirect URI is byte-identical to the one
+      // index.ts registered at boot (and honours publicUrl behind a proxy).
+      const redirectUri = spotifyRedirectUri(config);
       spotifyOAuth?.configure(config.spotify.clientId, redirectUri);
       // R2-4: also refresh the live Web API search provider so search/getAuthStatus
       // work without a restart. Uses the post-merge values so a masked/omitted
@@ -421,10 +456,24 @@ export function createBotRouter(
       res.status(404).json({ error: "Bot config not found" });
       return;
     }
-    // Never expose the TS identity / API key to the client; the edit form only
-    // consumes channel/server passwords.
-    const { ts6ApiKey: _ts6ApiKey, identity: _identity, ...safe } = saved as unknown as Record<string, unknown>;
-    res.json({ ...safe, hasTs6ApiKey: Boolean(saved.ts6ApiKey) });
+    // Never expose ANY connection secret to the client: TS identity, TS6 API
+    // key, and the server/channel passwords used to join. The edit form only
+    // needs to know WHETHER one is stored, so it can render "已保存" and let
+    // the operator leave the field untouched. Previously serverPassword and
+    // channelPassword survived the strip and were returned in cleartext.
+    const {
+      ts6ApiKey: _ts6ApiKey,
+      identity: _identity,
+      serverPassword: _serverPassword,
+      channelPassword: _channelPassword,
+      ...safe
+    } = saved as unknown as Record<string, unknown>;
+    res.json({
+      ...safe,
+      hasTs6ApiKey: Boolean(saved.ts6ApiKey),
+      hasServerPassword: Boolean(saved.serverPassword),
+      hasChannelPassword: Boolean(saved.channelPassword),
+    });
   });
 
   router.get("/:id/avatar", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
@@ -547,8 +596,20 @@ export function createBotRouter(
       const nickname = optionalRequiredBotText(body.nickname, "nickname", 100);
       const defaultChannel = optionalBotText(body.defaultChannel, "defaultChannel", 512);
       const channelId = optionalBotText(body.channelId, "channelId", 128);
-      const channelPassword = optionalBotText(body.channelPassword, "channelPassword", 1024);
-      const serverPassword = optionalBotText(body.serverPassword, "serverPassword", 1024);
+      // GET /:id/config no longer echoes stored passwords (they are write-only),
+      // so the edit form arrives with empty password inputs. Treat "" as "leave
+      // the stored secret alone" instead of wiping it. (manager.updateBot's
+      // `?? existing` does the actual keep; undefined is how we signal it.)
+      // "" (empty input in the edit form) means "leave the stored secret alone",
+      // while an explicit null means "clear it". Previously "" cleared it, but
+      // GET /:id/config no longer echoes the stored value, so an untouched empty
+      // input must not wipe the password.
+      const keepOrClear = (v: unknown, field: string): string | undefined => {
+        if (v === null) return "";
+        return optionalBotText(v, field, 1024) || undefined;
+      };
+      const channelPassword = keepOrClear(body.channelPassword, "channelPassword");
+      const serverPassword = keepOrClear(body.serverPassword, "serverPassword");
       const autoStart = botBoolean(body.autoStart, "autoStart");
       const normalizedProtocol = botProtocol(body.serverProtocol);
       const ts6ApiKey = optionalBotText(body.ts6ApiKey, "ts6ApiKey", 4096);

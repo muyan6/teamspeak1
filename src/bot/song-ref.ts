@@ -15,7 +15,7 @@ export interface SongRef {
    * the reference (e.g. a bare `id:`), so the caller should fall back to the
    * command's flags / default provider.
    */
-  platform: "netease" | "qq" | "bilibili" | null;
+  platform: "netease" | "qq" | "bilibili" | "youtube" | "kugou" | null;
 }
 
 /**
@@ -83,6 +83,22 @@ export function parseSongRef(raw: string): SongRef | null {
   if (/y\.qq\.com/i.test(q)) {
     const m = /songDetail\/([0-9A-Za-z]+)/.exec(q) ?? /[?&]songmid=([0-9A-Za-z]+)/i.exec(q);
     if (m) return { id: m[1], platform: "qq" };
+  }
+
+  // YouTube URL (youtu.be/<id>, youtube.com/watch?v=<id>, /shorts/<id>). The id
+  // is exactly 11 chars from the URL-safe alphabet.
+  if (/youtu\.be|youtube\.com/i.test(q)) {
+    const m =
+      /youtu\.be\/([A-Za-z0-9_-]{11})/.exec(q) ??
+      /[?&]v=([A-Za-z0-9_-]{11})/.exec(q) ??
+      /shorts\/([A-Za-z0-9_-]{11})/.exec(q);
+    if (m) return { id: m[1], platform: "youtube" };
+  }
+
+  // Kugou URL — the hash is the song identity.
+  if (/kugou\.com/i.test(q)) {
+    const m = /[?&]hash=([A-Za-z0-9]+)/i.exec(q);
+    if (m) return { id: m[1], platform: "kugou" };
   }
 
   return null;

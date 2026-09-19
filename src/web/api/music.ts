@@ -664,6 +664,7 @@ export function createMusicRouter(
         bilibili: bilibiliProvider.getQuality(),
         kugou: kugouProvider?.getQuality() ?? config.audioQuality.kugou,
         jellyfin: jellyfinProvider?.getQuality() ?? config.audioQuality.jellyfin,
+        spotify: spotifyProvider?.getQuality() ?? config.audioQuality.spotify,
       };
       try {
         saveConfig(configPath, config);

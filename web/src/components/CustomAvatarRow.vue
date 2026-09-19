@@ -6,6 +6,7 @@
 import { ref, onMounted, watch, nextTick } from 'vue';
 import axios from 'axios';
 import AvatarUpload from './AvatarUpload.vue';
+import { devWarn } from '../utils/log.js';
 
 const props = defineProps<{ botId: string }>();
 const avatarDataUrl = ref<string | null>(null);
@@ -21,7 +22,7 @@ async function loadCurrent() {
     avatarDataUrl.value = await blobToDataUrl(blob);
   } catch (err: any) {
     if (err?.response?.status !== 404) {
-      console.warn('failed to load avatar', err);
+      devWarn('failed to load avatar', err);
     }
     avatarDataUrl.value = null;
   } finally {
@@ -51,7 +52,7 @@ watch(avatarDataUrl, async (newVal, oldVal) => {
       await axios.delete(`/api/bot/${props.botId}/avatar`);
     }
   } catch (err) {
-    console.warn('avatar update failed', err);
+    devWarn('avatar update failed', err);
   }
 });
 

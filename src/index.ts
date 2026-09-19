@@ -1,6 +1,12 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, saveConfig, migrateLegacyConfig, isProviderEnabled } from "./data/config.js";
+import {
+  loadConfig,
+  saveConfig,
+  migrateLegacyConfig,
+  isProviderEnabled,
+  spotifyRedirectUri,
+} from "./data/config.js";
 import { createDatabase, backupDatabase } from "./data/database.js";
 import { createLogger } from "./logger.js";
 import { createApiServerManager } from "./music/api-server.js";
@@ -132,6 +138,7 @@ async function main() {
   bilibiliProvider.setQuality(config.audioQuality.bilibili);
   kugouProvider.setQuality(config.audioQuality.kugou);
   jellyfinProvider.setQuality(config.audioQuality.jellyfin);
+  spotifyProvider.setQuality(config.audioQuality.spotify);
 
   const permissions = createPermissionStore(db.db);
 
@@ -140,12 +147,12 @@ async function main() {
   // a web login immediately authorizes playback (C3.1). Own-app clientId => the
   // redirect points at this bot's web callback; empty clientId leaves OAuth
   // disabled (isAuthorized() stays false and the Rust backend never starts).
+  // The redirect URI comes from spotifyRedirectUri() so it is byte-identical to
+  // the one the Settings save path re-registers (and honours publicUrl).
   const spotifyOAuthClientId = config.spotify.clientId.trim();
   const spotifyOAuth = new SpotifyOAuth({
     clientId: spotifyOAuthClientId || undefined,
-    redirectUri: spotifyOAuthClientId
-      ? `http://127.0.0.1:${config.webPort}/api/spotify/callback`
-      : undefined,
+    redirectUri: spotifyRedirectUri(config),
     store: createFileOAuthTokenStore(
       path.join(SPOTIFY_DATA_DIR, "oauth", "oauth-tokens.json"),
     ),

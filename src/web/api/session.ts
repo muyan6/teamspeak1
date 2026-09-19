@@ -6,7 +6,7 @@ import type { SessionStore } from "../../data/sessions.js";
 import type { AuditStore } from "../../data/audit.js";
 import { resolvePermissionContext, type PermissionStore } from "../../data/permissions.js";
 import { SESSION_TTL_MS, GUEST_SESSION_TTL_MS } from "../../data/sessions.js";
-import { GUEST_USER_ID, GUEST_USERNAME } from "../../data/users.js";
+import { GUEST_USER_ID, GUEST_USERNAME, DUMMY_PASSWORD_HASH } from "../../data/users.js";
 import type { GuestModeConfig } from "../../data/config.js";
 import { SESSION_COOKIE_NAME, validateSessionFromHeaders, extractSessionToken } from "../auth/validateSession.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
@@ -45,7 +45,9 @@ export function createSessionRouter(
   audit: AuditStore,
   logger: Logger,
   permissions: PermissionStore,
-  getGuestConfig: () => GuestModeConfig
+  getGuestConfig: () => GuestModeConfig,
+  /** Wired by the web server so a logout also drops that user's WS sockets. */
+  onSessionsRevoked?: (userId: string) => void
 ): Router {
   const router = Router();
 
@@ -115,7 +117,9 @@ export function createSessionRouter(
       return;
     }
     const user = users.findByUsername(username);
-    const ok = user ? await users.verifyPassword(password, user.passwordHash) : false;
+    // Always run exactly one bcrypt comparison — even for an unknown username —
+    // so response time does not reveal whether the account exists.
+    const ok = await users.verifyPassword(password, user?.passwordHash ?? DUMMY_PASSWORD_HASH);
     if (!user || !ok) {
       await delay(FAILED_LOGIN_DELAY_MS);
       res.status(401).json({ error: "invalid credentials" });
@@ -149,7 +153,18 @@ export function createSessionRouter(
   router.post("/logout", (req, res) => {
     const token = extractSessionToken(req.headers.cookie);
     if (token) {
+      // Resolve the owner BEFORE deleting so the socket sweep can target them:
+      // a WebSocket authenticated at upgrade keeps streaming until it is closed
+      // explicitly, even after the session row is gone.
+      const owner = validateSessionFromHeaders(req.headers.cookie, sessions);
       sessions.deleteSession(token);
+      if (owner) {
+        try {
+          onSessionsRevoked?.(owner.userId);
+        } catch (err) {
+          logger.warn({ err }, "failed to close user sockets on logout");
+        }
+      }
     }
     clearSessionCookie(res);
     res.status(204).end();

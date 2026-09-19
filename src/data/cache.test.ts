@@ -55,6 +55,27 @@ describe("LRUCache", () => {
     }
   });
 
+  // Regression: get() only drops an EXPIRED entry when that exact key is read
+  // again, so a cache filled with short-TTL entries used to stay at maxSize
+  // full of dead values while set() evicted LIVE ones. Expired entries must be
+  // reclaimed first; only when none are expired does LRU eviction apply.
+  it("reclaims expired entries before evicting live ones", () => {
+    vi.useFakeTimers();
+    try {
+      const cache = new LRUCache<string, string>({ maxSize: 2, defaultTtlMs: 1000 });
+      cache.set("dead1", "v1");
+      cache.set("dead2", "v2");
+
+      vi.advanceTimersByTime(1500); // both expired, but nothing has read them
+      cache.set("live", "v3");      // would previously evict "dead1"
+
+      expect(cache.get("live")).toBe("v3");
+      expect(cache.size).toBe(1);   // both stale entries were reclaimed
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("supports delete and clear", () => {
     const cache = new LRUCache<string, number>();
     cache.set("a", 1);

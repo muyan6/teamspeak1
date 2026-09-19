@@ -75,8 +75,34 @@ export function createWebServer(options: WebServerOptions): WebServer {
   const logger = options.logger.child({ component: "web" });
 
   if (options.config.trustProxy) {
+    // Keep Express's permissive `true` so multi-hop deployments
+    // (Cloudflare -> nginx -> app) resolve req.ip to the REAL client and every
+    // user keeps their own rate-limit bucket. Pinning this to a hop count (1)
+    // would make req.ip the CDN/proxy address for two-or-more-hop setups and
+    // collapse /setup and /guest into ONE shared bucket for all visitors.
+    //
+    // Known trade-off, documented rather than silently changed: with `true`
+    // Express uses the LEFTMOST X-Forwarded-For entry, which a client can set.
+    // That only matters if the fronting proxy APPENDS to XFF instead of
+    // replacing it; nginx's `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`
+    // does append, so bind the app to the proxy (do not expose webPort publicly)
+    // if per-IP throttling must be trustworthy.
     app.set("trust proxy", true);
   }
+
+  // Canonical origin for CSRF host comparison (config.publicUrl when set), so
+  // the check does not compare two client-supplied headers against each other.
+  const canonicalHost = (() => {
+    const raw = (options.config.publicUrl ?? "").trim();
+    if (!raw) return null;
+    try {
+      return new URL(raw).host;
+    } catch {
+      logger.warn({ publicUrl: raw }, "publicUrl is not a valid URL — ignoring for CSRF host check");
+      return null;
+    }
+  })();
+  if (canonicalHost) app.set("canonicalHost", canonicalHost);
 
   // Security headers:
   //  • X-Frame-Options / CSP frame-ancestors — prevent the WebUI from being
@@ -87,10 +113,16 @@ export function createWebServer(options: WebServerOptions): WebServer {
   //    (issue #128: searching "TsmusicBot" surfaced strangers' WebUI URLs).
   //    Set on EVERY response so JSON/API responses and the SPA shell are all
   //    covered; complements /robots.txt and the <meta name="robots"> tag.
+  app.disable("x-powered-by");
   app.use((_req, res, next) => {
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
     res.setHeader("X-Robots-Tag", "noindex, nofollow");
+    // The SPA renders provider-supplied metadata (song/artist/album names), so
+    // these are the cheap second line of defence against stored XSS.
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "same-origin");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     next();
   });
 
@@ -114,9 +146,20 @@ export function createWebServer(options: WebServerOptions): WebServer {
     res.json({ status: "ok", version: "0.1.0" });
   });
 
+  // Public on purpose: the login/guest screen needs the base URL before it has a
+  // session. Only the ORIGIN is disclosed — an unauthenticated caller must not
+  // learn internal paths or a proxied hostname.
   app.get("/api/config/public-url", (_req, res) => {
     const raw = (options.config.publicUrl ?? "").trim();
-    res.json({ publicUrl: raw ? raw.replace(/\/+$/, "") : null });
+    if (!raw) {
+      res.json({ publicUrl: null });
+      return;
+    }
+    // Return the operator-configured URL as-is (minus trailing slashes). An
+    // earlier revision reduced this to `new URL(raw).origin`, which silently
+    // dropped a sub-path deployment (https://host/music -> https://host) and
+    // broke the share links built from it.
+    res.json({ publicUrl: raw.replace(/\/+$/, "") });
   });
 
   // ─── CSRF protection for all mutating API requests ──────────────────────
@@ -137,7 +180,24 @@ export function createWebServer(options: WebServerOptions): WebServer {
   app.use("/api/session/setup", setupLimit);
   app.use("/api/session/guest", guestLimit);
 
-  app.use("/api/session", createSessionRouter(users, sessions, audit, logger, permissions, () => options.config.guestMode));
+  // WebSocket sockets authenticate ONCE at upgrade, so a logout / permission
+  // revocation never reached the already-open socket. Both routers below are
+  // mounted before the WS controller exists, so bridge them with a mutable
+  // indirection wired to the real implementation once setupWebSocket runs.
+  let onUserAccessRevoked: (userId: string) => void = () => {};
+
+  app.use(
+    "/api/session",
+    createSessionRouter(
+      users,
+      sessions,
+      audit,
+      logger,
+      permissions,
+      () => options.config.guestMode,
+      (userId) => onUserAccessRevoked(userId),
+    ),
+  );
 
   // ─── Gates for everything else under /api ───────────────────────────────
   const requireAuth = createRequireAuth(sessions, permissions, () => options.config.guestMode);
@@ -226,8 +286,32 @@ export function createWebServer(options: WebServerOptions): WebServer {
   );
 
   // admin-only routes
-  app.use("/api/users", requireAdmin, createUsersRouter(users, sessions, audit, logger, permissions));
+  app.use(
+    "/api/users",
+    requireAdmin,
+    createUsersRouter(users, sessions, audit, logger, permissions, (userId) =>
+      onUserAccessRevoked(userId),
+    ),
+  );
   app.use("/api/audit", requireAdmin, createAuditRouter(audit));
+
+  // ─── Terminal error handler ─────────────────────────────────────────────
+  // Express 5 forwards rejected async handlers here. WITHOUT this handler they
+  // reach Express's default one, which (unless NODE_ENV=production, which this
+  // project never sets) answers with an HTML page containing the stack trace
+  // and absolute server paths. Always answer JSON, and log the detail
+  // server-side instead of shipping it to the client.
+  app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const status = (err as { status?: number; statusCode?: number })?.status
+      ?? (err as { statusCode?: number })?.statusCode;
+    const code = typeof status === "number" && status >= 400 && status < 600 ? status : 500;
+    logger.error({ err, method: req.method, url: req.originalUrl }, "Unhandled request error");
+    res.status(code).json({ error: code >= 500 ? "internal error" : "request failed" });
+  });
 
   // ─── Static SPA (public) ────────────────────────────────────────────────
   if (options.staticDir) {
@@ -296,6 +380,10 @@ export function createWebServer(options: WebServerOptions): WebServer {
   });
   const controller = setupWebSocket(wss, options.botManager, logger);
   onGuestPolicyChanged = controller.refreshGuestPolicy;
+  // Now that the WS controller exists, wire the logout / permission-revocation
+  // sweep. The client's useWebSocket auto-reconnects, so the socket comes back
+  // with freshly-resolved scope instead of the stale upgrade-time snapshot.
+  onUserAccessRevoked = (userId) => controller.closeUserSockets(userId);
 
   // ─── Session cleanup interval ──────────────────────────────────────────
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;

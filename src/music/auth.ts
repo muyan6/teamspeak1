@@ -18,13 +18,25 @@ export function createCookieStore(cookieDir: string): CookieStore {
   return {
     save(platform: CookiePlatform, cookie: string): void {
       const filePath = path.join(cookieDir, `${platform}.json`);
-      const tempPath = `${filePath}.tmp`;
-      fs.writeFileSync(
-        tempPath,
-        JSON.stringify({ cookie, updatedAt: new Date().toISOString() }),
-        { encoding: "utf-8", mode: 0o600 }
-      );
-      fs.renameSync(tempPath, filePath);
+      // Unique temp name: two concurrent saves for the same platform (QR poll
+      // + Settings save) used to share one path, and a throw between write and
+      // rename left a stale *.tmp behind forever.
+      const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      try {
+        fs.writeFileSync(
+          tempPath,
+          JSON.stringify({ cookie, updatedAt: new Date().toISOString() }),
+          { encoding: "utf-8", mode: 0o600 }
+        );
+        fs.renameSync(tempPath, filePath);
+      } catch (err) {
+        try {
+          fs.rmSync(tempPath, { force: true });
+        } catch {
+          /* best-effort */
+        }
+        throw err;
+      }
     },
 
     load(platform: CookiePlatform): string {

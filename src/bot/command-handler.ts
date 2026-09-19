@@ -3,55 +3,9 @@ import type { ParsedCommand } from "./commands.js";
 import type { TS3TextMessage } from "../ts-protocol/client.js";
 import type { Song, Platform, MusicProvider } from "../music/provider.js";
 import { defaultPlatform, isProviderEnabled } from "../data/config.js";
-import { PlayMode } from "../audio/queue.js";
+import { PlayMode, parsePlayMode } from "../audio/queue.js";
 import { SHARED_QUEUE_OWNER } from "../data/database.js";
-
-const PLAY_MODE_BY_VALUE: Record<string, PlayMode> = {
-  seq: PlayMode.Sequential,
-  sequential: PlayMode.Sequential,
-  loop: PlayMode.Loop,
-  random: PlayMode.Random,
-  rloop: PlayMode.RandomLoop,
-  randomloop: PlayMode.RandomLoop,
-};
-
-/** Parse "#1", "#2", etc. into a 1-based index, or null. */
-function parseSelectionIndex(arg: string): number | null {
-  const match = /^#(\d+)$/.exec(arg);
-  if (!match) return null;
-  const n = parseInt(match[1], 10);
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-
-/** Parse "id <id>", "id:<id>", URL, or plain id into a platform+id ref, or null. */
-function parseSongRef(arg: string): { platform?: Platform; id: string } | null {
-  const trimmed = arg.trim();
-  // 1) "id <id>" or "id:<id>"
-  const idMatch = /^id[:\s]+(\S+)$/i.exec(trimmed);
-  if (idMatch) return { id: idMatch[1] };
-
-  // 2) NetEase URL
-  const neteaseMatch = /music\.163\.com\/.*[?&]id=(\d+)/i.exec(trimmed);
-  if (neteaseMatch) return { platform: "netease", id: neteaseMatch[1] };
-
-  // 3) QQ URL
-  const qqMatch = /y\.qq\.com\/.*[?&]songmid=([a-zA-Z0-9]+)/i.exec(trimmed);
-  if (qqMatch) return { platform: "qq", id: qqMatch[1] };
-
-  // 4) Bilibili URL / bvid
-  const biliMatch = /(?:bilibili\.com\/video\/|(?:^|\s))(BV[a-zA-Z0-9]{10})/i.exec(trimmed);
-  if (biliMatch) return { platform: "bilibili", id: biliMatch[1] };
-
-  // 5) YouTube URL
-  const ytMatch = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/))([a-zA-Z0-9_-]{11})/i.exec(trimmed);
-  if (ytMatch) return { platform: "youtube", id: ytMatch[1] };
-
-  // 6) Kugou URL
-  const kugouMatch = /kugou\.com\/.*[?&]hash=([a-zA-Z0-9]+)/i.exec(trimmed);
-  if (kugouMatch) return { platform: "kugou", id: kugouMatch[1] };
-
-  return null;
-}
+import { parseSongRef, parseSelectionIndex } from "./song-ref.js";
 
 export class BotCommandHandler {
   private lastSearchResults: Song[] = [];
@@ -375,8 +329,8 @@ export class BotCommandHandler {
   }
 
   cmdMode(cmd: ParsedCommand): string {
-    const mode = PLAY_MODE_BY_VALUE[cmd.args];
-    if (mode === undefined) return "Usage: !mode <seq|loop|random|rloop>";
+    const mode = parsePlayMode(cmd.args);
+    if (mode === null) return "Usage: !mode <seq|loop|random|rloop>";
     this.bot.queue.setMode(mode);
     this.bot.persistPlayMode();
     this.bot.emit("stateChange");

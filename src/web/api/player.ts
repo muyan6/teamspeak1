@@ -102,6 +102,22 @@ export function createPlayerRouter(
     res.status(403).json({ error: "本地音频播放已关闭" });
   }
 
+  /**
+   * Reject free-text that would be re-parsed as command syntax. The command
+   * parser splits on whitespace and treats any 2-char "-x" token as a flag, so
+   * a query of "song -b" silently switched the provider and a playlistId of
+   * "x -q" did the same. Newlines are rejected too — they would split one
+   * request into several commands.
+   */
+  function invalidCommandText(value: unknown): boolean {
+    return (
+      typeof value !== "string" ||
+      value.trim() === "" ||
+      /[\r\n]/.test(value) ||
+      value.trim().startsWith("-")
+    );
+  }
+
   function requesterName(req: Request): string {
     const name = req.user?.username;
     return typeof name === "string" && name.trim() ? name.trim() : "游客";
@@ -134,7 +150,7 @@ export function createPlayerRouter(
     try {
       const bot = requestBot(req);
       const { query, platform } = req.body;
-      if (!query) {
+      if (invalidCommandText(query)) {
         res.status(400).json({ error: "query is required" });
         return;
       }
@@ -155,7 +171,7 @@ export function createPlayerRouter(
     try {
       const bot = requestBot(req);
       const { query, platform } = req.body;
-      if (!query) {
+      if (invalidCommandText(query)) {
         res.status(400).json({ error: "query is required" });
         return;
       }
@@ -294,6 +310,12 @@ export function createPlayerRouter(
   router.delete("/:botId/queue/:index", authorize({ capability: "player.queue", guestFlag: "removeClear" }), async (req, res) => {
     try {
       const bot = requestBot(req);
+      // The index is interpolated into a command string, so a non-numeric value
+      // (e.g. "1 -b") would be parsed as extra flags/args instead of an index.
+      if (!/^\d+$/.test(req.params.index)) {
+        res.status(400).json({ error: "index must be a non-negative integer" });
+        return;
+      }
       const cmd = parseCommand(`!remove ${req.params.index}`, "!")!;
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
@@ -348,7 +370,7 @@ export function createPlayerRouter(
     try {
       const bot = requestBot(req);
       const { playlistId, platform } = req.body;
-      if (!playlistId || typeof playlistId !== "string") {
+      if (invalidCommandText(playlistId)) {
         res.status(400).json({ error: "playlistId is required" });
         return;
       }
@@ -370,7 +392,7 @@ export function createPlayerRouter(
     try {
       const bot = requestBot(req);
       const { playlistId, platform } = req.body;
-      if (!playlistId || typeof playlistId !== "string") {
+      if (invalidCommandText(playlistId)) {
         res.status(400).json({ error: "playlistId is required" });
         return;
       }

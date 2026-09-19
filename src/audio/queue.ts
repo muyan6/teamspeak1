@@ -5,6 +5,34 @@ export enum PlayMode {
   RandomLoop = "rloop",
 }
 
+/**
+ * Map a persisted / user-supplied play-mode string onto the PlayMode enum.
+ *
+ * SINGLE source of truth for both consumers: the persisted-value restore path
+ * (BotInstance constructor) and the `!mode <value>` chat command. Accepts the
+ * canonical values (seq/loop/random/rloop) plus the long aliases
+ * (sequential/randomloop) that the chat command has always allowed, so a
+ * hand-edited config.json and a chat command behave identically. Returns null
+ * for anything unrecognized, which callers treat as "leave the mode alone".
+ */
+export function parsePlayMode(value: unknown): PlayMode | null {
+  if (typeof value !== "string") return null;
+  switch (value.trim().toLowerCase()) {
+    case "seq":
+    case "sequential":
+      return PlayMode.Sequential;
+    case "loop":
+      return PlayMode.Loop;
+    case "random":
+      return PlayMode.Random;
+    case "rloop":
+    case "randomloop":
+      return PlayMode.RandomLoop;
+    default:
+      return null;
+  }
+}
+
 export interface QueuedSong {
   id: string;
   name: string;

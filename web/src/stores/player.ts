@@ -106,6 +106,8 @@ export const usePlayerStore = defineStore('player', {
     scopedBotId: null as string | null,
     /** Per-bot queues keyed by botId */
     queues: {} as Record<string, Song[]>,
+    /** Per-bot "a queue fetch is already running" flags (see fetchQueueForBot). */
+    queueFetchInFlight: {} as Record<string, boolean>,
     /** Per-bot timing state keyed by botId */
     timings: {} as Record<string, TimingState>,
     theme: 'dark' as 'dark' | 'light',
@@ -367,12 +369,24 @@ export const usePlayerStore = defineStore('player', {
       }
     },
 
+    /**
+     * Per-bot in-flight guard. The WebSocket "stateChange" event no longer
+     * carries the queue, so the client fetches it on demand — and stateChange
+     * fires on paths that cluster (volume nudges, auto-pause, queue mutations).
+     * Without this, a burst of events queued one HTTP request per event, all
+     * returning the same body. A second call while one is in flight is dropped;
+     * the in-flight response already reflects the current server state.
+     */
     async fetchQueueForBot(botId: string) {
+      if (this.queueFetchInFlight[botId]) return;
+      this.queueFetchInFlight[botId] = true;
       try {
         const res = await axios.get(`/api/player/${botId}/queue`);
         this.queues[botId] = res.data.queue ?? [];
       } catch {
         // ignore
+      } finally {
+        this.queueFetchInFlight[botId] = false;
       }
     },
 

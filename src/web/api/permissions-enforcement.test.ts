@@ -181,10 +181,13 @@ describe("permission enforcement on action routes", () => {
       expect(res.status).toBe(403);
     });
 
-    it("NOT 403 for member WITH platform.auth on POST /api/auth/cookie", async () => {
+    // Writing a platform cookie replaces the PROCESS-WIDE music account that
+    // every user plays through, so it is admin-only rather than grantable via
+    // platform.auth (which would let a member hijack the operator's account).
+    it("403 for member WITH platform.auth on POST /api/auth/cookie (admin-only write)", async () => {
       const app = makeApp(member(["platform.auth"], "all"));
       const res = await request(app).post("/api/auth/cookie").send({ cookie: "c" });
-      expect(res.status).not.toBe(403);
+      expect(res.status).toBe(403);
     });
   });
 

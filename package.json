@@ -8,14 +8,14 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc && npm run build:web",
+    "build": "tsc -p tsconfig.build.json && npm run build:web",
     "build:web": "cd web && npm run build",
     "check:native": "node scripts/check-native.mjs",
     "prestart": "node scripts/check-native.mjs",
     "start": "node dist/index.js",
     "play": "node dist/index.js",
-    "test": "vitest run --exclude dist/** --exclude web/dist/**",
-    "test:watch": "vitest --exclude dist/** --exclude web/dist/**"
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "license": "MIT",
   "dependencies": {
@@ -26,19 +26,13 @@
     "axios": "^1.14.0",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^12.8.0",
-    "chalk": "^5.6.2",
     "cookie-parser": "^1.4.7",
     "express": "^5.2.1",
     "ffmpeg-static": "^5.3.0",
-    "koa": "^3.2.0",
-    "koa-bodyparser": "^4.4.1",
-    "koa-static": "^5.0.0",
     "NeteaseCloudMusicApi": "~4.32.0",
     "pino": "^10.3.1",
-    "ts3-nodejs-library": "^3.5.1",
     "tweetnacl": "^1.0.3",
-    "ws": "^8.20.0",
-    "yt-dlp-wrap": "^2.3.12"
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",

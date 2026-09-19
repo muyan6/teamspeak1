@@ -1,6 +1,6 @@
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 import type { SessionStore } from "../../data/sessions.js";
-import { SESSION_TTL_MS } from "../../data/sessions.js";
+import { SESSION_TTL_MS, GUEST_SESSION_TTL_MS } from "../../data/sessions.js";
 import { resolvePermissionContext, type PermissionStore, type GuestPermissions } from "../../data/permissions.js";
 import type { GuestModeConfig } from "../../data/config.js";
 import {
@@ -58,12 +58,16 @@ export function createRequireAuth(
     };
     const token = extractSessionToken(req.headers.cookie);
     if (token) {
+      // Re-issue against the ROLE'S OWN TTL. Guests are short-lived (1 day) and
+      // must not have their browser cookie silently promoted to the 7-day
+      // member/admin window — sessions.ts already enforces this in the DB, and
+      // the cookie has to match or the two disagree.
       res.cookie(SESSION_COOKIE_NAME, token, {
         httpOnly: true,
         sameSite: "lax",
         secure: req.secure,
         path: "/",
-        maxAge: SESSION_TTL_MS,
+        maxAge: result.role === "guest" ? GUEST_SESSION_TTL_MS : SESSION_TTL_MS,
       });
     }
     next();

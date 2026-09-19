@@ -11,6 +11,16 @@ export interface WebSocketController {
    * each guest socket is live re-scoped so out-of-scope bots stop streaming.
    */
   refreshGuestPolicy: (cfg: { enabled: boolean; bots: "all" | string[] }) => void;
+  /**
+   * Drop every socket belonging to `userId`.
+   *
+   * A member's bot scope is stamped ONCE at upgrade from their permissions, so
+   * revoking access (or deleting the account, or logging out) left the existing
+   * socket streaming that bot's state/queue until the client reconnected on its
+   * own. The session row is already gone server-side by then, so the socket is
+   * the last thing still honouring a revoked grant.
+   */
+  closeUserSockets: (userId: string) => void;
 }
 
 export function setupWebSocket(
@@ -30,6 +40,8 @@ export function setupWebSocket(
     if (!w.botScope || w.botScope === "all") return true;
     return w.botScope.has(botId);
   }
+
+  
 
   /** Track which bot instances have listeners attached (keyed by id, storing ref) */
   const attachedBots = new Map<string, {
@@ -134,12 +146,20 @@ export function setupWebSocket(
       detachBotListener(bot.id);
     }
 
+    // The queue is deliberately NOT part of this broadcast. `getQueue()` returns
+    // a fresh copy of every QueuedSong (id/name/artist/album/coverUrl/duration/
+    // requestedBy ≈ 300 bytes each, capped at MAX_QUEUE_SONGS = 1000), and
+    // "stateChange" fires on ~9 different paths — including volume and play-mode
+    // changes that do not touch the queue at all. A 500-song queue therefore
+    // meant re-serialising ~150 KB and pushing it to every connected client for
+    // a single volume nudge. Clients already handle the queue-less shape by
+    // fetching on demand (see useWebSocket.ts's `else store.fetchQueueForBot`),
+    // which also keeps the payload correct for the events that DO change it.
     const onStateChange = () => {
       broadcast({
         type: "stateChange",
         botId: bot.id,
         status: bot.getStatus(),
-        queue: bot.getQueue(),
       }, bot.id);
     };
 
@@ -222,5 +242,19 @@ export function setupWebSocket(
     }
   };
 
-  return { cleanup, refreshGuestPolicy };
+  /** Close every open socket whose upgrade was authenticated as `userId`. */
+  const closeUserSockets = (userId: string) => {
+    for (const ws of clients) {
+      const w = ws as unknown as { userId?: string };
+      if (w.userId !== userId) continue;
+      try {
+        ws.close(1008, "session revoked");
+      } catch {
+        // socket may already be closing; ignore
+      }
+      clients.delete(ws);
+    }
+  };
+
+  return { cleanup, refreshGuestPolicy, closeUserSockets };
 }

@@ -281,6 +281,9 @@ describe("music router POST /quality — persistence (#125)", () => {
       bilibili: "320",
       kugou: "320",
       jellyfin: "320",
+      // No spotifyProvider is wired into this test router, so the snapshot
+      // keeps the previously-persisted value rather than inventing one.
+      spotify: "320",
     });
   });
 

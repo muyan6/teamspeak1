@@ -20,6 +20,7 @@ import { GoLibrespotBackend } from "./go-librespot.js";
 import { RustLibrespotBackend } from "./rust-librespot.js";
 import {
   SpotifyOAuth,
+  createFileOAuthTokenStore,
   type OAuthTokens,
   type OAuthTokenStore,
 } from "./spotify-oauth.js";
@@ -58,6 +59,8 @@ export function perBotDeviceName(base: string, instanceId?: string): string {
  */
 class FileOAuthTokenStore implements OAuthTokenStore {
   constructor(private readonly file: string) {}
+  /* istanbul ignore next -- superseded by createFileOAuthTokenStore(); kept only
+     because existing tests construct it directly. */
   load(): OAuthTokens | null {
     try {
       if (!existsSync(this.file)) return null;
@@ -150,7 +153,11 @@ export class SpotifyController extends EventEmitter {
     this.oauth =
       o.oauth ??
       new SpotifyOAuth({
-        store: new FileOAuthTokenStore(
+        // Use the crash-safe store from spotify-oauth.ts (same-dir temp file +
+        // rename) rather than the local class: refresh() persists a ROTATED
+        // refresh token, and a torn write would silently de-authenticate the
+        // operator, forcing a full PKCE re-login.
+        store: createFileOAuthTokenStore(
           join(this.configDir, "spotify-oauth.json"),
         ),
       });
@@ -356,15 +363,28 @@ export class SpotifyController extends EventEmitter {
     }
   }
 
+  // Transport failures must never reject into the queue-advance path (C3.6):
+  // a transient 5xx from a dying sidecar used to surface as a rejected pause().
   async pause(): Promise<void> {
-    if (this.backend) await this.backend.pause();
+    if (!this.backend) return;
+    try {
+      await this.backend.pause();
+    } catch (err) {
+      this.logger.warn({ err }, "Spotify pause failed");
+    }
   }
 
   async resume(): Promise<void> {
-    if (this.backend) await this.backend.resume();
+    if (!this.backend) return;
+    try {
+      await this.backend.resume();
+    } catch (err) {
+      this.logger.warn({ err }, "Spotify resume failed");
+    }
   }
 
   async seek(ms: number): Promise<void> {
+    if (!this.backend) return;
     // R4-1: round to an integer ms ONCE here so BOTH backends receive a valid
     // integer position. The web progress bar computes seekTime = ratio *
     // duration (fractional seconds), so seek(seconds * 1000) is a NON-integer ms
@@ -373,7 +393,11 @@ export class SpotifyController extends EventEmitter {
     // 400 → the error is swallowed → the track never seeks. The Spotify Web API
     // (Rust path) likewise expects an integer position_ms. Clamp negatives to 0.
     const position = Math.max(0, Math.round(ms));
-    if (this.backend) await this.backend.seek(position);
+    try {
+      await this.backend.seek(position);
+    } catch (err) {
+      this.logger.warn({ err }, "Spotify seek failed");
+    }
   }
 
   getPcmStream(): Readable {
