@@ -623,7 +623,7 @@ export class KugouProvider implements MusicProvider {
       // Songs only. `page` is the 1-based cursor; the web pages in limit-aligned
       // steps so offset is a multiple of pagesize.
       const page = Math.floor(offset / limit) + 1;
-      const res = await this.mobileHttp.get("http://mobilecdn.kugou.com/api/v3/search/song", {
+      const res = await this.mobileHttp.get("https://mobilecdn.kugou.com/api/v3/search/song", {
         params: { format: "json", keyword: q, page, pagesize: limit, showtype: 1 },
       });
       const info = res.data?.data?.info as KugouRawSong[] | undefined;

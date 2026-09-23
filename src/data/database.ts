@@ -135,6 +135,7 @@ export interface FavoritePlaylist {
 export interface BotDatabase {
   db: Database.Database;
   addPlayHistory(entry: PlayHistoryEntry): void;
+  prunePlayHistory?(botId: string, limit?: number): void;
   getPlayHistory(botId: string, limit: number): PlayHistoryRecord[];
   saveBotInstance(instance: BotInstance): void;
   getBotInstances(): BotInstance[];
@@ -576,12 +577,26 @@ export function createDatabase(dbPath: string): BotDatabase {
   const selectQueueState = db.prepare("SELECT * FROM queue_state WHERE botId = ?");
   const deleteQueueState = db.prepare("DELETE FROM queue_state WHERE botId = ?");
 
+  const historyInsertsPerBot = new Map<string, number>();
+  const PRUNE_BATCH_SIZE = 50;
+
   return {
     db,
 
     addPlayHistory(record) {
       insertHistory.run({ ...record, requestedBy: record.requestedBy ?? "" });
-      pruneHistory.run(record.botId, record.botId, MAX_PLAY_HISTORY_PER_BOT);
+      const count = (historyInsertsPerBot.get(record.botId) ?? 0) + 1;
+      if (count >= PRUNE_BATCH_SIZE) {
+        historyInsertsPerBot.set(record.botId, 0);
+        pruneHistory.run(record.botId, record.botId, MAX_PLAY_HISTORY_PER_BOT);
+      } else {
+        historyInsertsPerBot.set(record.botId, count);
+      }
+    },
+
+    prunePlayHistory(botId, limit = MAX_PLAY_HISTORY_PER_BOT) {
+      historyInsertsPerBot.set(botId, 0);
+      pruneHistory.run(botId, botId, limit);
     },
 
     getPlayHistory(botId, limit) {

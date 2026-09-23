@@ -16,43 +16,57 @@ import type {
 export function parseLyrics(lrc: string, tlyric?: string): LyricLine[] {
   if (!lrc) return [];
 
-  const parseLine = (
-    line: string
-  ): { time: number; text: string } | null => {
-    const match = line.match(/^\[(\d{2}):(\d{2})\.(\d{2,3})\](.+)$/);
-    if (!match) return null;
-    const minutes = parseInt(match[1], 10);
-    const seconds = parseInt(match[2], 10);
-    const ms = parseInt(match[3].padEnd(3, "0"), 10);
-    const text = match[4].trim();
+  const timeTagRegex = /\[(\d{1,3}):(\d{2})(?:[.:](\d{2,3}))?\]/g;
+  const isMeta = /^(作词|作曲|编曲|制作|混音|母带)\s*[:：]/;
 
-    if (/^(作词|作曲|编曲|制作|混音|母带)\s*[:：]/.test(text)) return null;
+  const parseAllLines = (text: string): Array<{ time: number; text: string }> => {
+    const result: Array<{ time: number; text: string }> = [];
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (!line) continue;
 
-    return { time: minutes * 60 + seconds + ms / 1000, text };
+      const timestamps: number[] = [];
+      let match: RegExpExecArray | null;
+      timeTagRegex.lastIndex = 0;
+      while ((match = timeTagRegex.exec(line)) !== null) {
+        const minutes = parseInt(match[1], 10);
+        const seconds = parseInt(match[2], 10);
+        const ms = match[3] ? parseInt(match[3].padEnd(3, "0").slice(0, 3), 10) : 0;
+        timestamps.push(minutes * 60 + seconds + ms / 1000);
+      }
+
+      if (timestamps.length === 0) continue;
+
+      const lyricText = line.replace(timeTagRegex, "").trim();
+      if (isMeta.test(lyricText)) continue;
+
+      for (const t of timestamps) {
+        result.push({ time: t, text: lyricText });
+      }
+    }
+    return result;
   };
 
-  const lines: LyricLine[] = [];
+  const parsedBase = parseAllLines(lrc);
   const translationMap = new Map<number, string>();
 
   if (tlyric) {
-    for (const line of tlyric.split("\n")) {
-      const parsed = parseLine(line);
-      if (parsed) {
-        translationMap.set(Math.round(parsed.time * 100), parsed.text);
+    for (const item of parseAllLines(tlyric)) {
+      if (item.text) {
+        translationMap.set(Math.round(item.time * 100), item.text);
       }
     }
   }
 
-  for (const line of lrc.split("\n")) {
-    const parsed = parseLine(line);
-    if (parsed) {
-      const timeKey = Math.round(parsed.time * 100);
-      lines.push({
-        time: parsed.time,
-        text: parsed.text,
-        translation: translationMap.get(timeKey),
-      });
-    }
+  const lines: LyricLine[] = [];
+  for (const item of parsedBase) {
+    if (!item.text) continue;
+    const timeKey = Math.round(item.time * 100);
+    lines.push({
+      time: item.time,
+      text: item.text,
+      translation: translationMap.get(timeKey),
+    });
   }
 
   return lines.sort((a, b) => a.time - b.time);

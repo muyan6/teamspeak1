@@ -83,6 +83,31 @@ describe("database", () => {
     expect(history[1].requestedBy).toBe("alice");
   });
 
+  it("batches and prunes play history without losing latest entries", () => {
+    for (let i = 1; i <= 60; i++) {
+      botDb.addPlayHistory({
+        botId: "bot1",
+        songId: `song${i}`,
+        songName: `Song ${i}`,
+        artist: "Artist",
+        album: "Album",
+        platform: "netease",
+        coverUrl: "",
+      });
+    }
+
+    const history = botDb.getPlayHistory("bot1", 100);
+    expect(history).toHaveLength(60);
+    expect(history[0].songName).toBe("Song 60");
+
+    // Explicit prune to limit of 10
+    botDb.prunePlayHistory?.("bot1", 10);
+    const pruned = botDb.getPlayHistory("bot1", 100);
+    expect(pruned).toHaveLength(10);
+    expect(pruned[0].songName).toBe("Song 60");
+    expect(pruned[9].songName).toBe("Song 51");
+  });
+
   it("saves and loads bot instances", () => {
     const instance: BotInstance = {
       id: "bot1",

@@ -21,6 +21,30 @@ describe("NetEase adapter", () => {
     expect(lines).toHaveLength(0);
   });
 
+  it("handles multi-timestamp lines and sorts chronologically", () => {
+    const lrc = `[00:30.00][00:10.00]Repeated chorus
+[00:05.50]Intro
+[120:00.00]Epilogue`;
+    const lines = parseLyrics(lrc);
+    expect(lines).toHaveLength(4);
+    expect(lines[0].time).toBeCloseTo(5.5, 1);
+    expect(lines[0].text).toBe("Intro");
+    expect(lines[1].time).toBe(10);
+    expect(lines[1].text).toBe("Repeated chorus");
+    expect(lines[2].time).toBe(30);
+    expect(lines[2].text).toBe("Repeated chorus");
+    expect(lines[3].time).toBe(7200);
+    expect(lines[3].text).toBe("Epilogue");
+  });
+
+  it("handles timestamps without milliseconds", () => {
+    const lrc = "[01:15]Line without ms";
+    const lines = parseLyrics(lrc);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].time).toBe(75);
+    expect(lines[0].text).toBe("Line without ms");
+  });
+
   it("merges translation lyrics", () => {
     const lrc = "[00:12.50]Hello world";
     const tlyric = "[00:12.50]你好世界";

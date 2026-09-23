@@ -9,13 +9,36 @@ import { createSessionStore } from "../data/sessions.js";
 import { validateSessionFromHeaders, SESSION_COOKIE_NAME } from "./auth/validateSession.js";
 import { setupWebSocket } from "./websocket.js";
 
-function buildServer(sessions: ReturnType<typeof createSessionStore>) {
+function buildServer(
+  sessions: ReturnType<typeof createSessionStore>,
+  options: { canonicalHost?: string; trustProxy?: boolean } = {},
+) {
   const app = express();
+  if (options.canonicalHost) app.set("canonicalHost", options.canonicalHost);
   const server = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true });
   wss.on("connection", (ws) => ws.send("hello"));
   server.on("upgrade", (req, socket, head) => {
     if (req.url !== "/ws") return socket.destroy();
+    const canonicalHost = app.get("canonicalHost") as string | undefined;
+    const isProxyTrusted = Boolean(options.trustProxy);
+    const forwardedHost = isProxyTrusted
+      ? (req.headers["x-forwarded-host"] as string | undefined)?.split(",")[0].trim()
+      : undefined;
+    const expectedHost = canonicalHost ?? (forwardedHost || req.headers.host);
+
+    const originHeader = req.headers.origin;
+    if (originHeader) {
+      let originHost: string | null = null;
+      try {
+        originHost = new URL(originHeader).host;
+      } catch {}
+      if (!originHost || originHost !== expectedHost) {
+        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+    }
     const r = validateSessionFromHeaders(req.headers.cookie as string | undefined, sessions);
     if (!r) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
@@ -71,6 +94,95 @@ describe("WebSocket auth at upgrade", () => {
     });
     expect(msg).toBe("hello");
     ws.close();
+  });
+});
+
+describe("WebSocket upgrade origin check with reverse proxy", () => {
+  let botDb: BotDatabase;
+  let httpServer: http.Server;
+  let port: number;
+  let validToken: string;
+  let sessions: ReturnType<typeof createSessionStore>;
+
+  beforeEach(async () => {
+    botDb = createDatabase(":memory:");
+    const users = createUserStore(botDb.db);
+    sessions = createSessionStore(botDb.db);
+    const u = await users.createUser("alice", "pw-alice", "admin");
+    validToken = sessions.createSession(u.id).token;
+  });
+
+  afterEach(async () => {
+    if (httpServer) {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+    botDb.close();
+  });
+
+  it("accepts upgrade when Origin matches canonicalHost even if Host header is localhost", async () => {
+    const { server } = buildServer(sessions, { canonicalHost: "music.example.com" });
+    httpServer = server;
+    await new Promise<void>((resolve) => httpServer.listen(0, resolve));
+    port = (httpServer.address() as AddressInfo).port;
+
+    const ws = new WSClient(`ws://127.0.0.1:${port}/ws`, {
+      headers: {
+        Cookie: `${SESSION_COOKIE_NAME}=${validToken}`,
+        Origin: "https://music.example.com",
+        Host: `127.0.0.1:${port}`,
+      },
+    });
+
+    const msg = await new Promise<string>((resolve, reject) => {
+      ws.on("message", (data) => resolve(data.toString()));
+      ws.on("error", reject);
+    });
+    expect(msg).toBe("hello");
+    ws.close();
+  });
+
+  it("accepts upgrade when Origin matches x-forwarded-host under trustProxy", async () => {
+    const { server } = buildServer(sessions, { trustProxy: true });
+    httpServer = server;
+    await new Promise<void>((resolve) => httpServer.listen(0, resolve));
+    port = (httpServer.address() as AddressInfo).port;
+
+    const ws = new WSClient(`ws://127.0.0.1:${port}/ws`, {
+      headers: {
+        Cookie: `${SESSION_COOKIE_NAME}=${validToken}`,
+        Origin: "https://proxy.example.com",
+        "X-Forwarded-Host": "proxy.example.com",
+        Host: `127.0.0.1:${port}`,
+      },
+    });
+
+    const msg = await new Promise<string>((resolve, reject) => {
+      ws.on("message", (data) => resolve(data.toString()));
+      ws.on("error", reject);
+    });
+    expect(msg).toBe("hello");
+    ws.close();
+  });
+
+  it("rejects upgrade with 403 when Origin does not match expected host", async () => {
+    const { server } = buildServer(sessions, { canonicalHost: "music.example.com" });
+    httpServer = server;
+    await new Promise<void>((resolve) => httpServer.listen(0, resolve));
+    port = (httpServer.address() as AddressInfo).port;
+
+    const ws = new WSClient(`ws://127.0.0.1:${port}/ws`, {
+      headers: {
+        Cookie: `${SESSION_COOKIE_NAME}=${validToken}`,
+        Origin: "https://malicious.example.com",
+        Host: `127.0.0.1:${port}`,
+      },
+    });
+
+    const result = await new Promise<string>((resolve) => {
+      ws.on("unexpected-response", (_req, res) => resolve(`status:${res.statusCode}`));
+      ws.on("error", () => resolve("error"));
+    });
+    expect(result).toBe("status:403");
   });
 });
 
