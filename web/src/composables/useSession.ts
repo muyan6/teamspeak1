@@ -20,6 +20,11 @@ const POLL_INTERVAL_MS = 60_000;
 function ensurePollStarted() {
   if (pollTimer !== null) return;
   pollTimer = setInterval(() => {
+    // Skip while the tab is hidden. The poll only exists to notice a role /
+    // permission change made in another tab; a backgrounded tab issuing
+    // /api/session/me every minute forever is pure wasted traffic (and the app
+    // can be left open for days).
+    if (typeof document !== "undefined" && document.hidden) return;
     if (currentUser.value !== null) {
       // Best-effort refresh; ignore errors (network blips etc.)
       refreshMe().catch(() => {});

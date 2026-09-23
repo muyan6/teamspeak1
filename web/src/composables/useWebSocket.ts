@@ -2,12 +2,25 @@ import { ref, onUnmounted } from 'vue';
 import { usePlayerStore } from '../stores/player.js';
 import { devLog, devWarn } from '../utils/log.js';
 
+const RECONNECT_BASE_MS = 3000;
+const RECONNECT_MAX_MS = 60000;
+/**
+ * Close codes that mean "do not retry". The server rejects a bad/expired session
+ * during the upgrade handshake, which the browser surfaces as a close — retrying
+ * every 3s from a logged-out tab hammered the server's session lookup forever.
+ */
+const NO_RETRY_CODES = new Set([1008, 4001, 4401, 4403]);
+/** Handshake failures in a row before we stop retrying and re-check the session. */
+const MAX_FAILED_HANDSHAKES = 4;
+
 export function useWebSocket() {
   const connected = ref(false);
   let ws: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectAttempts = 0;
+  let consecutiveFailedHandshakes = 0;
   // Set by disconnect(). Without it, closing the socket fires onclose, whose
-  // handler re-arms the 3s reconnect — so a deliberate teardown (route change /
+  // handler re-arms the reconnect — so a deliberate teardown (route change /
   // unmount) silently resurrected the connection and leaked a socket + timer.
   let disposed = false;
 
@@ -20,10 +33,18 @@ export function useWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws`;
 
+    // Whether THIS attempt ever reached onopen. A handshake the server rejected
+    // (expired cookie, revoked session, guest mode off) closes before opening,
+    // and the browser reports it as a generic close — so the code alone cannot
+    // distinguish it from a transient failure. Counting opens-per-attempt does.
+    let openedThisAttempt = false;
     ws = new WebSocket(url);
 
     ws.onopen = () => {
       connected.value = true;
+      openedThisAttempt = true;
+      reconnectAttempts = 0;
+      consecutiveFailedHandshakes = 0;
       devLog('WebSocket connected');
     };
 
@@ -85,13 +106,40 @@ export function useWebSocket() {
       }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       connected.value = false;
       ws = null;
       if (disposed) return;
-      // Reconnect after 3 seconds
+      // A rejected handshake (expired/revoked session, guest mode turned off) is
+      // not transient: stop retrying and let the next API call's 401 handler
+      // send the user to /login. Everything else backs off exponentially so a
+      // server restart or a flaky network cannot turn every open tab into a
+      // fixed-rate reconnect loop.
+      if (NO_RETRY_CODES.has(event?.code)) {
+        devWarn('WebSocket closed by policy; not reconnecting', event?.code);
+        return;
+      }
+      // Repeated handshake rejections mean the session is no longer valid (the
+      // server answers an unauthenticated upgrade with a plain HTTP error, so
+      // there is no meaningful close code). Stop retrying, refresh the session,
+      // and let the shared 401 handler route the user to /login instead of
+      // hammering the upgrade endpoint forever from a stale tab.
+      if (!openedThisAttempt) {
+        consecutiveFailedHandshakes += 1;
+        if (consecutiveFailedHandshakes >= MAX_FAILED_HANDSHAKES) {
+          devWarn('WebSocket handshake rejected repeatedly; stopping reconnect');
+          import('../composables/useSession.js')
+            .then(({ useSession }) => useSession().refresh())
+            .catch(() => {});
+          return;
+        }
+      } else {
+        consecutiveFailedHandshakes = 0;
+      }
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(connect, 3000);
+      const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** reconnectAttempts);
+      reconnectAttempts = Math.min(reconnectAttempts + 1, 10);
+      reconnectTimer = setTimeout(connect, delay);
     };
 
     ws.onerror = () => {
@@ -101,6 +149,8 @@ export function useWebSocket() {
 
   function disconnect() {
     disposed = true;
+    reconnectAttempts = 0;
+    consecutiveFailedHandshakes = 0;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;

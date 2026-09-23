@@ -6,6 +6,33 @@ export interface ParsedCommand {
 }
 
 /**
+ * The only `-x` tokens treated as flags. Anything else that merely LOOKS like a
+ * flag (`-b`, `-y`, … appearing inside a song title or artist name) stays part
+ * of the search query instead of being silently swallowed.
+ *
+ * Previously any two-character token starting with `-` whose second character
+ * was a letter became a flag, so `!play A-Lin -b 给我一个理由` dropped `-b` from
+ * the query AND switched the source. Restricting to the known set keeps every
+ * documented flag working (`-b -q -y -k -s -l -n -j` for sources, `-a` for
+ * `!load`) while a hyphenated word like `-pop` survives as search text.
+ *
+ * Kept in sync with BotInstance.FLAG_PLATFORMS by hand: adding a source flag
+ * there means adding its letter here too, or the new flag parses as plain query
+ * text. `commands.test.ts` covers the documented flags.
+ */
+export const KNOWN_FLAG_LETTERS = new Set([
+  "b", // bilibili
+  "q", // qq
+  "y", // youtube
+  "k", // kugou
+  "s", // spotify
+  "l", // local
+  "n", // netease
+  "j", // jellyfin
+  "a", // !load -a (append)
+]);
+
+/**
  * The fixed set of "admin" chat commands. This is the SINGLE source of truth
  * for which commands the permission gate restricts; reclassifying a command is
  * a one-line edit here. Everything not in this set is public.
@@ -37,9 +64,9 @@ export function parseCommand(
 
   for (let i = 1; i < parts.length; i++) {
     if (
-      parts[i].startsWith("-") &&
       parts[i].length === 2 &&
-      /[a-zA-Z]/.test(parts[i][1])
+      parts[i].startsWith("-") &&
+      KNOWN_FLAG_LETTERS.has(parts[i][1].toLowerCase())
     ) {
       flags.add(parts[i][1].toLowerCase());
     } else {

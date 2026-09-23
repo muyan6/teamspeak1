@@ -840,7 +840,12 @@ describe("BotInstance.cmdRemove — spotify current-track reconciliation (R3-2)"
     expect(ctx.currentSourceIsSpotify).toBe(true);
   });
 
-  it("does NOT stop the sidecar when the current track is NOT spotify (URL self-heals)", async () => {
+  // Removing the AUDIBLE track must always stop + advance, whatever the source.
+  // A URL track does NOT "self-heal": queue.remove() steps currentIndex back one
+  // slot, so the ffmpeg process kept playing the deleted entry while getStatus()
+  // / !now / the WebUI all reported the PREVIOUS song. Only the Spotify case was
+  // reconciled before; the netease case is the same bug with a different player.
+  it("stops and advances when removing the current NON-spotify (URL) track", async () => {
     const ctx = makeRemoveCtx({
       currentIndex: 0,
       currentSourceIsSpotify: false, // current is a URL track
@@ -850,8 +855,8 @@ describe("BotInstance.cmdRemove — spotify current-track reconciliation (R3-2)"
     await cmdRemove.call(ctx, { args: "1" }); // index 0 == current
 
     expect(ctx.spotifyController.stop).not.toHaveBeenCalled();
-    expect(ctx.player.stop).not.toHaveBeenCalled();
-    expect(ctx.playNext).not.toHaveBeenCalled();
+    expect(ctx.player.stop).toHaveBeenCalledTimes(1);
+    expect(ctx.playNext).toHaveBeenCalledTimes(1);
   });
 
   it("returns 'Invalid position' without touching the sidecar on a bad index", async () => {
@@ -1758,5 +1763,28 @@ describe("BotInstance auto-reconnect on unexpected disconnect", () => {
     expect(bot.getReconnectAttempts()).toBe(0);
     expect(bot.isReconnecting()).toBe(false);
     expect((bot as any).connected).toBe(true);
+  });
+
+  it("filters out bots and queries in getHumanListenersInChannel", () => {
+    const bot = makeReconnectBot();
+    const selfClid = (bot as any).tsClient.getClientId();
+    (bot as any).managedVoiceClients.register(
+      { host: "127.0.0.1", voicePort: 9987 },
+      99,
+      "other-bot-token",
+      "managed-uid-2",
+    );
+
+    const channelClients = [
+      { id: selfClid, nickname: "SelfBot", uid: "self-uid", type: 0 },
+      { id: 10, nickname: "HumanUser1", uid: "human-1", type: 0 },
+      { id: 11, nickname: "ServerQueryBot", uid: "serveradmin", type: 1 },
+      { id: 12, nickname: "HumanUser2", uid: "human-2", type: 0 },
+      { id: 99, nickname: "OtherMusicBot", uid: "managed-uid-2", type: 0 },
+    ];
+
+    const humanListeners = bot.getHumanListenersInChannel(channelClients as any);
+    expect(humanListeners).toHaveLength(2);
+    expect(humanListeners.map((c) => c.nickname)).toEqual(["HumanUser1", "HumanUser2"]);
   });
 });

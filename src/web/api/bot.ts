@@ -12,6 +12,24 @@ import type { ServerProtocol } from "../../ts-protocol/client.js";
 
 class InvalidBotInputError extends Error {}
 
+/**
+ * Minimal magic-byte check for the three avatar formats the store accepts
+ * (png / jpeg / webp). Used to reject a payload whose declared data-URL MIME
+ * does not match its actual bytes.
+ */
+function looksLikeImage(buf: Buffer, mime: string): boolean {
+  if (buf.length < 12) return false;
+  const png = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+  const jpeg = buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+  // "RIFF" .... "WEBP"
+  const webp =
+    buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP";
+  if (mime === "image/png") return png;
+  if (mime === "image/jpeg") return jpeg;
+  if (mime === "image/webp") return webp;
+  return false;
+}
+
 function requiredBotText(value: unknown, field: string, maxLength: number): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new InvalidBotInputError(`${field} is required`);
@@ -524,6 +542,15 @@ export function createBotRouter(
     }
     if (buf.length > 200 * 1024) {
       res.status(413).json({ error: "avatar exceeds 200KB limit" });
+      return;
+    }
+    // Verify the bytes really are the claimed image type. The MIME comes from
+    // the data-URL prefix, i.e. from the client, and the result is written to
+    // data/avatars/ and later shipped with that Content-Type — so a `bot.manage`
+    // holder could previously store arbitrary non-image content under
+    // "image/png". Magic bytes are a cheap sanity check, not a full decoder.
+    if (!looksLikeImage(buf, mime)) {
+      res.status(400).json({ error: "dataUrl content does not match its declared image type" });
       return;
     }
     const rel = avatarStore.write(req.params.id, mime, buf);

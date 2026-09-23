@@ -140,9 +140,16 @@ export class PlayQueue {
     this.nextRandomCandidate = null;
     const [removed] = this.songs.splice(index, 1);
 
-    if (index < this.currentIndex) {
-      this.currentIndex--;
-    } else if (index === this.currentIndex) {
+    // Removing the current entry — or anything before it — shifts every later
+    // song down one slot, so step the pointer back: the next next() then lands
+    // on the song that slid into the removed slot. (Both branches used to be
+    // spelled out separately with identical bodies.)
+    //
+    // NOTE: this only keeps the QUEUE consistent. A caller that removes the
+    // AUDIBLE track must also restart playback itself — see
+    // BotCommandHandler.cmdRemove — because the queue cannot know whether the
+    // removed song is the one currently coming out of the speakers.
+    if (index <= this.currentIndex) {
       this.currentIndex--;
     }
 

@@ -277,7 +277,10 @@ export function createPlayerRouter(
   });
 
   // Get current elapsed time (ground truth from server)
-  router.get("/:botId/elapsed", (req, res) => {
+  // Read-only, but still gated on requireNotGuest: guests are scoped to a
+  // whitelist of playback ACTIONS, and exposing live progress/queue/history to
+  // a login-less visitor is data these routes were never meant to publish.
+  router.get("/:botId/elapsed", requireNotGuest, (req, res) => {
       const bot = requestBot(req);
     res.json({ elapsed: bot.getPlayer().getElapsed() });
   });
@@ -302,7 +305,7 @@ export function createPlayerRouter(
     }
   });
 
-  router.get("/:botId/queue", (req, res) => {
+  router.get("/:botId/queue", requireNotGuest, (req, res) => {
       const bot = requestBot(req);
     res.json({ queue: bot.getQueue(), status: bot.getStatus() });
   });
@@ -802,13 +805,22 @@ export function createPlayerRouter(
     }
   });
 
-  router.get("/:botId/history", (req, res) => {
+  router.get("/:botId/history", requireNotGuest, (req, res) => {
     if (!database) {
       res.json({ history: [] });
       return;
     }
-    const limit = parseInt(req.query.limit as string) || 50;
-    const records = database.getPlayHistory(req.params.botId, limit);
+    // Clamp the limit. `parseInt(x) || 50` let a NEGATIVE value through (only
+    // 0/NaN fall back), and SQLite reads `LIMIT -1` as "no limit" — so
+    // `?limit=-1` dumped the bot's entire play history in one response. An
+    // absurdly large positive value had the same effect.
+    const rawLimit = parseInt(req.query.limit as string, 10);
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(500, Math.max(1, rawLimit))
+      : 50;
+    // String() because attaching an extra RequestHandler above widens the
+    // inferred params type to ParamsDictionary (string | string[]).
+    const records = database.getPlayHistory(String(req.params.botId), limit);
     const history = records.map((r) => ({
       id: r.songId,
       name: r.songName,

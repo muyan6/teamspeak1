@@ -993,6 +993,11 @@ export class AudioPlayer extends EventEmitter {
     // transport is delegated to the SpotifyController by the caller (Task 7).
     if (this.externalMode) return;
     if (this.currentUrl && Number.isFinite(seconds) && seconds >= 0) {
+      // play() bails out with an "ffmpeg unavailable" error once the failure
+      // counter hits MAX_CONSECUTIVE_FAILURES, so without this reset a user who
+      // hit three bad tracks could never seek again — the slider would silently
+      // do nothing for the rest of the session.
+      this.consecutiveFailures = 0;
       this.play(this.currentUrl, seconds, this.currentSongDuration);
     }
   }

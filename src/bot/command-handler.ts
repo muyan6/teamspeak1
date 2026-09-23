@@ -313,16 +313,30 @@ export class BotCommandHandler {
   async cmdRemove(cmd: ParsedCommand): Promise<string> {
     const index = parseInt(cmd.args, 10) - 1;
     if (isNaN(index) || index < 0) return "Usage: !remove <number>";
-    const removingCurrentSpotify =
-      index === this.bot.queue.getCurrentIndex() && this.bot.currentSourceIsSpotify;
+    // Removing the AUDIBLE track is a different operation from removing any
+    // other slot: the audio must actually stop and the next song must start,
+    // or the queue pointer (now stepped back by remove()) no longer matches
+    // what is coming out of the speakers — `!now` / WebUI / play history would
+    // all report the wrong song while the removed one kept playing. This was
+    // only handled for Spotify; URL tracks kept playing the deleted entry.
+    const removingCurrent = index === this.bot.queue.getCurrentIndex();
     const removed = this.bot.queue.remove(index);
     if (!removed) return "Invalid position";
-    if (removingCurrentSpotify) {
-      this.bot.spotifyController.stop();
-      this.bot.currentSourceIsSpotify = false;
+    if (removingCurrent) {
+      // Only a Spotify track needs the sidecar stopped; a URL track is silenced
+      // by player.stop() below.
+      if (this.bot.currentSourceIsSpotify) {
+        this.bot.spotifyController.stop();
+        this.bot.currentSourceIsSpotify = false;
+      }
       this.bot.player.stop();
+      this.bot.jellyfinReporter?.onStop();
       await this.bot.playNext();
     }
+    // Sweep AFTER playback has moved on: the removed song is now unreferenced
+    // (so a finished local upload is deleted) while the newly-current song is
+    // still queued and therefore preserved. Sweeping before playNext() used to
+    // race the still-open ffmpeg handle on the file being removed.
     this.bot.sweepLocalAudio("removed_from_queue");
     this.bot.emit("stateChange");
     return `Removed: ${removed.name}`;
@@ -461,7 +475,10 @@ export class BotCommandHandler {
     if (!msg) return "Vote can only be used in TeamSpeak";
     this.bot.voteSkipUsers.add(msg.invokerUid);
     const clients = await this.bot.tsClient.getClientsInChannel();
-    const totalUsers = clients.length - 1;
+    const realListeners = typeof this.bot.getHumanListenersInChannel === "function"
+      ? this.bot.getHumanListenersInChannel(clients)
+      : clients.filter((c) => c.id !== this.bot.tsClient.getClientId() && c.type !== 1);
+    const totalUsers = realListeners.length;
     const needed = Math.max(1, Math.ceil(totalUsers / 2));
     const votes = this.bot.voteSkipUsers.size;
 

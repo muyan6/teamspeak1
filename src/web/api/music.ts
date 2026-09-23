@@ -60,6 +60,32 @@ export function createLocalUploadBody(limit: string): express.RequestHandler {
 
 const localUploadBody = createLocalUploadBody(LOCAL_UPLOAD_LIMIT);
 
+/**
+ * Every audio-quality tier recognized by at least one provider, as accepted by
+ * POST /api/music/quality. This is the union across sources — a platform-less
+ * "broadcast" sends one value to all of them and each keeps only the tiers it
+ * knows (jellyfin ignores `lossless`, netease ignores `direct`).
+ *
+ * NetEase/QQ: standard | higher | exhigh | lossless | hires | jymaster
+ * Jellyfin:   direct | 320 | 192 | 128
+ * Kugou:      standard | higher | exhigh | lossless | hires | 128 | 320 | flac | high
+ * Bilibili / Spotify: free-form passthrough, so they accept any of the above.
+ */
+const KNOWN_QUALITY_VALUES = new Set([
+  "standard",
+  "higher",
+  "exhigh",
+  "lossless",
+  "hires",
+  "jymaster",
+  "direct",
+  "128",
+  "192",
+  "320",
+  "flac",
+  "high",
+]);
+
 export function createMusicRouter(
   neteaseProvider: MusicProvider,
   qqProvider: MusicProvider,
@@ -630,6 +656,17 @@ export function createMusicRouter(
     const { quality, platform } = req.body;
     if (!quality) {
       res.status(400).json({ error: "quality is required" });
+      return;
+    }
+    // Validate the value here rather than trusting each provider's setQuality()
+    // to ignore junk. Some of them (bilibili, spotify) store the string verbatim
+    // and feed it straight into an upstream API parameter, so an object or a
+    // 10 KB string reached the request URL. The union below is every tier any
+    // provider recognizes; a provider silently ignores a tier that isn't its own
+    // (jellyfin drops `lossless`, netease drops `direct`), which is the intended
+    // cross-platform broadcast behavior.
+    if (typeof quality !== "string" || !KNOWN_QUALITY_VALUES.has(quality)) {
+      res.status(400).json({ error: "invalid quality" });
       return;
     }
     if (!platform || platform === "netease") {

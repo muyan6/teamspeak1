@@ -37,7 +37,7 @@ import { createRequireAuth } from "./middleware/requireAuth.js";
 import { requireAdmin } from "./middleware/requireAdmin.js";
 import { requireNotGuest } from "./middleware/requireNotGuest.js";
 import { csrfOriginCheck } from "./middleware/csrf.js";
-import { createRateLimit } from "./middleware/rateLimit.js";
+import { createRateLimit, createRateLimitBucket } from "./middleware/rateLimit.js";
 import { validateSessionFromHeaders } from "./auth/validateSession.js";
 
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
@@ -88,6 +88,18 @@ export function createWebServer(options: WebServerOptions): WebServer {
     // does append, so bind the app to the proxy (do not expose webPort publicly)
     // if per-IP throttling must be trustworthy.
     app.set("trust proxy", true);
+    // The permissive `true` above only yields trustworthy per-IP throttling when
+    // the operator has ALSO pinned the canonical host via publicUrl. Without it,
+    // the CSRF fallback compares two client-supplied headers against each other.
+    // That is a documented trade-off, not a bug — but it should be visible in
+    // the startup log rather than only in this comment.
+    if (!(options.config.publicUrl ?? "").trim()) {
+      logger.warn(
+        "trustProxy is enabled but publicUrl is empty — set publicUrl to the public " +
+          "origin so CSRF host checks and per-IP rate limiting cannot be spoofed via " +
+          "forwarded headers",
+      );
+    }
   }
 
   // Canonical origin for CSRF host comparison (config.publicUrl when set), so
@@ -166,7 +178,13 @@ export function createWebServer(options: WebServerOptions): WebServer {
   app.use("/api", csrfOriginCheck);
 
   // Anti-DoS: throttle auth endpoints.
-  // 5 req per minute per (IP + username) for /login to avoid subnet-wide lockouts.
+  // 5 req per minute per (IP + username) for /login to avoid subnet-wide lockouts,
+  // PLUS a coarser per-IP ceiling. The username component alone was bypassable:
+  // an attacker rotating usernames got a fresh 5-request bucket for every guess,
+  // so password spraying against many accounts was effectively unthrottled. The
+  // per-IP bucket caps the TOTAL login volume from one address while the
+  // per-(IP+user) bucket still protects a single account from a shared-NAT
+  // neighbour's failures.
   // 3 req per minute per IP for /setup (more limited; first-run is rare).
   // 10 req per minute per IP for /guest.
   const loginLimit = createRateLimit({
@@ -174,11 +192,17 @@ export function createWebServer(options: WebServerOptions): WebServer {
     refillPerSec: 5 / 60,
     keyFn: (req) => `${req.ip}:${String(req.body?.username ?? "").trim().toLowerCase()}`,
   });
+  const loginIpLimit = createRateLimit({ capacity: 20, refillPerSec: 20 / 60 });
   const setupLimit = createRateLimit({ capacity: 3, refillPerSec: 3 / 60 });
   const guestLimit = createRateLimit({ capacity: 10, refillPerSec: 10 / 60 });
-  app.use("/api/session/login", loginLimit);
+  app.use("/api/session/login", loginIpLimit, loginLimit);
   app.use("/api/session/setup", setupLimit);
   app.use("/api/session/guest", guestLimit);
+
+  // The /ws upgrade path authenticates (and touches the session row) BEFORE any
+  // Express middleware runs, so it needs its own limiter — otherwise a client
+  // stuck in a reconnect loop drives one DB write per attempt, unthrottled.
+  const wsUpgradeLimit = createRateLimitBucket({ capacity: 30, refillPerSec: 30 / 60 });
 
   // WebSocket sockets authenticate ONCE at upgrade, so a logout / permission
   // revocation never reached the already-open socket. Both routers below are
@@ -316,7 +340,10 @@ export function createWebServer(options: WebServerOptions): WebServer {
   // ─── Static SPA (public) ────────────────────────────────────────────────
   if (options.staticDir) {
     app.use(express.static(options.staticDir));
-    app.get(/^(?!\/api|\/ws)/, (_req, res) => {
+    // Negative lookahead is anchored at a path boundary: without the (\/|$) the
+    // exclusion also swallowed any future route merely STARTING with those
+    // letters (e.g. "/apixyz"), silently serving the SPA shell instead of 404.
+    app.get(/^(?!\/(?:api|ws)(?:\/|$))/, (_req, res) => {
       res.sendFile(path.join(options.staticDir!, "index.html"));
     });
   }
@@ -335,7 +362,33 @@ export function createWebServer(options: WebServerOptions): WebServer {
       socket.destroy();
       return;
     }
-    const reqHost = req.headers.host;
+    // Throttle the handshake itself. This handler runs BEFORE any Express
+    // middleware and talks to a raw socket, so it consumes the bucket directly
+    // rather than going through the RequestHandler form. Without it, a client
+    // stuck in a reconnect loop drove one session-table write per attempt,
+    // unthrottled. Rejected handshakes answer 429 and close before the session
+    // lookup below.
+    //
+    // `req.socket.remoteAddress` is used rather than `req.ip` because the
+    // Express trust-proxy setting does not apply to this hand-rolled path;
+    // behind a proxy this throttles per proxy hop, which is strictly safer than
+    // not throttling at all.
+    const wsKey = req.socket?.remoteAddress ?? "unknown";
+    const wsVerdict = wsUpgradeLimit.tryConsume(wsKey);
+    if (wsVerdict !== true) {
+      socket.write(
+        `HTTP/1.1 429 Too Many Requests\r\nRetry-After: ${wsVerdict}\r\nConnection: close\r\n\r\n`,
+      );
+      socket.destroy();
+      return;
+    }
+    const canonicalHost = app.get("canonicalHost") as string | undefined;
+    const isProxyTrusted = Boolean(options.config.trustProxy);
+    const forwardedHost = isProxyTrusted
+      ? (req.headers["x-forwarded-host"] as string | undefined)?.split(",")[0].trim()
+      : undefined;
+    const expectedHost = canonicalHost ?? (forwardedHost || req.headers.host);
+
     const originHeader = req.headers.origin;
     if (originHeader) {
       let originHost: string | null = null;
@@ -344,7 +397,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
       } catch {
         // fall through; treat as missing/invalid origin
       }
-      if (!originHost || originHost !== reqHost) {
+      if (!originHost || originHost !== expectedHost) {
         socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
         socket.destroy();
         return;

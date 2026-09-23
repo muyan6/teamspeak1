@@ -295,6 +295,8 @@ export class LocalMusicProvider implements MusicProvider {
    */
   private readonly fileExistsCache = new Map<string, number>();
   private static readonly FILE_EXISTS_TTL_MS = 60_000;
+  /** Upper bound on cached "this file exists" entries (see markFilePresent). */
+  private static readonly FILE_EXISTS_CACHE_MAX = 5_000;
 
   constructor(uploadDir: string, options: LocalMusicProviderOptions = {}) {
     this.uploadDir = uploadDir;
@@ -363,7 +365,7 @@ export class LocalMusicProvider implements MusicProvider {
     }
     const exists = existsSync(record.filePath);
     if (exists) {
-      this.fileExistsCache.set(record.id, Date.now());
+      this.markFilePresent(record.id);
     } else {
       this.fileExistsCache.delete(record.id);
     }
@@ -372,6 +374,25 @@ export class LocalMusicProvider implements MusicProvider {
 
   /** Mark a record as present without a stat (used right after a write). */
   private markFilePresent(id: string): void {
+    // Bound the map: it is only ever cleared wholesale by rebuildSearchIndex(),
+    // so without this an install that uploaded thousands of files over months
+    // kept one Map entry per id forever. Eviction is by TTL where possible and
+    // oldest-inserted otherwise; a false negative just costs one stat, so this
+    // cache is safe to lose entries from.
+    if (!this.fileExistsCache.has(id) &&
+        this.fileExistsCache.size >= LocalMusicProvider.FILE_EXISTS_CACHE_MAX) {
+      const now = Date.now();
+      for (const [key, at] of this.fileExistsCache) {
+        if (now - at >= LocalMusicProvider.FILE_EXISTS_TTL_MS) {
+          this.fileExistsCache.delete(key);
+        }
+      }
+      while (this.fileExistsCache.size >= LocalMusicProvider.FILE_EXISTS_CACHE_MAX) {
+        const oldest = this.fileExistsCache.keys().next().value;
+        if (oldest === undefined) break;
+        this.fileExistsCache.delete(oldest);
+      }
+    }
     this.fileExistsCache.set(id, Date.now());
   }
 

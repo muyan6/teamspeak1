@@ -4,6 +4,7 @@ import {
   type TS3ClientOptions,
   type TS3TextMessage,
   type TS3VoiceActivity,
+  type ClientInfo,
 } from "../ts-protocol/client.js";
 import { AudioPlayer } from "../audio/player.js";
 import { PlayQueue, PlayMode, parsePlayMode, type QueuedSong } from "../audio/queue.js";
@@ -214,6 +215,8 @@ export class BotInstance extends EventEmitter {
   /** 当前曲实际播放时长（试听片段秒数或完整 duration）；resolveAndPlay 赋值。 */
   private effectiveDuration: number | undefined;
   private playGate: Promise<unknown> = Promise.resolve();
+  /** Serializes chunked chat replies (see enqueueReply / sendChunked). */
+  private replyGate: Promise<unknown> = Promise.resolve();
   /** Per-bot Jellyfin playback-report session (start / ~10s progress / stop).
    *  null when the wired provider has no reporting capability. */
   jellyfinReporter: JellyfinPlaybackReporter | null = null;
@@ -595,6 +598,17 @@ export class BotInstance extends EventEmitter {
     }
   }
 
+  /** Filter channel clients down to real human listeners, excluding bots and queries. */
+  getHumanListenersInChannel(clients: ClientInfo[]): ClientInfo[] {
+    return clients.filter((c) => {
+      if (c.id === this.tsClient.getClientId()) return false;
+      if (c.type === 1) return false; // Exclude ServerQuery / Query bots
+      if (c.uid && this.managedVoiceClients.hasClientUid(c.uid)) return false; // Exclude other managed music bots
+      if (this.managedVoiceClients.has(this.voiceServerScope, c.id)) return false;
+      return true;
+    });
+  }
+
   private async refreshOccupancy(): Promise<void> {
     if (!this.connected) return;
     if (this.occupancyRefreshInFlight) {
@@ -606,13 +620,7 @@ export class BotInstance extends EventEmitter {
     try {
       const clients = await this.tsClient.getClientsInChannel();
       if (!this.connected || generation !== this.occupancyGeneration) return;
-      const realListeners = clients.filter((c) => {
-        if (c.id === this.tsClient.getClientId()) return false;
-        if (c.type === 1) return false; // Exclude ServerQuery / Query bots
-        if (c.uid && this.managedVoiceClients.hasClientUid(c.uid)) return false; // Exclude other managed music bots
-        if (this.managedVoiceClients.has(this.voiceServerScope, c.id)) return false;
-        return true;
-      });
+      const realListeners = this.getHumanListenersInChannel(clients);
       const userCount = realListeners.length;
       this.handleOccupancy(userCount);
       const channelId = this.tsClient.getChannelId().toString();
@@ -1058,13 +1066,31 @@ export class BotInstance extends EventEmitter {
         // A single long reply (e.g. full lyrics) would exceed TeamSpeak's
         // per-message byte cap, so split it and send the chunks in order with
         // an anti-flood pacing delay between chunks.
-        const chunks = splitTextIntoChunks(response);
-        for (let i = 0; i < chunks.length; i++) {
-          if (i > 0) {
-            await new Promise((resolve) => setTimeout(resolve, 200));
+        //
+        // The send loop runs inside its OWN serialization gate, separate from
+        // the command gate: a 40-chunk !lyrics reply takes ~8s of paced sends,
+        // and two users issuing long commands at once used to interleave their
+        // chunks into one garbled stream. Queueing whole replies keeps each
+        // command's output contiguous, while holding the PLAY lock through the
+        // pacing would stall every unrelated transport command for those 8s.
+        //
+        // `replyGate` is read through `?? Promise.resolve()` so lightweight
+        // test doubles (which only provide the handful of members a command
+        // touches) keep working unchanged.
+        const sendReply = async () => {
+          const chunks = splitTextIntoChunks(response);
+          for (let i = 0; i < chunks.length; i++) {
+            if (i > 0) {
+              await new Promise((resolve) => setTimeout(resolve, 200));
+            }
+            await this.tsClient.sendTextMessage(chunks[i]);
           }
-          await this.tsClient.sendTextMessage(chunks[i]);
-        }
+        };
+        const previous = this.replyGate ?? Promise.resolve();
+        const queued = previous.then(sendReply, sendReply);
+        // Settled-void chain: one failed send must not wedge later replies.
+        this.replyGate = queued.catch(() => {});
+        await queued;
       }
     } catch (err) {
       this.logger.error({ err, command: parsed.name }, "Command execution error");
@@ -1280,7 +1306,21 @@ export class BotInstance extends EventEmitter {
     }
     // Keep lightweight test doubles and older integrations usable; real
     // BotInstance instances always provide this gate.
-    this.assertProviderEnabled?.(song.platform);
+    //
+    // The gate THROWS for a disabled source, and playNext()'s retry loop calls
+    // this method without a try/catch — so a queued song left over from a
+    // since-disabled provider used to abort the whole advance and stop playback
+    // silently. A disabled source is a "cannot play this track", not a fatal
+    // error: report it as a skip (false) like any other unresolvable URL.
+    try {
+      this.assertProviderEnabled?.(song.platform);
+    } catch (err) {
+      this.logger.warn(
+        { err, songId: song.id, platform: song.platform },
+        "Provider disabled — skipping track instead of aborting the queue",
+      );
+      return false;
+    }
     // Clear any accumulated skip votes — every fresh track starts with a
     // clean slate, regardless of which code path loaded it (cmdPlay,
     // cmdPlaylist, cmdAlbum, cmdFm, trackEnd auto-advance, etc.).
@@ -1853,6 +1893,8 @@ export class BotInstance extends EventEmitter {
     this.playGate = next.catch(() => {});
     return next;
   }
+
+  
 
   getStatus(): BotStatus {
     return {

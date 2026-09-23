@@ -367,15 +367,45 @@ export class BotManager extends EventEmitter {
     return { stopped, failed };
   }
 
-  async loadSavedBots(): Promise<void> {
+  /**
+   * Instantiate every saved bot (synchronously, so they are immediately present
+   * in getAllBots()) and optionally drive their auto-connect handshakes.
+   *
+   * `awaitConnections: false` (used by the boot path) returns as soon as the
+   * instances exist, with the connects running in the background. The old
+   * all-awaited behaviour meant the boot sequence — which calls this BEFORE
+   * starting the web server — was blocked for up to 25s per unreachable bot
+   * plus a fixed 1s stagger: ten auto-start bots with a few dead hosts left the
+   * WebUI unreachable for minutes and tripped container health checks. Waiting
+   * for handshakes was never required for the web layer to be correct; it only
+   * needs the instances to exist, which the synchronous pass guarantees.
+   */
+  async loadSavedBots(opts: { awaitConnections?: boolean } = {}): Promise<void> {
+    const awaitConnections = opts.awaitConnections !== false;
     const savedInstances = this.database.getBotInstances();
+
+    // ── Synchronous pass: register every instance before any await ──
+    const pendingConnects: Array<{
+      saved: import("../data/database.js").BotInstance;
+      bot: BotInstance;
+    }> = [];
     for (const saved of savedInstances) {
       const bot = this.buildBotInstance(saved);
       this.bots.set(saved.id, bot);
       this.emit("botInstance", bot);
 
-      // Only auto-connect bots that have autoStart enabled
       if (saved.autoStart) {
+        pendingConnects.push({ saved, bot });
+      } else {
+        this.logger.info(
+          { botId: saved.id, name: saved.name },
+          "Loaded bot (autoStart disabled, not connecting)"
+        );
+      }
+    }
+
+    const connectAll = async () => {
+      for (const { saved, bot } of pendingConnects) {
         try {
           await connectWithTimeout(bot, 25_000, this.logger);
           this.persistBotIdentity(saved, bot);
@@ -393,16 +423,20 @@ export class BotManager extends EventEmitter {
 
         // Stagger connections to avoid overwhelming the TS server
         await new Promise((resolve) => setTimeout(resolve, 1000));
-      } else {
-        this.logger.info(
-          { botId: saved.id, name: saved.name },
-          "Loaded bot (autoStart disabled, not connecting)"
-        );
       }
+    };
+
+    if (awaitConnections) {
+      await connectAll();
+    } else {
+      // Detached on purpose: the caller must not wait on remote handshakes.
+      // Every path inside connectAll() handles its own errors, so this promise
+      // cannot reject and become an unhandled rejection.
+      void connectAll();
     }
 
     this.logger.info(
-      { count: savedInstances.length },
+      { count: savedInstances.length, autoConnect: pendingConnects.length },
       "Loaded saved bot instances"
     );
   }

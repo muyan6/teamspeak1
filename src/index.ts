@@ -65,7 +65,7 @@ async function main() {
     scheduleFatalExit("Uncaught exception", { err });
   });
   process.on("unhandledRejection", (reason) => {
-    scheduleFatalExit("Unhandled promise rejection", { reason });
+    logger.error({ reason }, "Unhandled promise rejection");
   });
   const db = createDatabase(DB_PATH);
 
@@ -175,7 +175,11 @@ async function main() {
     spotifyOAuth,
     jellyfinProvider
   );
-  await botManager.loadSavedBots();
+  // Register every saved bot synchronously, but do NOT block startup on the
+  // TeamSpeak handshakes: an unreachable host costs up to 25s each, which used
+  // to delay the WebUI (and the container health check) by minutes. The bots are
+  // in the manager's map immediately; connects finish in the background.
+  await botManager.loadSavedBots({ awaitConnections: false });
 
   const webServer = createWebServer({
     port: config.webPort,
@@ -204,18 +208,46 @@ async function main() {
     `WebUI: ${publicUrl || `http://localhost:${config.webPort}`}`
   );
 
-  const shutdown = () => {
+  // Graceful shutdown. Previously this called process.exit(0) as soon as the
+  // synchronous stops returned, which truncated anything still settling —
+  // notably the Spotify sidecar child processes (their kill is asynchronous) and
+  // any in-flight DB write. Now we let the event loop drain, with a hard cap so a
+  // wedged child can never keep the process alive forever.
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info("Shutting down...");
-    qqProvider.stopKeepAlive();
-    botManager.shutdown();
-    webServer.stop();
-    apiServer.stop();
-    db.close();
+    try {
+      qqProvider.stopKeepAlive();
+      botManager.shutdown();
+      webServer.stop();
+      apiServer.stop();
+    } catch (err) {
+      logger.warn({ err }, "Error while stopping services");
+    }
+
+    // Give pending async teardown (sidecar kills, WAL checkpoint) a moment to
+    // finish, then close the DB and exit.
+    const forceExit = setTimeout(() => {
+      logger.warn("Shutdown timed out — forcing exit");
+      try { db.close(); } catch { /* already closed */ }
+      process.exit(0);
+    }, 5000);
+    forceExit.unref();
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      db.close();
+    } catch (err) {
+      logger.warn({ err }, "Error while closing database");
+    }
+    clearTimeout(forceExit);
     process.exit(0);
   };
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => { void shutdown(); });
+  process.on("SIGTERM", () => { void shutdown(); });
 }
 
 main().catch((err) => {

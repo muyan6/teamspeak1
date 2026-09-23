@@ -33,7 +33,7 @@ import {
 
 export { CODEC_OPUS_MUSIC } from "./voice.js";
 export type { ServerProtocol } from "./protocol-detect.js";
-export type { FileUploadInfo } from "@honeybbq/teamspeak-client";
+export type { FileUploadInfo, ClientInfo } from "@honeybbq/teamspeak-client";
 
 /** Escape a string for use in TS3 ServerQuery-style commands. */
 export function escapeTS3(str: string): string {
@@ -146,6 +146,7 @@ export class TS3Client extends EventEmitter {
   }
 
   async connect(): Promise<void> {
+    this.disconnecting = false;
     this.voiceEndpointResolver.reset();
     this.clearVisibleClientUids();
     this.visibleClients.clear();
@@ -518,6 +519,7 @@ export class TS3Client extends EventEmitter {
     await this.client.waitConnected();
     this.clientId = this.client.clientID();
     this.voiceFramesSent = 0;
+    this.disconnecting = false;
     this.logger.info(
       { clientId: this.clientId, protocol: this.detectedProtocol },
       `Logged in (visible client, ${this.detectedProtocol.toUpperCase()} server)`,
@@ -826,6 +828,7 @@ export class TS3Client extends EventEmitter {
   }
 
   private voiceFramesSent = 0;
+  private voiceSendErrors = 0;
 
   sendVoiceData(opusFrame: Buffer): void {
     if (!this.client || this.disconnecting) return;
@@ -836,8 +839,17 @@ export class TS3Client extends EventEmitter {
         this.logger.info({ opusBytes: opusFrame.length, clientId: this.clientId }, "First voice packet sent to TeamSpeak");
       }
     } catch (err) {
-      if (this.voiceFramesSent === 0) {
-        this.logger.error({ err }, "Failed to send first voice packet");
+      this.voiceSendErrors++;
+      // Only the FIRST failure and the first failure of each subsequent
+      // power-of-two batch are logged. Previously everything after frame 1 was
+      // swallowed, so a bot that had gone silent while its status still read
+      // "playing" produced no evidence at all; logging every frame would emit
+      // ~50 lines/second from a broken transport.
+      if (this.voiceFramesSent === 0 || (this.voiceSendErrors & (this.voiceSendErrors - 1)) === 0) {
+        this.logger.error(
+          { err, consecutiveErrors: this.voiceSendErrors, framesSent: this.voiceFramesSent },
+          "Failed to send voice packet to TeamSpeak",
+        );
       }
     }
   }
