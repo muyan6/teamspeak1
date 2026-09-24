@@ -13,7 +13,7 @@ import { createRequireAuth } from "../middleware/requireAuth.js";
 import { createUsersRouter } from "./users.js";
 import { SESSION_COOKIE_NAME } from "../auth/validateSession.js";
 
-function makeApp(botDb: BotDatabase, users: UserStore, sessions: SessionStore) {
+function makeApp(botDb: BotDatabase, users: UserStore, sessions: SessionStore, revoke?: (id: string) => void) {
   const app = express();
   app.use(express.json());
   app.use(cookieParser());
@@ -21,7 +21,7 @@ function makeApp(botDb: BotDatabase, users: UserStore, sessions: SessionStore) {
   const requireAuth = createRequireAuth(sessions, permissions, () => getDefaultConfig().guestMode);
   const audit = createAuditStore(botDb.db);
   app.use("/api", requireAuth);
-  app.use("/api/users", createUsersRouter(users, sessions, audit, pino({ level: "silent" }), permissions));
+  app.use("/api/users", createUsersRouter(users, sessions, audit, pino({ level: "silent" }), permissions, revoke));
   return { app, permissions, audit };
 }
 
@@ -214,13 +214,18 @@ describe("users router", () => {
     expect(users.countAdmins()).toBe(2);
   });
 
-  it("PATCH /:id/role can change role between admin and member", async () => {
-    const res = await request(app)
+  it("PATCH /:id/role can change role between admin and member and revokes sockets", async () => {
+    let revokedId: string | null = null;
+    const { app: customApp } = makeApp(botDb, users, sessions, (id) => {
+      revokedId = id;
+    });
+    const res = await request(customApp)
       .patch(`/api/users/${bobId}/role`)
       .set("Cookie", aliceCookie)
       .send({ role: "admin" });
     expect(res.status).toBe(204);
     expect(users.findById(bobId)!.role).toBe("admin");
+    expect(revokedId).toBe(bobId);
   });
 
   it("PATCH /:id/role blocks demoting the last admin", async () => {

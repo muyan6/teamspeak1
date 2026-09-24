@@ -52,16 +52,24 @@ export class BotProfileManager {
    */
   private generation = 0;
 
+  private allowedCoverHosts: string[] = [];
+
   constructor(
     tsClient: TS3Client,
     logger: Logger,
     config: ProfileConfig,
     defaultNickname: string,
+    allowedCoverHosts: string[] = [],
   ) {
     this.tsClient = tsClient;
     this.logger = logger.child({ component: "profile" });
     this.config = { ...config };
     this.defaultNickname = defaultNickname;
+    this.allowedCoverHosts = allowedCoverHosts.map((h) => h.toLowerCase());
+  }
+
+  setAllowedCoverHosts(hosts: string[]): void {
+    this.allowedCoverHosts = hosts.map((h) => h.toLowerCase());
   }
 
   // --- Public API ---
@@ -268,7 +276,7 @@ export class BotProfileManager {
     if (!this.config.descriptionEnabled || this.permDenied.description) return;
     try {
       const text = song
-        ? `${song.name} - ${song.artist} [${song.album}]`
+        ? `${sanitizeTS3Text(song.name)} - ${sanitizeTS3Text(song.artist)} [${sanitizeTS3Text(song.album)}]`
         : "";
       const httpQuery = this.tsClient.getHttpQuery();
       if (httpQuery) {
@@ -426,9 +434,9 @@ export class BotProfileManager {
       }
 
       const lines = [
-        `\u266A \u6B63\u5728\u64AD\u653E: ${song.name} - ${song.artist}`, // ♪ 正在播放:
-        `\u4E13\u8F91: ${song.album}`, // 专辑:
-        `\u5E73\u53F0: ${song.platform}`, // 平台:
+        `\u266A \u6B63\u5728\u64AD\u653E: ${sanitizeTS3Text(song.name)} - ${sanitizeTS3Text(song.artist)}`, // ♪ 正在播放:
+        `\u4E13\u8F91: ${sanitizeTS3Text(song.album)}`, // 专辑:
+        `\u5E73\u53F0: ${sanitizeTS3Text(song.platform)}`, // 平台:
       ];
       const desc = lines.join("\\n");
       await this.tsClient.sendCommandNoWait(
@@ -442,7 +450,7 @@ export class BotProfileManager {
   private async sendNowPlayingMessage(song: QueuedSong): Promise<void> {
     if (!this.config.nowPlayingMsgEnabled || this.permDenied.nowPlayingMsg) return;
     try {
-      const text = `\u266A \u6B63\u5728\u64AD\u653E: ${song.name} - ${song.artist} [${song.album}]`;
+      const text = `\u266A \u6B63\u5728\u64AD\u653E: ${sanitizeTS3Text(song.name)} - ${sanitizeTS3Text(song.artist)} [${sanitizeTS3Text(song.album)}]`;
       await this.tsClient.sendTextMessage(text);
     } catch (err) {
       this.handleFeatureError("nowPlayingMsg", err);
@@ -471,7 +479,7 @@ export class BotProfileManager {
   }
 
   private async downloadImage(url: string): Promise<Buffer | null> {
-    if (!isSafeCoverUrl(url)) {
+    if (!isSafeCoverUrl(url, this.allowedCoverHosts)) {
       this.logger.warn({ url }, "Refusing to download cover image: unsafe or private URL (SSRF guard)");
       return null;
     }
@@ -530,10 +538,20 @@ export class BotProfileManager {
 }
 
 /**
+ * Sanitize user/song text for display in TeamSpeak 3 channel descriptions and messages.
+ * Neutralizes raw brackets to prevent broken BBCode parsing or injection.
+ */
+export function sanitizeTS3Text(text: string): string {
+  if (!text || typeof text !== "string") return "";
+  return text.replace(/\[/g, "［").replace(/\]/g, "］");
+}
+
+/**
  * SSRF Guard: Verify that a cover image URL points to a valid public HTTP(S) host
  * and not a private LAN, loopback, or cloud metadata address.
+ * Allows explicitly whitelisted hosts (e.g. user-configured Jellyfin server).
  */
-export function isSafeCoverUrl(urlString: string): boolean {
+export function isSafeCoverUrl(urlString: string, allowedHosts: string[] = []): boolean {
   if (!urlString || typeof urlString !== "string") return false;
   let parsed: URL;
   try {
@@ -548,6 +566,10 @@ export function isSafeCoverUrl(urlString: string): boolean {
   const host = hostname.startsWith("[") && hostname.endsWith("]")
     ? hostname.slice(1, -1)
     : hostname;
+
+  if (allowedHosts.some((h) => h.toLowerCase() === host || h.toLowerCase() === hostname)) {
+    return true;
+  }
 
   if (
     host === "localhost" ||

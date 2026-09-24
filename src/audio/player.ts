@@ -209,8 +209,8 @@ export class AudioPlayer extends EventEmitter {
   private seekOffset = 0;
   private framesPlayed = 0;
   private sessionId = 0;
-  private static readonly BUFFER_HIGH_WATER = 48 * 1024 * 1024;
-  private static readonly BUFFER_LOW_WATER = 16 * 1024 * 1024;
+  private static readonly BUFFER_HIGH_WATER = 16 * 1024 * 1024;
+  private static readonly BUFFER_LOW_WATER = 4 * 1024 * 1024;
   private ffmpegPaused = false;
   private spawnFailed = false;
   private consecutiveFailures = 0;
@@ -306,7 +306,7 @@ export class AudioPlayer extends EventEmitter {
     return frame;
   }
 
-  play(url: string, seekSeconds = 0, songDuration = 0): void {
+  play(url: string, seekSeconds = 0, songDuration = 0, startPaused = false): void {
     // 1. 停止当前所有播放，自增 sessionId 屏蔽旧回调 （
     this.stop();
 
@@ -330,7 +330,7 @@ export class AudioPlayer extends EventEmitter {
     this.triggerFadeIn(400);
 
     if (shouldUsePowerShellDownload(url)) {
-      this.playViaPowerShellDownload(url, seekSeconds, currentSessionId);
+      this.playViaPowerShellDownload(url, seekSeconds, currentSessionId, startPaused);
       return;
     }
 
@@ -392,11 +392,11 @@ export class AudioPlayer extends EventEmitter {
       }
     });
 
-    this.state = "playing";
+    this.state = startPaused ? "paused" : "playing";
     this.startFrameLoop();
   }
 
-  private playViaPowerShellDownload(url: string, seekSeconds: number, sessionId: number): void {
+  private playViaPowerShellDownload(url: string, seekSeconds: number, sessionId: number, startPaused = false): void {
     const tempDir = mkdtempSync(join(tmpdir(), "tsbot-jdymusic-"));
     const tempFile = join(tempDir, "song.audio");
     this.currentTempDir = tempDir;
@@ -463,7 +463,7 @@ export class AudioPlayer extends EventEmitter {
         this.emit("error", new Error(`PowerShell download exited ${code}`));
         return;
       }
-      this.spawnFfmpegFromFile(tempFile, seekSeconds, sessionId);
+      this.spawnFfmpegFromFile(tempFile, seekSeconds, sessionId, startPaused);
     });
 
     ps.on("error", (err) => {
@@ -482,10 +482,10 @@ export class AudioPlayer extends EventEmitter {
     // first tick, before the PowerShell download even completes. The
     // frame loop is started inside spawnFfmpegFromFile() once ffmpeg is
     // alive and producing PCM.
-    this.state = "playing";
+    this.state = startPaused ? "paused" : "playing";
   }
 
-  private spawnFfmpegFromFile(tempFile: string, seekSeconds: number, sessionId: number): void {
+  private spawnFfmpegFromFile(tempFile: string, seekSeconds: number, sessionId: number, startPaused = false): void {
     if (this.sessionId !== sessionId) {
       if (this.currentTempDir) {
         cleanupTempDir(this.currentTempDir);
@@ -535,6 +535,7 @@ export class AudioPlayer extends EventEmitter {
     });
 
     // Now that ffmpeg is producing PCM, run the frame loop.
+    this.state = startPaused ? "paused" : "playing";
     this.startFrameLoop();
   }
 
@@ -703,13 +704,21 @@ export class AudioPlayer extends EventEmitter {
     if (!globalActivePids.has(pid)) return;
 
     try {
-      proc.kill("SIGTERM");
+      if (process.platform === "win32") {
+        spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+      } else {
+        proc.kill("SIGTERM");
+      }
     } catch (e) { /* ignore */ }
 
     const killTimeout = setTimeout(() => {
       try {
-        process.kill(pid, 0); 
-        process.kill(pid, "SIGKILL");
+        if (process.platform === "win32") {
+          spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+        } else {
+          process.kill(pid, 0); 
+          process.kill(pid, "SIGKILL");
+        }
       } catch (e) {
       } finally {
         globalActivePids.delete(pid);
@@ -998,7 +1007,8 @@ export class AudioPlayer extends EventEmitter {
       // hit three bad tracks could never seek again — the slider would silently
       // do nothing for the rest of the session.
       this.consecutiveFailures = 0;
-      this.play(this.currentUrl, seconds, this.currentSongDuration);
+      const wasPaused = this.state === "paused";
+      this.play(this.currentUrl, seconds, this.currentSongDuration, wasPaused);
     }
   }
   pause(): void { if (this.state === "playing") this.state = "paused"; }

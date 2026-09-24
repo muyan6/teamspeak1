@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { BotProfileManager, isSafeCoverUrl } from "./profile.js";
+import { BotProfileManager, isSafeCoverUrl, sanitizeTS3Text } from "./profile.js";
 import type { TS3Client } from "../ts-protocol/client.js";
 import type { QueuedSong } from "../audio/queue.js";
 
@@ -239,6 +239,20 @@ describe("isSafeCoverUrl SSRF guard", () => {
   it("rejects invalid or empty URLs", () => {
     expect(isSafeCoverUrl("")).toBe(false);
     expect(isSafeCoverUrl("not a url")).toBe(false);
+  });
+
+  it("allows LAN or private URLs if host is in allowedHosts (e.g. Jellyfin)", () => {
+    expect(isSafeCoverUrl("http://192.168.1.100:8096/Items/123/Images/Primary", ["192.168.1.100"])).toBe(true);
+    expect(isSafeCoverUrl("http://jellyfin.local:8096/Images", ["jellyfin.local"])).toBe(true);
+    expect(isSafeCoverUrl("http://192.168.1.100:8096/Items/123/Images/Primary", ["other.host"])).toBe(false);
+  });
+});
+
+describe("sanitizeTS3Text", () => {
+  it("converts brackets to prevent broken BBCode parsing", () => {
+    expect(sanitizeTS3Text("Song [Remix] [Official]")).toBe("Song ［Remix］ ［Official］");
+    expect(sanitizeTS3Text("[b]Bold[/b]")).toBe("［b］Bold［/b］");
+    expect(sanitizeTS3Text("")).toBe("");
   });
 });
 

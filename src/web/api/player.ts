@@ -154,13 +154,15 @@ export function createPlayerRouter(
         res.status(400).json({ error: "query is required" });
         return;
       }
-      if (selectPlatform(bot, platform, res) === null) return;
+      const selected = selectPlatform(bot, platform, res);
+      if (selected === null) return;
       const cmd = parseCommand(`!play ${platformFlag(platform)} ${query}`.trim(), "!");
       if (!cmd) {
         res.status(400).json({ error: "Invalid command" });
         return;
       }
-      const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)));
+      const timeoutMs = selected === "youtube" ? 50000 : 25000;
+      const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)), timeoutMs);
       res.json({ message: response });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
@@ -175,13 +177,15 @@ export function createPlayerRouter(
         res.status(400).json({ error: "query is required" });
         return;
       }
-      if (selectPlatform(bot, platform, res) === null) return;
+      const selected = selectPlatform(bot, platform, res);
+      if (selected === null) return;
       const cmd = parseCommand(`!add ${platformFlag(platform)} ${query}`.trim(), "!");
       if (!cmd) {
         res.status(400).json({ error: "Invalid command" });
         return;
       }
-      const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)));
+      const timeoutMs = selected === "youtube" ? 50000 : 25000;
+      const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)), timeoutMs);
       res.json({ message: response });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });

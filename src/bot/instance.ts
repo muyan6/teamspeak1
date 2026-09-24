@@ -312,12 +312,21 @@ export class BotInstance extends EventEmitter {
       oauth: options.spotifyOAuth,
     });
 
+    const allowedCoverHosts: string[] = [];
+    if (options.config.jellyfin?.serverUrl) {
+      try {
+        const u = new URL(options.config.jellyfin.serverUrl);
+        if (u.hostname) allowedCoverHosts.push(u.hostname);
+      } catch { /* ignore invalid url */ }
+    }
+
     const profileConfig = this.database.getProfileConfig(this.id);
     this.profileManager = new BotProfileManager(
       this.tsClient,
       this.logger,
       profileConfig,
       options.tsOptions.nickname,
+      allowedCoverHosts,
     );
 
     // Best-effort: a corrupted/locked avatar file must not block bot startup.
@@ -1938,9 +1947,11 @@ export class BotInstance extends EventEmitter {
       // SpotifyController.seek expects milliseconds — convert here.
       this.spotifyController.seek(seconds * 1000).catch((err) =>
         this.logger.warn({ err }, "Spotify seek failed"));
+      this.emit?.("stateChange");
       return;
     }
     this.player.seek(seconds);
+    this.emit?.("stateChange");
   }
 
   getQueueManager(): PlayQueue {

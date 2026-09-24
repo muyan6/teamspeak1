@@ -476,6 +476,19 @@ describe("AudioPlayer external-PCM mode (playPcmStream)", () => {
     player.stop();
   });
 
+  it("seek() preserves paused state and passes startPaused=true to play()", () => {
+    const player = new AudioPlayer(silentLogger);
+    (player as any).currentUrl = "http://example.com/audio.mp3";
+    (player as any).state = "paused";
+
+    const playSpy = vi.spyOn(player, "play").mockImplementation(() => {});
+
+    player.seek(45);
+
+    expect(playSpy).toHaveBeenCalledWith("http://example.com/audio.mp3", 45, 0, true);
+    player.stop();
+  });
+
   it("isExternalActive() is false initially, true after playPcmStream, false after stop()", () => {
     const player = new AudioPlayer(silentLogger);
     // Idle: never attached.

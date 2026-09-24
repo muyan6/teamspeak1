@@ -171,8 +171,9 @@ export function createUsersRouter(
       res.status(400).json({ error: "cannot demote last admin" });
       return;
     }
-    // Only audit when the role actually changed
+    // Only audit and revoke active sockets when the role actually changed
     if (targetBefore.role !== newRole) {
+      revoke(targetId);
       try {
         audit.record({
           actorId: req.user!.id, actorUsername: req.user!.username,

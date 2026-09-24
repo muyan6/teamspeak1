@@ -6,11 +6,13 @@
       <!-- Progress bar (read-only display; seek interaction gated on transport / canTransport) -->
       <div
         class="progress-bar-container"
-        :class="{ 'no-seek': !canTransport }"
+        :class="{ 'no-seek': !canTransport, 'is-dragging': isDraggingProgress }"
         ref="progressBarRef"
-        @click="onProgressClick"
-        @mousemove="onProgressHover"
-        @mouseleave="progressTooltipVisible = false"
+        @pointerdown="onProgressPointerDown"
+        @pointermove="onProgressPointerMove"
+        @pointerup="onProgressPointerUp"
+        @pointercancel="onProgressPointerUp"
+        @mouseleave="onProgressMouseLeave"
       >
         <div class="progress-bar-bg">
           <div class="progress-bar-fill" :style="{ width: progressPercent + '%' }" />
@@ -139,39 +141,85 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+const isDraggingProgress = ref(false);
+
+function calculateProgressRatio(e: PointerEvent | MouseEvent): number {
+  const bar = progressBarRef.value;
+  if (!bar) return 0;
+  const rect = bar.getBoundingClientRect();
+  if (rect.width <= 0) return 0;
+  return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+}
+
 function updateProgress() {
   // liveElapsed() (an action, not the cached `elapsed` getter) re-interpolates
   // from the server anchor on every frame so the clock ticks each second (#107).
-  currentElapsed.value = store.liveElapsed();
+  // When the user is dragging the progress bar, do NOT overwrite the display.
+  if (!isDraggingProgress.value) {
+    currentElapsed.value = store.liveElapsed();
 
-  const duration = currentSong.value?.duration ?? 0;
-  progressPercent.value = duration > 0
-    ? Math.min((currentElapsed.value / duration) * 100, 100)
-    : 0;
+    const duration = currentSong.value?.duration ?? 0;
+    progressPercent.value = duration > 0
+      ? Math.min((currentElapsed.value / duration) * 100, 100)
+      : 0;
+  }
 
   rafId = requestAnimationFrame(updateProgress);
 }
 
-async function onProgressClick(e: MouseEvent) {
+function onProgressPointerDown(e: PointerEvent) {
   if (!canTransport.value) return; // seek gated on transport (canTransport)
+  isDraggingProgress.value = true;
+  try {
+    (e.currentTarget as HTMLElement)?.setPointerCapture?.(e.pointerId);
+  } catch { /* ignore */ }
+
+  const ratio = calculateProgressRatio(e);
+  const duration = currentSong.value?.duration ?? 0;
+  progressPercent.value = ratio * 100;
+  currentElapsed.value = ratio * duration;
+
+  const bar = progressBarRef.value;
+  if (bar) {
+    progressTooltipVisible.value = true;
+    progressTooltipX.value = e.clientX - bar.getBoundingClientRect().left;
+    progressTooltipTime.value = formatTime(ratio * duration);
+  }
+}
+
+function onProgressPointerMove(e: PointerEvent) {
   const bar = progressBarRef.value;
   if (!bar) return;
-  const rect = bar.getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const ratio = calculateProgressRatio(e);
+  const duration = currentSong.value?.duration ?? 0;
+  progressTooltipVisible.value = true;
+  progressTooltipX.value = e.clientX - bar.getBoundingClientRect().left;
+  progressTooltipTime.value = formatTime(ratio * duration);
+
+  if (isDraggingProgress.value && canTransport.value) {
+    progressPercent.value = ratio * 100;
+    currentElapsed.value = ratio * duration;
+  }
+}
+
+async function onProgressPointerUp(e: PointerEvent) {
+  if (!isDraggingProgress.value) return;
+  isDraggingProgress.value = false;
+  try {
+    (e.currentTarget as HTMLElement)?.releasePointerCapture?.(e.pointerId);
+  } catch { /* ignore */ }
+
+  if (!canTransport.value) return;
+  const ratio = calculateProgressRatio(e);
   const duration = currentSong.value?.duration ?? 0;
   const seekTime = ratio * duration;
   await store.seek(seekTime);
 }
 
-function onProgressHover(e: MouseEvent) {
-  const bar = progressBarRef.value;
-  if (!bar) return;
-  const rect = bar.getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-  const duration = currentSong.value?.duration ?? 0;
-  progressTooltipVisible.value = true;
-  progressTooltipX.value = e.clientX - rect.left;
-  progressTooltipTime.value = formatTime(ratio * duration);
+function onProgressMouseLeave() {
+  if (!isDraggingProgress.value) {
+    progressTooltipVisible.value = false;
+  }
 }
 
 onMounted(() => {
@@ -259,9 +307,9 @@ function cycleMode() {
   z-index: 101;
   display: flex;
   align-items: center;
-  padding: 0;
+  touch-action: none;
 
-  &:hover {
+  &:hover, &.is-dragging {
     .progress-bar-bg { height: 4px; }
     .progress-bar-thumb { opacity: 1; transform: scale(1); }
   }
