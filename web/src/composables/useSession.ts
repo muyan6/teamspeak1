@@ -13,6 +13,7 @@ const currentUser = ref<User | null>(null);
 const needsSetup = ref<boolean | null>(null); // null = unknown / not fetched yet
 const guestAllowed = ref(false);
 const ready = ref(false);
+let generation = 0;
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 const POLL_INTERVAL_MS = 60_000;
@@ -49,10 +50,15 @@ async function refreshNeedsSetup(): Promise<void> {
 }
 
 async function refreshMe(): Promise<void> {
+  const expected = generation;
   const res = await fetch("/api/session/me", { credentials: "same-origin" });
+  if (expected !== generation) return;
   if (res.status === 200) {
-    currentUser.value = (await res.json()) as User;
-  } else {
+    const user = (await res.json()) as User;
+    if (expected !== generation) return;
+    currentUser.value = user;
+    ensurePollStarted();
+  } else if (res.status === 401) {
     currentUser.value = null;
   }
 }
@@ -69,6 +75,7 @@ async function refresh(): Promise<void> {
 }
 
 async function login(username: string, password: string): Promise<void> {
+  generation++;
   const res = await fetch("/api/session/login", {
     method: "POST",
     credentials: "same-origin",
@@ -85,6 +92,7 @@ async function login(username: string, password: string): Promise<void> {
 }
 
 async function continueAsGuest(): Promise<void> {
+  generation++;
   const res = await fetch("/api/session/guest", { method: "POST", credentials: "same-origin" });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -95,6 +103,7 @@ async function continueAsGuest(): Promise<void> {
 }
 
 async function setup(username: string, password: string): Promise<void> {
+  generation++;
   const res = await fetch("/api/session/setup", {
     method: "POST",
     credentials: "same-origin",
@@ -112,9 +121,10 @@ async function setup(username: string, password: string): Promise<void> {
 }
 
 async function logout(): Promise<void> {
+  generation++;
   stopPoll();
-  await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" });
-  currentUser.value = null;
+  try { await fetch("/api/session/logout", { method: "POST", credentials: "same-origin" }); }
+  finally { currentUser.value = null; }
 }
 
 function can(cap: string): boolean {

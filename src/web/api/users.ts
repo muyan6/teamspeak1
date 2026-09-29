@@ -27,13 +27,13 @@ export function createUsersRouter(
    * at that moment, so without this a revoked bot kept streaming state to the
    * still-open socket until the client happened to reconnect.
    */
-  onAccessRevoked?: (userId: string) => void
+  onAccessRevoked?: (userId: string, keepToken?: string) => void
 ): Router {
   const router = Router();
 
-  const revoke = (userId: string): void => {
+  const revoke = (userId: string, keepToken?: string): void => {
     try {
-      onAccessRevoked?.(userId);
+      onAccessRevoked?.(userId, keepToken);
     } catch (err) {
       logger.warn({ err, userId }, "failed to close revoked user sockets");
     }
@@ -133,7 +133,7 @@ export function createUsersRouter(
       ? (extractSessionToken(req.headers.cookie) ?? undefined)
       : undefined;
     sessions.deleteAllForUser(targetId, exceptToken);
-    if (targetId !== req.user!.id) revoke(targetId);
+    revoke(targetId, exceptToken);
     try {
       audit.record({
         actorId: req.user!.id, actorUsername: req.user!.username,

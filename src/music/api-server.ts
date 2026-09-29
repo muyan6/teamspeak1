@@ -13,7 +13,7 @@ export interface ApiServerOptions {
 
 export interface ApiServerManager {
   start(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
   getNeteaseBaseUrl(): string;
   getQQMusicBaseUrl(): string;
 }
@@ -89,8 +89,11 @@ export function createApiServerManager(
           } else {
             const ncmModule = await import("NeteaseCloudMusicApi") as any;
             const serverObj = ncmModule.server ?? ncmModule.default?.server;
-            const app = await serverObj.serveNcmApi({ port: options.neteasePort });
-            neteaseServer = app;
+            const app = await serverObj.serveNcmApi({ port: options.neteasePort, host: '127.0.0.1' });
+            neteaseServer = app.server ?? app;
+            if (neteaseServer && !neteaseServer.listening && typeof neteaseServer.once === 'function') {
+              await new Promise<void>((resolve, reject) => { neteaseServer!.once('listening', resolve); neteaseServer!.once('error', reject); });
+            }
             logger.info(
               { port: options.neteasePort },
               "NetEase Cloud Music API started"
@@ -190,16 +193,15 @@ export function createApiServerManager(
       }
     },
 
-    stop(): void {
+    async stop(): Promise<void> {
       logger.info("Stopping music API servers");
-      if (neteaseServer && typeof (neteaseServer as any).close === "function") {
-        (neteaseServer as any).close();
-      }
+      const servers = [neteaseServer, qqMusicServer];
       neteaseServer = null;
-      if (qqMusicServer && typeof (qqMusicServer as any).close === "function") {
-        (qqMusicServer as any).close();
-      }
       qqMusicServer = null;
+      await Promise.all(servers.map(s => new Promise<void>(resolve => {
+        if (!s || typeof s.close !== 'function') { resolve(); return; }
+        s.close(() => resolve()); s.closeIdleConnections?.();
+      })));
     },
 
     getNeteaseBaseUrl(): string {

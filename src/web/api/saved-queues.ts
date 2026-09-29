@@ -66,7 +66,7 @@ export function createSavedQueuesRouter(
   router.post("/", (req, res) => {
     const userId = req.user!.id;
     const { botId, name, shared } = req.body ?? {};
-    if (typeof name !== "string" || !name.trim() || typeof botId !== "string" || !botId) {
+    if (typeof name !== "string" || !name.trim() || name.length > 100 || typeof botId !== "string" || !botId) {
       res.status(400).json({ error: "botId and name are required" });
       return;
     }
@@ -85,6 +85,10 @@ export function createSavedQueuesRouter(
       return;
     }
     const ownerId = shared === true ? SHARED_QUEUE_OWNER : userId;
+    const existing = database.listSavedQueues(ownerId, false).find(q => q.name === name.trim());
+    if (existing && ownerId === SHARED_QUEUE_OWNER && req.user?.role !== 'admin' && existing.creatorId !== userId) {
+      res.status(403).json({ error: '只有管理员或创建者可以覆盖共享队列' }); return;
+    }
     try {
       const saved = database.saveQueue(ownerId, name.trim(), songs, userId);
       logger.info({ userId, ownerId, name: saved.name, count: saved.songCount }, "saved queue upserted");

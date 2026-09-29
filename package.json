@@ -15,7 +15,9 @@
     "start": "node dist/index.js",
     "play": "node dist/index.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "predev": "node scripts/check-native.mjs",
+    "preplay": "node scripts/check-native.mjs"
   },
   "license": "MIT",
   "dependencies": {
@@ -23,7 +25,7 @@
     "@honeybbq/teamspeak-client": "^0.2.1",
     "@koa/router": "^15.4.0",
     "@sansenjian/qq-music-api": "~2.4.0",
-    "axios": "^1.14.0",
+    "axios": "^1.20.0",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^12.8.0",
     "cookie-parser": "^1.4.7",
@@ -32,7 +34,9 @@
     "NeteaseCloudMusicApi": "~4.32.0",
     "pino": "^10.3.1",
     "tweetnacl": "^1.0.3",
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "tar": "^7.5.22",
+    "pino-roll": "^4.0.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
@@ -45,7 +49,7 @@
     "supertest": "^7.2.2",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.2"
+    "vitest": "^4.1.11"
   },
   "allowScripts": {
     "@discordjs/opus@0.10.0": true,
@@ -54,5 +58,11 @@
     "esbuild@0.28.1": true,
     "ffmpeg-static@5.3.0": true,
     "ssh2@1.17.0": true
+  },
+  "overrides": {
+    "tar": "$tar",
+    "music-metadata": "^11.16.1",
+    "file-type": "^21.3.4",
+    "qs": "^6.15.4"
   }
 }

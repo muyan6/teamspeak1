@@ -5,7 +5,9 @@ import type { BotDatabase } from "../../data/database.js";
 import type { MusicProvider, Platform, Song } from "../../music/provider.js";
 import type { Logger } from "../../logger.js";
 import type { BotInstance } from "../../bot/instance.js";
-import { parseCommand } from "../../bot/commands.js";
+import { parseCommand, type ParsedCommand } from "../../bot/commands.js";
+import { MAX_QUEUE_SONGS } from "../../audio/queue.js";
+import { normalizeSong, publicCoverUrl } from '../../music/media-dto.js';
 import { requireBotAccess } from "../middleware/requirePermission.js";
 import { authorize } from "../middleware/authorize.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
@@ -113,9 +115,13 @@ export function createPlayerRouter(
     return (
       typeof value !== "string" ||
       value.trim() === "" ||
-      /[\r\n]/.test(value) ||
-      value.trim().startsWith("-")
+      value.length > 2000 || /[\r\n\x00]/.test(value)
     );
+  }
+
+  function mediaCommand(name: string, args: string, platform: Platform): ParsedCommand {
+    const flag = platformFlag(platform).slice(1);
+    return { name, args, rawArgs: args.split(/\s+/), flags: new Set(flag ? [flag] : []) };
   }
 
   function requesterName(req: Request): string {
@@ -156,7 +162,7 @@ export function createPlayerRouter(
       }
       const selected = selectPlatform(bot, platform, res);
       if (selected === null) return;
-      const cmd = parseCommand(`!play ${platformFlag(platform)} ${query}`.trim(), "!");
+      const cmd = mediaCommand('play', query, selected);
       if (!cmd) {
         res.status(400).json({ error: "Invalid command" });
         return;
@@ -165,7 +171,7 @@ export function createPlayerRouter(
       const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)), timeoutMs);
       res.json({ message: response });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -179,7 +185,7 @@ export function createPlayerRouter(
       }
       const selected = selectPlatform(bot, platform, res);
       if (selected === null) return;
-      const cmd = parseCommand(`!add ${platformFlag(platform)} ${query}`.trim(), "!");
+      const cmd = mediaCommand('add', query, selected);
       if (!cmd) {
         res.status(400).json({ error: "Invalid command" });
         return;
@@ -188,7 +194,7 @@ export function createPlayerRouter(
       const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)), timeoutMs);
       res.json({ message: response });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -199,7 +205,7 @@ export function createPlayerRouter(
       const response = await executeWithTimeout(bot.executeCommand(cmd));
       res.json({ message: response });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   };
 
@@ -230,7 +236,7 @@ export function createPlayerRouter(
         message,
       });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -256,7 +262,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -276,16 +282,13 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
   // Get current elapsed time (ground truth from server)
-  // Read-only, but still gated on requireNotGuest: guests are scoped to a
-  // whitelist of playback ACTIONS, and exposing live progress/queue/history to
-  // a login-less visitor is data these routes were never meant to publish.
-  router.get("/:botId/elapsed", requireNotGuest, (req, res) => {
-      const bot = requestBot(req);
+  router.get("/:botId/elapsed", (req, res) => {
+    const bot = requestBot(req);
     res.json({ elapsed: bot.getPlayer().getElapsed() });
   });
 
@@ -305,12 +308,12 @@ export function createPlayerRouter(
       bot.seek(position);
       res.json({ message: `Seeked to ${Math.floor(position)}s`, seekOffset: position });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
-  router.get("/:botId/queue", requireNotGuest, (req, res) => {
-      const bot = requestBot(req);
+  router.get("/:botId/queue", (req, res) => {
+    const bot = requestBot(req);
     res.json({ queue: bot.getQueue(), status: bot.getStatus() });
   });
 
@@ -327,7 +330,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -369,7 +372,7 @@ export function createPlayerRouter(
       }
       res.json(result.body);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -381,15 +384,13 @@ export function createPlayerRouter(
         res.status(400).json({ error: "playlistId is required" });
         return;
       }
-      if (selectPlatform(bot, platform, res) === null) return;
-      const cmd = parseCommand(
-        `!playlist ${platformFlag(platform)} ${playlistId}`.trim(),
-        "!"
-      )!;
+      const selected = selectPlatform(bot, platform, res);
+      if (selected === null) return;
+      const cmd = mediaCommand('playlist', playlistId, selected);
       const response = await bot.executeCommand(cmd, undefined, requesterName(req));
       res.json({ message: response });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -435,6 +436,7 @@ export function createPlayerRouter(
         // If null, the batch endpoint itself errored — fall through to
         // the sequential retry path, which still has a chance.
       }
+      if (queueable.length > MAX_QUEUE_SONGS) { res.status(400).json({ error: `队列最多 ${MAX_QUEUE_SONGS} 首歌曲` }); return; }
       if (queueable.length === 0) {
         res.json({ ok: false, message: `歌单 ${totalCount} 首歌曲均无版权可播放（区域/版权限制）` });
         return;
@@ -473,7 +475,7 @@ export function createPlayerRouter(
       }
     } catch (err) {
       logger.error({ err }, "Play playlist failed");
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -511,6 +513,7 @@ export function createPlayerRouter(
           queueable = songs.filter((s: { id: string }) => playable.has(s.id));
         }
       }
+      if (queueable.length > MAX_QUEUE_SONGS) { res.status(400).json({ error: `队列最多 ${MAX_QUEUE_SONGS} 首歌曲` }); return; }
       if (queueable.length === 0) {
         res.json({ ok: false, message: `专辑 ${totalCount} 首歌曲均无版权可播放（区域/版权限制）` });
         return;
@@ -549,7 +552,7 @@ export function createPlayerRouter(
       }
     } catch (err) {
       logger.error({ err }, "play-album failed");
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -586,18 +589,14 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
   router.post("/:botId/play-song", authorize({ capability: "player.control" }), async (req, res) => {
     try {
       const bot = requestBot(req);
-      const { song } = req.body;
-      if (!song || !song.id || !song.platform) {
-        res.status(400).json({ error: "song object with id and platform is required" });
-        return;
-      }
+      const song = normalizeSong(req.body?.song);
       const selectedPlatform = selectPlatform(bot, song.platform, res);
       if (selectedPlatform === null) return;
       if (isLocalAudioDisabled(bot, selectedPlatform)) {
@@ -615,7 +614,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -624,11 +623,7 @@ export function createPlayerRouter(
   router.post("/:botId/play-next-song", authorize({ capability: "player.control", guestFlag: "playNext" }), async (req, res) => {
     try {
       const bot = requestBot(req);
-      const { song } = req.body;
-      if (!song || !song.id || !song.platform) {
-        res.status(400).json({ error: "song object with id and platform is required" });
-        return;
-      }
+      const song = normalizeSong(req.body?.song);
       const selectedPlatform = selectPlatform(bot, song.platform, res);
       if (selectedPlatform === null) return;
       if (isLocalAudioDisabled(bot, selectedPlatform)) {
@@ -664,7 +659,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -674,11 +669,7 @@ export function createPlayerRouter(
   router.post("/:botId/play-now-song", authorize({ capability: "player.control", guestFlag: "playNow" }), async (req, res) => {
     try {
       const bot = requestBot(req);
-      const { song } = req.body;
-      if (!song || !song.id || !song.platform) {
-        res.status(400).json({ error: "song object with id and platform is required" });
-        return;
-      }
+      const song = normalizeSong(req.body?.song);
       const selectedPlatform = selectPlatform(bot, song.platform, res);
       if (selectedPlatform === null) return;
       if (isLocalAudioDisabled(bot, selectedPlatform)) {
@@ -702,18 +693,14 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
   router.post("/:botId/add-song", authorize({ capability: "player.queue", guestFlag: "addToQueue" }), async (req, res) => {
     try {
       const bot = requestBot(req);
-      const { song } = req.body;
-      if (!song || !song.id || !song.platform) {
-        res.status(400).json({ error: "song object with id and platform is required" });
-        return;
-      }
+      const song = normalizeSong(req.body?.song);
       const selectedPlatform = selectPlatform(bot, song.platform, res);
       if (selectedPlatform === null) return;
       if (isLocalAudioDisabled(bot, selectedPlatform)) {
@@ -739,7 +726,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -784,7 +771,7 @@ export function createPlayerRouter(
 
       res.json(body);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -805,11 +792,11 @@ export function createPlayerRouter(
       }
       res.json(pm.getConfig());
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
     }
   });
 
-  router.get("/:botId/history", requireNotGuest, (req, res) => {
+  router.get("/:botId/history", (req, res) => {
     if (!database) {
       res.json({ history: [] });
       return;
@@ -831,7 +818,7 @@ export function createPlayerRouter(
       artist: r.artist,
       album: r.album,
       duration: 0,
-      coverUrl: r.coverUrl,
+      coverUrl: publicCoverUrl(r.coverUrl),
       platform: r.platform,
       playedAt: r.playedAt,
       requestedBy: r.requestedBy,

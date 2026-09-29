@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import dgram from "node:dgram";
+import net from "node:net";
 import {
   Client as TS3FullClient,
   generateIdentity as genTS3Identity,
@@ -293,9 +294,12 @@ export class TS3Client extends EventEmitter {
                 targetHost = targetAddr.slice(1, closing);
                 targetRawPort = targetAddr.slice(closing + 2);
               } else {
-                targetHost = targetAddr;
+                targetHost = closing > 0 ? targetAddr.slice(1, closing) : targetAddr;
                 targetRawPort = "9987";
               }
+            } else if (net.isIPv6(targetAddr) || (targetAddr.match(/:/g) || []).length > 1) {
+              targetHost = targetAddr;
+              targetRawPort = "9987";
             } else {
               const sep = targetAddr.lastIndexOf(":");
               if (sep > 0) {
@@ -313,7 +317,8 @@ export class TS3Client extends EventEmitter {
               return;
             }
 
-            const socket = dgram.createSocket("udp4");
+            const isIpv6 = net.isIPv6(targetHost) || targetHost.includes(":");
+            const socket = dgram.createSocket(isIpv6 ? "udp6" : "udp4");
             let settled = false;
             const onError = (err: Error) => {
               if (settled) return;
@@ -811,7 +816,7 @@ export class TS3Client extends EventEmitter {
       if (closing > 0) return host.slice(1, closing);
     }
     const sep = host.lastIndexOf(":");
-    if (sep > 0 && !host.includes("]")) {
+    if (sep > 0 && !host.includes("]") && (host.match(/:/g) || []).length === 1) {
       return host.slice(0, sep);
     }
     return host;

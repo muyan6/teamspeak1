@@ -242,8 +242,9 @@ describe("isSafeCoverUrl SSRF guard", () => {
   });
 
   it("allows LAN or private URLs if host is in allowedHosts (e.g. Jellyfin)", () => {
-    expect(isSafeCoverUrl("http://192.168.1.100:8096/Items/123/Images/Primary", ["192.168.1.100"])).toBe(true);
-    expect(isSafeCoverUrl("http://jellyfin.local:8096/Images", ["jellyfin.local"])).toBe(true);
+    expect(isSafeCoverUrl("http://192.168.1.100:8096/Items/123/Images/Primary", ["http://192.168.1.100:8096"])).toBe(true);
+    expect(isSafeCoverUrl("http://jellyfin.local:8096/Images", ["http://jellyfin.local:8096"])).toBe(false);
+    expect(isSafeCoverUrl("http://192.168.1.100:8097/Items/123/Images/Primary", ["http://192.168.1.100:8096"])).toBe(false);
     expect(isSafeCoverUrl("http://192.168.1.100:8096/Items/123/Images/Primary", ["other.host"])).toBe(false);
   });
 });
@@ -256,3 +257,27 @@ describe("sanitizeTS3Text", () => {
   });
 });
 
+describe("BotProfileManager channel description formatting", () => {
+  it("uses proper TS3 newline escape instead of literal \\\\n", async () => {
+    const ts = makeMockTs();
+    (ts as any).getChannelId = () => 123n;
+    const sentCommands: string[] = [];
+    ts.sendCommandNoWait = vi.fn().mockImplementation(async (cmd: string) => {
+      sentCommands.push(cmd);
+    });
+
+    const cfgWithChannel = {
+      ...cfgOn,
+      channelDescEnabled: true,
+    };
+    const pm = new BotProfileManager(ts as any, noopLogger, cfgWithChannel, "Bot");
+    await pm.onSongChange(fakeSong);
+    await flush();
+
+    const editCmd = sentCommands.find((c) => c.startsWith("channeledit"));
+    expect(editCmd).toBeDefined();
+    // TS3 newline escape is \n in command string, not \\n
+    expect(editCmd).toContain("\\n");
+    expect(editCmd).not.toContain("\\\\n");
+  });
+});

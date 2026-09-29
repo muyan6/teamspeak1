@@ -204,16 +204,26 @@ function onProgressPointerMove(e: PointerEvent) {
 
 async function onProgressPointerUp(e: PointerEvent) {
   if (!isDraggingProgress.value) return;
-  isDraggingProgress.value = false;
   try {
     (e.currentTarget as HTMLElement)?.releasePointerCapture?.(e.pointerId);
   } catch { /* ignore */ }
 
-  if (!canTransport.value) return;
+  if (e.pointerType === 'touch') {
+    progressTooltipVisible.value = false;
+  }
+
+  if (!canTransport.value) {
+    isDraggingProgress.value = false;
+    return;
+  }
   const ratio = calculateProgressRatio(e);
   const duration = currentSong.value?.duration ?? 0;
   const seekTime = ratio * duration;
-  await store.seek(seekTime);
+  try {
+    await store.seek(seekTime);
+  } finally {
+    isDraggingProgress.value = false;
+  }
 }
 
 function onProgressMouseLeave() {

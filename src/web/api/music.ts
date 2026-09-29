@@ -7,6 +7,7 @@ import { LRUCache } from "../../data/cache.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
 import { authorize } from "../middleware/authorize.js";
+import { musicContext } from '../../music/media-dto.js';
 
 /**
  * Body cap for a local upload. express.raw buffers the whole body in memory,
@@ -123,6 +124,28 @@ export function createMusicRouter(
   const searchCache = new LRUCache<string, SearchResult>({
     maxSize: 200,
     defaultTtlMs: 3 * 60 * 1000, // 3 minutes
+  });
+
+  let cacheContext = '';
+  router.use((_req, _res, next) => {
+    const context = musicContext(config, [neteaseProvider, qqProvider, bilibiliProvider,
+      localProvider, kugouProvider, spotifyProvider, jellyfinProvider].filter((p): p is MusicProvider => !!p));
+    if (context !== cacheContext) {
+      for (const cache of [lyricsCache, albumCache, songDetailCache, playlistSongsCache, searchCache]) cache.clear();
+      cacheContext = context;
+    }
+    next();
+  });
+
+  router.get('/jellyfin/cover/:id', async (req, res) => {
+    if (config && !isProviderEnabled(config, 'jellyfin')) { res.status(404).end(); return; }
+    const p = jellyfinProvider as MusicProvider & { getCoverImage?: (id: string, tag?: string) => Promise<{ buffer: Buffer; mime: string } | null> };
+    if (!p?.getCoverImage) { res.status(404).end(); return; }
+    try {
+      const image = await p.getCoverImage(req.params.id, typeof req.query.tag === 'string' ? req.query.tag : '');
+      if (!image) { res.status(404).end(); return; }
+      res.set('Cache-Control', 'private, max-age=300').type(image.mime).send(image.buffer);
+    } catch { res.status(502).end(); }
   });
 
   const reserveLocalUploadSlot: express.RequestHandler = (_req, res, next) => {
@@ -243,7 +266,7 @@ export function createMusicRouter(
       const parsedType = (typeof type === "string" && ["song", "playlist", "album", "all"].includes(type))
         ? (type as SearchType)
         : "all";
-      const cacheKey = `${String(platform ?? "default")}:${String(q).trim().toLowerCase()}:${parsedLimit}:${parsedOffset}:${parsedType}`;
+      const cacheKey = `${provider.platform}:${String(q).trim().toLowerCase()}:${parsedLimit}:${parsedOffset}:${parsedType}`;
       const cached = searchCache.get(cacheKey);
       if (cached) {
         res.json(cached);

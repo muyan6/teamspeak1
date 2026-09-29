@@ -26,8 +26,8 @@ export class SpotifyProvider implements MusicProvider {
     this.api.setCreds(this.creds);
   }
 
-  async search(query: string, limit = 20): Promise<SearchResult> {
-    return this.api.search(query, limit);
+  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
+    return this.api.search(query, limit, offset);
   }
 
   // Stage 1: return a sentinel URI. The play path recognizes `spotify:` and

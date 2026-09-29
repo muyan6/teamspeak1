@@ -38,7 +38,7 @@ import { requireAdmin } from "./middleware/requireAdmin.js";
 import { requireNotGuest } from "./middleware/requireNotGuest.js";
 import { csrfOriginCheck } from "./middleware/csrf.js";
 import { createRateLimit, createRateLimitBucket } from "./middleware/rateLimit.js";
-import { validateSessionFromHeaders } from "./auth/validateSession.js";
+import { validateSessionFromHeaders, extractSessionToken } from "./auth/validateSession.js";
 
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
@@ -66,7 +66,7 @@ export interface WebServerOptions {
 
 export interface WebServer {
   start(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
 }
 
 export function createWebServer(options: WebServerOptions): WebServer {
@@ -208,7 +208,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
   // revocation never reached the already-open socket. Both routers below are
   // mounted before the WS controller exists, so bridge them with a mutable
   // indirection wired to the real implementation once setupWebSocket runs.
-  let onUserAccessRevoked: (userId: string) => void = () => {};
+  let onUserAccessRevoked: (userId: string, keepToken?: string, onlyToken?: string) => void = () => {};
 
   app.use(
     "/api/session",
@@ -219,7 +219,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
       logger,
       permissions,
       () => options.config.guestMode,
-      (userId) => onUserAccessRevoked(userId),
+      (userId, keepToken, onlyToken) => onUserAccessRevoked(userId, keepToken, onlyToken),
     ),
   );
 
@@ -313,8 +313,8 @@ export function createWebServer(options: WebServerOptions): WebServer {
   app.use(
     "/api/users",
     requireAdmin,
-    createUsersRouter(users, sessions, audit, logger, permissions, (userId) =>
-      onUserAccessRevoked(userId),
+    createUsersRouter(users, sessions, audit, logger, permissions, (userId, keepToken) =>
+      onUserAccessRevoked(userId, keepToken),
     ),
   );
   app.use("/api/audit", requireAdmin, createAuditRouter(audit));
@@ -428,15 +428,20 @@ export function createWebServer(options: WebServerOptions): WebServer {
       w.userId = result.userId;
       w.isGuest = result.role === "guest";
       w.botScope = botScope;
+      (w as typeof w & { sessionToken: string }).sessionToken = extractSessionToken(req.headers.cookie) ?? '';
       wss.emit("connection", ws, req);
     });
   });
-  const controller = setupWebSocket(wss, options.botManager, logger);
+  const controller = setupWebSocket(wss, options.botManager, logger, ws => {
+    const token = (ws as typeof ws & { sessionToken?: string }).sessionToken;
+    const result = token ? sessions.validate(token) : null;
+    return !!result && (result.role !== 'guest' || options.config.guestMode.enabled);
+  });
   onGuestPolicyChanged = controller.refreshGuestPolicy;
   // Now that the WS controller exists, wire the logout / permission-revocation
   // sweep. The client's useWebSocket auto-reconnects, so the socket comes back
   // with freshly-resolved scope instead of the stale upgrade-time snapshot.
-  onUserAccessRevoked = (userId) => controller.closeUserSockets(userId);
+  onUserAccessRevoked = (userId, keepToken, onlyToken) => controller.closeUserSockets(userId, keepToken, onlyToken);
 
   // ─── Session cleanup interval ──────────────────────────────────────────
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -472,14 +477,16 @@ export function createWebServer(options: WebServerOptions): WebServer {
         }
       });
     },
-    stop(): void {
+    async stop(): Promise<void> {
       if (cleanupTimer) {
         clearInterval(cleanupTimer);
         cleanupTimer = null;
       }
       controller.cleanup();
-      wss.close();
-      server.close();
+      await Promise.all([
+        new Promise<void>(resolve => wss.close(() => resolve())),
+        new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); }),
+      ]);
     },
   };
 }

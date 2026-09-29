@@ -49,6 +49,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import axios from 'axios';
+import { createLatestRequest } from '../composables/latestRequest.js';
 import { usePlayerStore } from '../stores/player.js';
 import CoverArt from '../components/CoverArt.vue';
 
@@ -77,6 +78,7 @@ const scrollContainer = ref<HTMLElement | null>(null);
 const lineRefs = ref<Record<number, HTMLElement>>({});
 const scrollOffset = ref(0);
 let syncTimer: ReturnType<typeof setInterval> | null = null;
+const lyricRequests = createLatestRequest();
 
 const bgStyle = computed(() => {
   if (currentSong.value?.coverUrl) {
@@ -90,6 +92,7 @@ const bgStyle = computed(() => {
 });
 
 async function fetchLyrics() {
+  const ticket = lyricRequests.start();
   if (!currentSong.value) return;
   loading.value = true;
   lines.value = [];
@@ -98,12 +101,15 @@ async function fetchLyrics() {
   try {
     const res = await axios.get(`/api/music/lyrics/${currentSong.value.id}`, {
       params: { platform: currentSong.value.platform },
+      signal: ticket.signal,
     });
+    if (!ticket.isCurrent()) return;
     lines.value = res.data.lyrics || [];
   } catch {
+    if (!ticket.isCurrent()) return;
     lines.value = [];
   } finally {
-    loading.value = false;
+    if (ticket.isCurrent()) loading.value = false;
   }
 }
 
@@ -181,6 +187,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  lyricRequests.cancel();
   stopSync();
 });
 </script>

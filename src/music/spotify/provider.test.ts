@@ -34,7 +34,7 @@ describe("SpotifyProvider", () => {
       }),
     });
     const out = await new SpotifyProvider(api).search("queen", 5);
-    expect(api.search).toHaveBeenCalledWith("queen", 5);
+    expect(api.search).toHaveBeenCalledWith("queen", 5, 0);
     expect(out.songs[0].id).toBe("t1");
   });
 

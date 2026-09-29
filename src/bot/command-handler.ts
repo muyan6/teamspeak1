@@ -3,7 +3,7 @@ import type { ParsedCommand } from "./commands.js";
 import type { TS3TextMessage } from "../ts-protocol/client.js";
 import type { Song, Platform, MusicProvider } from "../music/provider.js";
 import { defaultPlatform, isProviderEnabled } from "../data/config.js";
-import { PlayMode, parsePlayMode } from "../audio/queue.js";
+import { PlayMode, parsePlayMode, MAX_QUEUE_SONGS } from "../audio/queue.js";
 import { SHARED_QUEUE_OWNER } from "../data/database.js";
 import { parseSongRef, parseSelectionIndex } from "./song-ref.js";
 
@@ -234,6 +234,7 @@ export class BotCommandHandler {
   }
 
   cmdStop(): string {
+    this.bot.invalidatePlayback?.();
     if (this.bot.queue.current()?.platform === "spotify") {
       this.bot.spotifyController.stop();
     }
@@ -296,6 +297,7 @@ export class BotCommandHandler {
   }
 
   cmdClear(): string {
+    this.bot.invalidatePlayback?.();
     this.bot.spotifyController.stop();
     this.bot.currentSourceIsSpotify = false;
     this.bot.player.stop();
@@ -385,6 +387,7 @@ export class BotCommandHandler {
     }
 
     const songs = await provider.getPlaylistSongs(playlistId);
+    if (songs.length > MAX_QUEUE_SONGS) return `队列最多 ${MAX_QUEUE_SONGS} 首歌曲`;
     if (songs.length === 0) return "Playlist is empty or not found";
 
     this.bot.player.stop();
@@ -420,6 +423,7 @@ export class BotCommandHandler {
     }
 
     const songs = await provider.getAlbumSongs(albumId);
+    if (songs.length > MAX_QUEUE_SONGS) return `队列最多 ${MAX_QUEUE_SONGS} 首歌曲`;
     if (songs.length === 0) return "Album is empty or not found";
 
     this.bot.player.stop();

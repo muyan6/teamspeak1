@@ -20,13 +20,14 @@ export interface WebSocketController {
    * own. The session row is already gone server-side by then, so the socket is
    * the last thing still honouring a revoked grant.
    */
-  closeUserSockets: (userId: string) => void;
+  closeUserSockets: (userId: string, keepToken?: string, onlyToken?: string) => void;
 }
 
 export function setupWebSocket(
   wss: WebSocketServer,
   botManager: BotManager,
-  logger: Logger
+  logger: Logger,
+  isSessionValid: (ws: WebSocket) => boolean = () => true,
 ): WebSocketController {
   const clients = new Set<WebSocket>();
 
@@ -86,6 +87,11 @@ export function setupWebSocket(
 
   const heartbeatInterval = setInterval(() => {
     for (const ws of clients) {
+      if (!isSessionValid(ws)) {
+        clients.delete(ws);
+        ws.close(4401, 'session expired');
+        continue;
+      }
       const socket = ws as WebSocket & { isAlive?: boolean };
       if (socket.isAlive === false) {
         clients.delete(ws);
@@ -155,11 +161,16 @@ export function setupWebSocket(
     // a single volume nudge. Clients already handle the queue-less shape by
     // fetching on demand (see useWebSocket.ts's `else store.fetchQueueForBot`),
     // which also keeps the payload correct for the events that DO change it.
+    let lastQueueRevision = bot.getQueueManager?.()?.getRevision?.();
     const onStateChange = () => {
+      const revision = bot.getQueueManager?.()?.getRevision?.();
+      const queueChanged = revision === undefined || revision !== lastQueueRevision;
+      lastQueueRevision = revision;
       broadcast({
         type: "stateChange",
         botId: bot.id,
         status: bot.getStatus(),
+        queueChanged,
       }, bot.id);
     };
 
@@ -221,6 +232,8 @@ export function setupWebSocket(
     for (const id of Array.from(attachedBots.keys())) {
       detachBotListener(id);
     }
+    for (const ws of clients) { try { ws.terminate(); } catch {} }
+    clients.clear();
   };
 
   // When the admin changes guestMode (disable / narrow scope), already-open guest
@@ -243,12 +256,13 @@ export function setupWebSocket(
   };
 
   /** Close every open socket whose upgrade was authenticated as `userId`. */
-  const closeUserSockets = (userId: string) => {
+  const closeUserSockets = (userId: string, keepToken?: string, onlyToken?: string) => {
     for (const ws of clients) {
-      const w = ws as unknown as { userId?: string };
+      const w = ws as unknown as { userId?: string; sessionToken?: string };
       if (w.userId !== userId) continue;
+      if (keepToken && w.sessionToken === keepToken || onlyToken && w.sessionToken !== onlyToken) continue;
       try {
-        ws.close(1008, "session revoked");
+        ws.close(4009, 'access changed');
       } catch {
         // socket may already be closing; ignore
       }

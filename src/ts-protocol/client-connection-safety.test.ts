@@ -72,5 +72,29 @@ describe("TS3Client connection safety", () => {
       stubLogger
     );
     expect(ipv6Client.getHost()).toBe("2001:db8::1");
+
+    const bareIpv6Client = new TS3Client(
+      {
+        host: "2001:db8::1",
+        port: 9987,
+        queryPort: 10011,
+        nickname: "test-bot",
+        serverProtocol: "ts3",
+      },
+      stubLogger
+    );
+    expect(bareIpv6Client.getHost()).toBe("2001:db8::1");
+
+    const loopbackIpv6Client = new TS3Client(
+      {
+        host: "::1",
+        port: 9987,
+        queryPort: 10011,
+        nickname: "test-bot",
+        serverProtocol: "ts3",
+      },
+      stubLogger
+    );
+    expect(loopbackIpv6Client.getHost()).toBe("::1");
   });
 });

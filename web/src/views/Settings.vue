@@ -1793,7 +1793,11 @@ async function saveCookie(platform: string) {
 }
 
 async function savePrefix() {
-  // Prefix is saved client-side for now
+  try {
+    const res = await axios.post('/api/bot/settings', { commandPrefix: commandPrefix.value });
+    commandPrefix.value = res.data.commandPrefix;
+    store.notify('命令前缀已保存', 'info');
+  } catch { store.notify('命令前缀保存失败', 'error'); }
 }
 
 // Idle timeout
@@ -1847,6 +1851,7 @@ async function loadIdleTimeout() {
   const voiceDuckingLoadRevision = voiceDuckingRequestRevision;
   try {
     const res = await axios.get('/api/bot/settings');
+    commandPrefix.value = res.data.commandPrefix ?? '!';
     idleTimeout.value = res.data.idleTimeoutMinutes ?? 0;
     autoPauseOnEmpty.value = res.data.autoPauseOnEmpty ?? false;
     // A later save owns the state. Do not let an older GET response overwrite

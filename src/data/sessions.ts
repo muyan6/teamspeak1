@@ -23,6 +23,8 @@ export interface SessionValidation {
 export interface SessionStore {
   createSession(userId: string, opts?: { ttlMs?: number; skipCap?: boolean }): { token: string; expiresAt: number };
   validateAndTouch(rawToken: string): SessionValidation | null;
+  /** Read-only validation for long-lived sockets; checking must not renew TTL. */
+  validate(rawToken: string): SessionValidation | null;
   deleteSession(rawToken: string): void;
   deleteAllForUser(userId: string, exceptToken?: string): void;
   cleanupExpired(): void;
@@ -56,6 +58,12 @@ export function createSessionStore(db: Database.Database): SessionStore {
   );
 
   return {
+    validate(rawToken) {
+      if (!rawToken) return null;
+      const row = selectStmt.get(hashToken(rawToken)) as (SessionValidation & { userId: string; username: string; role: SessionValidation['role']; expiresAt: number }) | undefined;
+      if (!row || row.expiresAt <= Date.now()) return null;
+      return { userId: row.userId, username: row.username, role: row.role };
+    },
     createSession(userId, opts) {
       // Cap concurrent sessions per user — oldest gets evicted on overflow.
       // Wrap the count → delete → insert in a transaction so concurrent logins

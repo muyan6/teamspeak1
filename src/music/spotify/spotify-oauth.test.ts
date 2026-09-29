@@ -451,8 +451,8 @@ describe("SpotifyOAuth.configure (runtime credentials, whole-branch I2)", () => 
     oauth.configure("cid", REDIRECT);
     expect(oauth.getClientId()).toBe("cid");
     expect(oauth.getRedirectUri()).toBe(REDIRECT);
-    // Now authorize + isAuthorized work against the newly-supplied app.
-    expect(oauth.isAuthorized()).toBe(true);
+    // Changing the app must not re-use tokens minted for a different app.
+    expect(oauth.isAuthorized()).toBe(false);
     const { url } = oauth.buildAuthorizeUrl();
     const p = new URL(url).searchParams;
     expect(p.get("client_id")).toBe("cid");

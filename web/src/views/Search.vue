@@ -191,7 +191,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import { createLatestRequest } from '../composables/latestRequest.js';
 import { useRoute, useRouter } from 'vue-router';
 import { Icon } from '@iconify/vue';
 import axios from 'axios';
@@ -202,6 +203,9 @@ import CoverArt from '../components/CoverArt.vue';
 import { mergeDedup, hasMore, nextOffset } from './searchPagination.js';
 
 const PAGE_SIZE = 20;
+const searches = createLatestRequest();
+let searchGeneration = 0;
+onUnmounted(() => { searchGeneration++; searches.cancel(); });
 
 const store = usePlayerStore();
 const route = useRoute();
@@ -320,6 +324,7 @@ function recordInitialHasMore(items: { platform: string }[], type: TabType) {
 }
 
 async function loadMore() {
+  const generation = searchGeneration;
   const type = activeTab.value;
   const source = selectedSource.value;
   if (loadingMore.value[type]) return;
@@ -330,6 +335,7 @@ async function loadMore() {
     const res = await axios.get('/api/music/search', {
       params: { q: query.value, platform: source, limit: PAGE_SIZE, offset },
     });
+    if (generation !== searchGeneration) return;
     if (type === 'albums') {
       const incoming = (res.data.albums ?? []) as Album[];
       allAlbums.value = mergeDedup(allAlbums.value, incoming);
@@ -346,7 +352,7 @@ async function loadMore() {
   } catch {
     // 保留 hasMore 现状，允许用户重试。
   } finally {
-    loadingMore.value = { ...loadingMore.value, [type]: false };
+    if (generation === searchGeneration) loadingMore.value = { ...loadingMore.value, [type]: false };
   }
 }
 
@@ -383,13 +389,15 @@ async function toggleFavPlaylist(pl: { id: string; platform: string; name: strin
 
 async function doSearch() {
   if (!query.value.trim()) return;
+  const ticket = searches.start(); searchGeneration++;
   loading.value = true;
   searched.value = true;
   activeTab.value = 'songs';
   resetPagination();
   router.replace({ query: { q: query.value } });
   try {
-    const res = await axios.get('/api/music/search/all', { params: { q: query.value } });
+    const res = await axios.get('/api/music/search/all', { params: { q: query.value }, signal: ticket.signal });
+    if (!ticket.isCurrent()) return;
     allSongs.value = res.data.songs ?? [];
     allAlbums.value = res.data.albums ?? [];
     allPlaylists.value = res.data.playlists ?? [];
@@ -397,9 +405,10 @@ async function doSearch() {
     recordInitialHasMore(allAlbums.value, 'albums');
     recordInitialHasMore(allPlaylists.value, 'playlists');
   } catch {
+    if (!ticket.isCurrent()) return;
     allSongs.value = []; allAlbums.value = []; allPlaylists.value = [];
   } finally {
-    loading.value = false;
+    if (ticket.isCurrent()) loading.value = false;
   }
 }
 

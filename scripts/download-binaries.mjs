@@ -51,6 +51,7 @@ import { Readable } from "node:stream";
 import { execFileSync, execSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { createHash } from 'node:crypto';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const NODE_MODULES = join(ROOT, "node_modules");
@@ -61,6 +62,29 @@ const CDN = process.argv[2] || "https://cdn.npmmirror.com/binaries";
 const PLATFORM = process.platform;
 const ARCH = process.arch;
 const NODE_ABI = process.versions.modules;
+const MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024;
+
+async function verifiedDownload(mirrorUrl, officialUrl, expectedSize, expectedDigest) {
+  // A mirror is a transport optimisation, not the trust anchor. Compare its
+  // content against the publisher's HTTPS asset before executing native code.
+  const original = await download(officialUrl);
+  if (expectedSize && original.length !== expectedSize) throw new Error('publisher asset size mismatch');
+  const digest = `sha256:${createHash('sha256').update(original).digest('hex')}`;
+  if (expectedDigest && digest !== expectedDigest) throw new Error('publisher asset checksum mismatch');
+  let bytes = original;
+  if (mirrorUrl && mirrorUrl !== officialUrl) {
+    try {
+      const mirror = await download(mirrorUrl);
+      if (createHash('sha256').update(mirror).digest('hex') !== createHash('sha256').update(original).digest('hex')) throw new Error('mirror checksum mismatch');
+      bytes = mirror;
+    } catch (err) { log(`mirror unavailable or differs; using publisher asset: ${err.message}`); }
+  }
+  const manifestPath = join(NODE_MODULES, '.tsmusicbot-binary-hashes.json');
+  let manifest = {}; try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch {}
+  manifest[officialUrl] = { sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length };
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  return bytes;
+}
 
 /** Modules the bot cannot start without. ffmpeg-static is optional: a system
  *  ffmpeg on PATH is a documented fallback, so it only ever produces a WARN. */
@@ -141,8 +165,12 @@ function summarizeError(text) {
 // ---------------------------------------------------------------------------
 
 function download(url, redirects = 0) {
+  if (new URL(url).protocol !== 'https:') return Promise.reject(new Error('binary downloads require HTTPS'));
   return new Promise((resolve, reject) => {
-    const req = get(url, { timeout: 120000 }, (res) => {
+    const req = get(url, { timeout: 120000, headers: {
+      'User-Agent': 'TSMusicBot-installer',
+      ...(new URL(url).hostname === 'api.github.com' && process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}),
+    } }, (res) => {
       const { statusCode, headers } = res;
       if (statusCode >= 300 && statusCode < 400 && headers.location) {
         res.resume();
@@ -159,7 +187,8 @@ function download(url, redirects = 0) {
         return;
       }
       const chunks = [];
-      res.on("data", (c) => chunks.push(c));
+      let size = 0;
+      res.on('data', c => { size += c.length; if (size > MAX_DOWNLOAD_BYTES) res.destroy(new Error('binary download exceeds 128 MB')); else chunks.push(c); });
       res.on("error", reject);
       res.on("end", () => resolve(Buffer.concat(chunks)));
     });
@@ -193,7 +222,13 @@ async function extractTarGz(buf, cwd) {
   const tmpFile = join(tmpdir(), `tsmb-${process.pid}-${Date.now()}.tar.gz`);
   writeFileSync(tmpFile, buf);
   try {
-    await tar.extract({ cwd, file: tmpFile });
+    let total = 0, entries = 0;
+    await tar.extract({ cwd, file: tmpFile, strict: true, preservePaths: false, filter(name, entry) {
+      const parts = name.replaceAll('\\', '/').split('/');
+      if (++entries > 256 || (total += Number(entry.size) || 0) > MAX_DOWNLOAD_BYTES) throw new Error('archive exceeds extraction limits');
+      if (name.startsWith('/') || name.includes(':') || parts.includes('..') || !['File', 'Directory'].includes(entry.type)) throw new Error('invalid binary archive entry');
+      return true;
+    } });
   } finally {
     try {
       rmSync(tmpFile, { force: true });
@@ -435,7 +470,7 @@ async function ensureFfmpeg() {
     // could not be spawned would hurt exactly the slow-network users this
     // script exists for.
     log(`${name}: present (${humanSize(ffDest)}) but could not be executed: ${probe.error}`);
-    return makeResult(name, "ok", "present, not verified");
+    log(`${name}: invalid executable for this platform; replacing it with a verified build`);
   }
 
   if (existsSync(ffDest)) {
@@ -449,13 +484,18 @@ async function ensureFfmpeg() {
   const tmpDest = `${ffDest}.tsmb-tmp-${process.pid}`;
   try {
     log(`${name}: GET ${url}  (~80 MB, 这一步比较慢,请耐心等待)`);
-    const buf = await download(url);
+    const release = JSON.parse((await download('https://api.github.com/repos/eugeneware/ffmpeg-static/releases/tags/b6.1.1')).toString('utf8'));
+    const asset = release.assets.find(a => a.name === `ffmpeg-${PLATFORM}-${ARCH}.gz`);
+    if (!asset) throw new Error('publisher has no FFmpeg asset for this platform');
+    const buf = await verifiedDownload(url, asset.browser_download_url, asset.size, asset.digest);
     await pipeline(Readable.from(buf), createGunzip(), createWriteStream(tmpDest));
     ensureExecutable(tmpDest);
     if (sizeOf(tmpDest) < FFMPEG_MIN_BYTES) {
       throw new Error(`downloaded ffmpeg is only ${humanSize(tmpDest)} — truncated`);
     }
     renameSync(tmpDest, ffDest); // atomic swap, same directory
+    const after = probeFfmpegBinary(ffDest);
+    if (!after.ok) throw new Error(after.error);
     backup.commit();
     log(`${name}: OK (${humanSize(ffDest)})`);
     return makeResult(name, "repaired", humanSize(ffDest));
@@ -508,10 +548,19 @@ async function ensureOpus() {
   try {
     try {
       log(`${name}: GET ${url}`);
-      const buf = await download(url);
+      const release = JSON.parse((await download(`https://api.github.com/repos/discordjs/opus/releases/tags/v${version}`)).toString('utf8'));
+      const exact = release.assets.find(a => a.name === url.split('/').pop());
+      // node-pre-gyp encodes Node's ABI in its folder even though this addon
+      // uses stable N-API v3. A published earlier-ABI N-API build is reusable
+      // under newer Node; the load probe below verifies that before commit.
+      const asset = exact ?? release.assets.filter(a => a.name.includes(`-napi-v3-${PLATFORM}-${ARCH}-unknown-unknown.tar.gz`))
+        .sort((a, b) => Number(b.name.match(/node-v(\d+)/)?.[1]) - Number(a.name.match(/node-v(\d+)/)?.[1]))[0];
+      if (!asset) throw new Error('no compatible published Opus N-API asset');
+      const buf = await verifiedDownload(`${CDN}/@discordjs/opus/v${version}/${asset.name}`, asset.browser_download_url, asset.size, asset.digest);
       staging = mkdtempSync(join(pkgDir, ".tsmb-staging-"));
       await extractTarGz(buf, staging);
-      const staged = join(staging, prebuildDirName);
+      const publishedDir = asset.name.replace(`opus-v${version}-`, '').replace(/\.tar\.gz$/, '');
+      const staged = join(staging, publishedDir);
       if (!existsSync(join(staged, "opus.node"))) {
         throw new Error(`tarball did not contain ${prebuildDirName}/opus.node`);
       }
@@ -578,7 +627,7 @@ async function ensureBetterSqlite3() {
   try {
     try {
       log(`${name}: GET ${url}`);
-      const buf = await download(url);
+      const buf = await verifiedDownload(url, `https://github.com/WiseLibs/better-sqlite3/releases/download/v${version}/${url.split('/').pop()}`);
       staging = mkdtempSync(join(pkgDir, ".tsmb-staging-"));
       await extractTarGz(buf, staging);
       const staged = join(staging, "build", "Release", "better_sqlite3.node");

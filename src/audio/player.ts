@@ -674,7 +674,8 @@ export class AudioPlayer extends EventEmitter {
       this.downloader = null;
       try {
         if (process.platform === "win32" && ps.pid) {
-          spawn("taskkill", ["/pid", String(ps.pid), "/T", "/F"], { stdio: "ignore" });
+          const tk = spawn("taskkill", ["/pid", String(ps.pid), "/T", "/F"], { stdio: "ignore" });
+          tk.on("error", () => {});
         } else {
           ps.kill("SIGTERM");
         }
@@ -705,7 +706,8 @@ export class AudioPlayer extends EventEmitter {
 
     try {
       if (process.platform === "win32") {
-        spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+        const tk = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+        tk.on("error", () => {});
       } else {
         proc.kill("SIGTERM");
       }
@@ -714,7 +716,8 @@ export class AudioPlayer extends EventEmitter {
     const killTimeout = setTimeout(() => {
       try {
         if (process.platform === "win32") {
-          spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+          const tk = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+          tk.on("error", () => {});
         } else {
           process.kill(pid, 0); 
           process.kill(pid, "SIGKILL");

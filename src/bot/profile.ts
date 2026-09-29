@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
-import axios from "axios";
+import { downloadCoverImage } from '../music/image-download.js';
+export { isSafeCoverUrl } from '../music/image-download.js';
 import { TS3Client, escapeTS3 } from "../ts-protocol/client.js";
 import { HttpQueryError } from "../ts-protocol/http-query.js";
 import type { ProfileConfig } from "../data/database.js";
@@ -60,6 +61,7 @@ export class BotProfileManager {
     config: ProfileConfig,
     defaultNickname: string,
     allowedCoverHosts: string[] = [],
+    private readonly loadProviderCover?: (url: string) => Promise<Buffer | null>,
   ) {
     this.tsClient = tsClient;
     this.logger = logger.child({ component: "profile" });
@@ -438,7 +440,7 @@ export class BotProfileManager {
         `\u4E13\u8F91: ${sanitizeTS3Text(song.album)}`, // 专辑:
         `\u5E73\u53F0: ${sanitizeTS3Text(song.platform)}`, // 平台:
       ];
-      const desc = lines.join("\\n");
+      const desc = lines.join("\n");
       await this.tsClient.sendCommandNoWait(
         `channeledit cid=${channelId} channel_description=${escapeTS3(desc)}`,
       );
@@ -479,17 +481,9 @@ export class BotProfileManager {
   }
 
   private async downloadImage(url: string): Promise<Buffer | null> {
-    if (!isSafeCoverUrl(url, this.allowedCoverHosts)) {
-      this.logger.warn({ url }, "Refusing to download cover image: unsafe or private URL (SSRF guard)");
-      return null;
-    }
     try {
-      const resp = await axios.get(url, {
-        responseType: "arraybuffer",
-        timeout: 8000,
-        maxContentLength: 2 * 1024 * 1024, // 2 MB cap
-      });
-      return Buffer.from(resp.data);
+      if (url.startsWith('/api/music/jellyfin/cover/')) return await this.loadProviderCover?.(url) ?? null;
+      return await downloadCoverImage(url, this.allowedCoverHosts);
     } catch (err) {
       this.logger.warn({ err, url }, "Failed to download cover image");
       return null;
@@ -544,54 +538,5 @@ export class BotProfileManager {
 export function sanitizeTS3Text(text: string): string {
   if (!text || typeof text !== "string") return "";
   return text.replace(/\[/g, "［").replace(/\]/g, "］");
-}
-
-/**
- * SSRF Guard: Verify that a cover image URL points to a valid public HTTP(S) host
- * and not a private LAN, loopback, or cloud metadata address.
- * Allows explicitly whitelisted hosts (e.g. user-configured Jellyfin server).
- */
-export function isSafeCoverUrl(urlString: string, allowedHosts: string[] = []): boolean {
-  if (!urlString || typeof urlString !== "string") return false;
-  let parsed: URL;
-  try {
-    parsed = new URL(urlString);
-  } catch {
-    return false;
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return false;
-  }
-  const hostname = parsed.hostname.toLowerCase();
-  const host = hostname.startsWith("[") && hostname.endsWith("]")
-    ? hostname.slice(1, -1)
-    : hostname;
-
-  if (allowedHosts.some((h) => h.toLowerCase() === host || h.toLowerCase() === hostname)) {
-    return true;
-  }
-
-  if (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host === "0.0.0.0" ||
-    host === "::1" ||
-    host.endsWith(".local") ||
-    host.endsWith(".internal") ||
-    host.endsWith(".localhost")
-  ) {
-    return false;
-  }
-
-  if (/^127\./.test(host)) return false;
-  if (/^10\./.test(host)) return false;
-  if (/^192\.168\./.test(host)) return false;
-  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host)) return false;
-  if (/^169\.254\./.test(host)) return false;
-  if (/^0\./.test(host)) return false;
-  if (/^fc[0-9a-f]{2}:/i.test(host) || /^fd[0-9a-f]{2}:/i.test(host)) return false;
-  if (/^fe80:/i.test(host)) return false;
-
-  return true;
 }
 

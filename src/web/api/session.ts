@@ -47,7 +47,7 @@ export function createSessionRouter(
   permissions: PermissionStore,
   getGuestConfig: () => GuestModeConfig,
   /** Wired by the web server so a logout also drops that user's WS sockets. */
-  onSessionsRevoked?: (userId: string) => void
+  onSessionsRevoked?: (userId: string, keepToken?: string, onlyToken?: string) => void
 ): Router {
   const router = Router();
 
@@ -67,7 +67,7 @@ export function createSessionRouter(
     }
     req.user = { id: result.userId, username: result.username, role: result.role };
     const token = extractSessionToken(req.headers.cookie);
-    if (token) setSessionCookie(res, token);
+    if (token) setSessionCookie(res, token, result.role === 'guest' ? GUEST_SESSION_TTL_MS : SESSION_TTL_MS);
     next();
   };
 
@@ -160,7 +160,7 @@ export function createSessionRouter(
       sessions.deleteSession(token);
       if (owner) {
         try {
-          onSessionsRevoked?.(owner.userId);
+          onSessionsRevoked?.(owner.userId, undefined, token);
         } catch (err) {
           logger.warn({ err }, "failed to close user sockets on logout");
         }
@@ -208,6 +208,7 @@ export function createSessionRouter(
     await users.changePassword(u.id, newPassword);
     const currentToken = extractSessionToken(req.headers.cookie);
     sessions.deleteAllForUser(u.id, currentToken ?? undefined);
+    onSessionsRevoked?.(u.id, currentToken ?? undefined);
     try {
       audit.record({
         actorId: u.id, actorUsername: u.username,

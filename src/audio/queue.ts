@@ -1,3 +1,6 @@
+export const MAX_QUEUE_SONGS = 1000;
+export class QueueCapacityError extends Error { readonly status = 400; }
+
 export enum PlayMode {
   Sequential = "seq",
   Loop = "loop",
@@ -58,6 +61,13 @@ export interface QueueSnapshot {
 }
 
 export class PlayQueue {
+  private revision = 0;
+  constructor(private readonly onChange: () => void = () => {}) {}
+  getRevision(): number { return this.revision; }
+  private changed(): void { this.revision++; this.onChange(); }
+  private reserve(count: number): void {
+    if (this.songs.length + count > MAX_QUEUE_SONGS) throw new QueueCapacityError(`队列最多 ${MAX_QUEUE_SONGS} 首歌曲`);
+  }
   private songs: QueuedSong[] = [];
   private currentIndex = -1;
   private mode: PlayMode = PlayMode.Sequential;
@@ -76,13 +86,17 @@ export class PlayQueue {
   }
 
   add(song: QueuedSong): void {
+    this.reserve(1);
     this.songs.push(song);
     this.nextRandomCandidate = null;
+    this.changed();
   }
 
   addMany(songs: QueuedSong[]): void {
+    this.reserve(songs.length);
     this.songs.push(...songs);
     this.nextRandomCandidate = null;
+    this.changed();
   }
 
   /**
@@ -99,9 +113,11 @@ export class PlayQueue {
    * the forward stack, which next() consults first (issue #141).
    */
   addNext(song: QueuedSong): void {
+    this.reserve(1);
     this.nextRandomCandidate = null;
     if (this.currentIndex < 0 || this.songs.length === 0) {
       this.songs.push(song);
+      this.changed();
       return;
     }
     const insertAt = this.currentIndex + 1;
@@ -133,6 +149,7 @@ export class PlayQueue {
         this.forwardStack.shift();
       }
     }
+    this.changed();
   }
 
   remove(index: number): QueuedSong | null {
@@ -174,6 +191,7 @@ export class PlayQueue {
       .filter((idx) => idx !== index)
       .map((idx) => (idx > index ? idx - 1 : idx));
 
+    this.changed();
     return removed;
   }
 
@@ -184,6 +202,7 @@ export class PlayQueue {
     this.history = [];
     this.forwardStack = [];
     this.nextRandomCandidate = null;
+    this.changed();
   }
 
   play(): QueuedSong | null {
@@ -419,6 +438,14 @@ export class PlayQueue {
     return this.currentIndex;
   }
 
+  /** Keep a bounded FM back-stack without removing unplayed or audible tracks. */
+  trimPlayed(keep = 50): void {
+    const retained = new Set(this.history.slice(-keep));
+    for (let i = this.songs.length - 1; i >= 0; i--) {
+      if (this.playedIndices.has(i) && i !== this.currentIndex && !retained.has(i)) this.remove(i);
+    }
+  }
+
   /** Number of songs not yet played in Random mode. */
   unplayedCount(): number {
     return this.songs.length - this.playedIndices.size;
@@ -443,7 +470,7 @@ export class PlayQueue {
    * restored index (an out-of-range index degrades to -1 = "nothing current").
    */
   restore(s: QueueSnapshot): void {
-    this.songs = s.songs.map((song) => ({ ...song }));
+    this.songs = s.songs.slice(0, MAX_QUEUE_SONGS).map((song) => ({ ...song }));
     this.mode = s.mode;
     this.currentIndex =
       s.currentIndex >= 0 && s.currentIndex < this.songs.length ? s.currentIndex : -1;
@@ -451,5 +478,6 @@ export class PlayQueue {
     this.history = [];
     this.forwardStack = [];
     this.nextRandomCandidate = null;
+    this.changed();
   }
 }

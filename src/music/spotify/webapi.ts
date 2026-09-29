@@ -147,11 +147,12 @@ export class SpotifyWebApi {
     }
   }
 
-  async search(query: string, limit = 20): Promise<SearchResult> {
+  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
     const data = await this.get("/v1/search", {
       q: query,
       type: "track,album,playlist",
       limit,
+      offset,
     });
     if (!data) return { songs: [], playlists: [], albums: [] };
     return {

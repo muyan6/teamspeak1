@@ -154,6 +154,7 @@ export function createBotRouter(
       jellyfin: maskedJellyfin(),
       enabledProviders: config.enabledProviders,
       defaultPlatform: config.defaultPlatform,
+      commandPrefix: config.commandPrefix,
     });
   });
 
@@ -182,6 +183,10 @@ export function createBotRouter(
   // touches credentials, guest policy, provider gating or admin groups is
   // admin-only.
   router.post("/settings", requirePermission("bot.manage"), (req, res) => {
+    const prefix = req.body?.commandPrefix;
+    if (prefix !== undefined && (typeof prefix !== 'string' || !prefix || prefix.length > 16 || /[\s\x00-\x1f]/.test(prefix))) {
+      res.status(400).json({ error: 'commandPrefix must be 1-16 non-whitespace characters' }); return;
+    }
     const isAdmin = req.user?.role === "admin";
     if (!isAdmin) {
       const touched = ADMIN_ONLY_SETTINGS_KEYS.filter(
@@ -216,6 +221,7 @@ export function createBotRouter(
     const hasFade = typeof req.body.audioFade === "boolean";
 
     if (hasIdle) config.idleTimeoutMinutes = idleTimeoutMinutes;
+    if (typeof prefix === 'string') config.commandPrefix = prefix;
     if (hasAutoPause) config.autoPauseOnEmpty = autoPauseOnEmpty;
     if (hasLocalAudioEnabled) config.localAudioEnabled = localAudioEnabled;
     if (hasLoudness) config.loudnessNormalization = req.body.loudnessNormalization;
@@ -361,6 +367,16 @@ export function createBotRouter(
     // provider — a Settings save must work without a restart.
     if (jf && typeof jf === "object") {
       jellyfinProvider?.configure(config.jellyfin);
+      const hosts: string[] = [];
+      if (config.jellyfin?.serverUrl) {
+        try {
+          const u = new URL(config.jellyfin.serverUrl);
+          if (u.hostname) hosts.push(config.jellyfin.serverUrl);
+        } catch { /* ignore invalid url */ }
+      }
+      for (const bot of botManager.getAllBots()) {
+        bot.updateAllowedCoverHosts?.(hosts);
+      }
     }
 
     // I2: only when the spotify block was present, push the (possibly UI-entered)
@@ -409,6 +425,7 @@ export function createBotRouter(
       jellyfin: maskedJellyfin(),
       enabledProviders: config.enabledProviders,
       defaultPlatform: config.defaultPlatform,
+      commandPrefix: config.commandPrefix,
     });
   });
 

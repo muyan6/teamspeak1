@@ -24,6 +24,7 @@ function makeFakeBot(id: string) {
     executeCommand: async () => "ok",
     getStatus: () => ({ id }),
     getQueue: () => [],
+    getPlayer: () => ({ getElapsed: () => 0 }),
     getProfileManager: () => ({ getConfig: () => ({}), updateConfig: () => {}, setCustomAvatar: () => {} }),
   };
 }
@@ -422,6 +423,13 @@ describe("guest enforcement on player routes", () => {
   it("members are unaffected — player.queue still reaches /add-song", async () => {
     const m = makeApp(member(["player.queue"], [ALLOWED_BOT]));
     expect((await request(m).post(`/api/player/${ALLOWED_BOT}/add-song`).send({ song: SONG })).status).not.toBe(403);
+  });
+
+  it("guests CAN read /queue, /elapsed, /history without 403", async () => {
+    const app = mountGuest({});
+    expect((await request(app).get(`/api/player/${ALLOWED_BOT}/queue`)).status).not.toBe(403);
+    expect((await request(app).get(`/api/player/${ALLOWED_BOT}/elapsed`)).status).not.toBe(403);
+    expect((await request(app).get(`/api/player/${ALLOWED_BOT}/history`)).status).not.toBe(403);
   });
 });
 

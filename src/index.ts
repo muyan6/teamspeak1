@@ -26,7 +26,7 @@ import { createWebServer } from "./web/server.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
-const DATA_DIR = path.join(ROOT_DIR, "data");
+const DATA_DIR = process.env.TSMB_DATA_DIR ? path.resolve(process.env.TSMB_DATA_DIR) : path.join(ROOT_DIR, 'data');
 // config.json lives under the persisted data dir (the Docker volume) alongside the
 // DB/cookies/logs, so it survives container restarts and manual edits take effect
 // (#86). LEGACY_CONFIG_PATH is the old root-level location we migrate from once.
@@ -218,27 +218,25 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("Shutting down...");
+    const forceExit = setTimeout(() => {
+      logger.warn('Shutdown timed out — forcing exit');
+      try { db.close(); } catch {}
+      process.exit(1);
+    }, 5000);
+    forceExit.unref();
     try {
       qqProvider.stopKeepAlive();
       botManager.shutdown();
-      webServer.stop();
-      apiServer.stop();
+      await Promise.all([webServer.stop(), apiServer.stop()]);
     } catch (err) {
       logger.warn({ err }, "Error while stopping services");
     }
 
     // Give pending async teardown (sidecar kills, WAL checkpoint) a moment to
     // finish, then close the DB and exit.
-    const forceExit = setTimeout(() => {
-      logger.warn("Shutdown timed out — forcing exit");
-      try { db.close(); } catch { /* already closed */ }
-      process.exit(0);
-    }, 5000);
-    forceExit.unref();
-
     try {
-      await new Promise((resolve) => setTimeout(resolve, 300));
       db.close();
+      await new Promise<void>(resolve => logger.flush(() => resolve()));
     } catch (err) {
       logger.warn({ err }, "Error while closing database");
     }
@@ -248,6 +246,11 @@ async function main() {
 
   process.on("SIGINT", () => { void shutdown(); });
   process.on("SIGTERM", () => { void shutdown(); });
+  // Local process supervisors can request the same graceful shutdown on
+  // Windows, where child.kill() does not deliver a catchable POSIX signal.
+  process.on('message', message => {
+    if (message && typeof message === 'object' && 'type' in message && message.type === 'shutdown') void shutdown();
+  });
 }
 
 main().catch((err) => {

@@ -113,6 +113,11 @@ export interface CreateBotParams {
 
 export class BotManager extends EventEmitter {
   private bots = new Map<string, BotInstance>();
+  private lifecycleVersions = new Map<string, number>();
+  private nextLifecycle(id: string): number {
+    const version = (this.lifecycleVersions.get(id) ?? 0) + 1;
+    this.lifecycleVersions.set(id, version); return version;
+  }
   private readonly managedVoiceClients = new ManagedVoiceClientRegistry();
   private neteaseProvider: MusicProvider;
   private qqProvider: MusicProvider;
@@ -210,6 +215,7 @@ export class BotManager extends EventEmitter {
   }
 
   async removeBot(id: string): Promise<void> {
+    this.nextLifecycle(id);
     const bot = this.bots.get(id);
     if (bot) {
       bot.disconnect();
@@ -278,7 +284,7 @@ export class BotManager extends EventEmitter {
   /** Local upload ids still referenced by any bot's queue. The local provider
    *  uses this to avoid deleting a file another queue/bot is still using. */
   getReferencedLocalSongIds(): Set<string> {
-    const ids = new Set<string>();
+    const ids = this.database.getReferencedLocalSongIds();
     for (const bot of this.bots.values()) {
       for (const song of bot.getQueueManager().list()) {
         if (song.platform === "local") ids.add(song.id);
@@ -288,6 +294,7 @@ export class BotManager extends EventEmitter {
   }
 
   async startBot(id: string): Promise<void> {
+    const version = this.nextLifecycle(id);
     const oldBot = this.bots.get(id);
     if (!oldBot) throw new Error(`Bot ${id} not found`);
 
@@ -310,15 +317,18 @@ export class BotManager extends EventEmitter {
       this.bots.set(id, bot);
       this.emit("botInstance", bot);
       await connectWithTimeout(bot, 25_000, this.logger);
+      if (this.bots.get(id) !== bot || this.lifecycleVersions.get(id) !== version || !bot.isConnected()) throw new Error('Bot start was cancelled');
       // Mark as autoStart so it reconnects on Docker / service restart, and persist identity
       const identity = bot.getIdentityExport() || saved.identity;
-      this.database.saveBotInstance({ ...saved, autoStart: true, identity });
+      const latest = this.getBotConfig(id);
+      if (latest) this.database.saveBotInstance({ ...latest, autoStart: true, identity });
     } else {
       await connectWithTimeout(oldBot, 25_000, this.logger);
     }
   }
 
   stopBot(id: string): void {
+    this.nextLifecycle(id);
     const bot = this.bots.get(id);
     if (!bot) throw new Error(`Bot ${id} not found`);
     bot.disconnect();
@@ -406,8 +416,12 @@ export class BotManager extends EventEmitter {
 
     const connectAll = async () => {
       for (const { saved, bot } of pendingConnects) {
+        const shouldConnect = () => this.bots.get(saved.id) === bot &&
+          this.database.getBotInstances().some(b => b.id === saved.id && b.autoStart);
+        if (!shouldConnect()) continue;
         try {
           await connectWithTimeout(bot, 25_000, this.logger);
+          if (!shouldConnect()) continue;
           this.persistBotIdentity(saved, bot);
           this.logger.info(
             { botId: saved.id, name: saved.name },
@@ -418,7 +432,7 @@ export class BotManager extends EventEmitter {
             { err, botId: saved.id, name: saved.name },
             "Failed to auto-connect bot on startup (will retry in background)"
           );
-          bot.scheduleAutoReconnect(3000);
+          if (shouldConnect()) bot.scheduleAutoReconnect(3000);
         }
 
         // Stagger connections to avoid overwhelming the TS server
@@ -443,8 +457,9 @@ export class BotManager extends EventEmitter {
 
   private persistBotIdentity(saved: import("../data/database.js").BotInstance, bot: BotInstance): void {
     const identity = bot.getIdentityExport();
-    if (identity && identity !== saved.identity) {
-      this.database.saveBotInstance({ ...saved, identity });
+    const current = this.database.getBotInstances().find(b => b.id === saved.id);
+    if (current && this.bots.get(saved.id) === bot && identity && identity !== current.identity) {
+      this.database.saveBotInstance({ ...current, identity });
     }
   }
 

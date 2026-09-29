@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
+import { publicCoverUrl } from './media-dto.js';
 import axios, { type AxiosError, type AxiosInstance } from "axios";
 import type { JellyfinConfig } from "../data/config.js";
 import type { Logger } from "../logger.js";
@@ -209,6 +210,7 @@ export class JellyfinProvider implements MusicProvider {
   private deviceId = "";
   private quality: string = "direct";
   private loginPromise: Promise<void> | null = null;
+  private generation = 0;
   private persistFn: ((serialized: string) => void) | null = null;
   private logger: Logger | null = null;
 
@@ -233,6 +235,8 @@ export class JellyfinProvider implements MusicProvider {
       prev.apiKey !== this.cfg.apiKey ||
       prev.userId !== this.cfg.userId;
     if (credsChanged) {
+      this.generation++;
+      this.loginPromise = null;
       this.token = "";
       this.userId = "";
     }
@@ -285,6 +289,7 @@ export class JellyfinProvider implements MusicProvider {
   }
 
   private async login(): Promise<void> {
+    const generation = this.generation;
     this.ensureDeviceId();
     const res = await this.api.post(
       `${this.cfg.serverUrl}/Users/AuthenticateByName`,
@@ -292,6 +297,7 @@ export class JellyfinProvider implements MusicProvider {
       { headers: { Authorization: this.authHeader() } },
     );
     const token = res.data?.AccessToken as string | undefined;
+    if (generation !== this.generation) throw new Error('Jellyfin configuration changed during login');
     const userId = res.data?.User?.Id as string | undefined;
     if (!token || !userId) {
       throw new Error("Jellyfin 登录响应缺少 AccessToken/User.Id");
@@ -320,9 +326,8 @@ export class JellyfinProvider implements MusicProvider {
       throw new Error("Jellyfin 未配置用户名/密码 (username not configured)");
     }
     if (!this.loginPromise) {
-      this.loginPromise = this.login().finally(() => {
-        this.loginPromise = null;
-      });
+      const pending = this.login().finally(() => { if (this.loginPromise === pending) this.loginPromise = null; });
+      this.loginPromise = pending;
     }
     return this.loginPromise;
   }
@@ -362,7 +367,26 @@ export class JellyfinProvider implements MusicProvider {
   // --- MusicProvider ---
 
   private coverFor(item: JellyfinItem): string {
-    return buildCoverUrl(this.cfg.serverUrl, this.token, item);
+    return publicCoverUrl(buildCoverUrl(this.cfg.serverUrl, this.token, item));
+  }
+
+  async getCoverImage(itemId: string, tag = ''): Promise<{ buffer: Buffer; mime: string } | null> {
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(itemId) || tag.length > 256) return null;
+    await this.ensureAuth();
+    const res = await this.api.get(`${this.cfg.serverUrl}/Items/${encodeURIComponent(itemId)}/Images/Primary`, {
+      headers: { 'X-Emby-Token': this.token }, params: { maxWidth: 512, ...(tag ? { tag } : {}) },
+      responseType: 'arraybuffer', maxContentLength: 2 * 1024 * 1024, timeout: 8000, maxRedirects: 0,
+    });
+    const mime = String(res.headers?.['content-type'] ?? '').split(';')[0].toLowerCase();
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mime)) return null;
+    return { buffer: Buffer.from(res.data), mime };
+  }
+
+  async getCoverImageFromUrl(raw: string): Promise<Buffer | null> {
+    const u = new URL(raw, 'http://relative.invalid');
+    const m = /^\/api\/music\/jellyfin\/cover\/([A-Za-z0-9_-]+)$/.exec(u.pathname);
+    if (!m || u.origin !== 'http://relative.invalid') return null;
+    return (await this.getCoverImage(m[1], u.searchParams.get('tag') ?? ''))?.buffer ?? null;
   }
 
   private mapSongs(items: JellyfinItem[] | undefined | null): Song[] {

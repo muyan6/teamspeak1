@@ -7,7 +7,8 @@ import {
   type ClientInfo,
 } from "../ts-protocol/client.js";
 import { AudioPlayer } from "../audio/player.js";
-import { PlayQueue, PlayMode, parsePlayMode, type QueuedSong } from "../audio/queue.js";
+import { PlayQueue, PlayMode, parsePlayMode, MAX_QUEUE_SONGS, type QueuedSong } from "../audio/queue.js";
+import { publicSong, musicContext } from "../music/media-dto.js";
 import type { MusicProvider, Platform, Song } from "../music/provider.js";
 import {
   parseCommand,
@@ -144,6 +145,7 @@ export interface BotStatus {
   elapsed: number; // ground truth elapsed seconds from frame count
   /** 当前曲实际播放时长（秒）。试听片段=试听秒数；完整曲=duration。缺失时前端回退 currentSong.duration。 */
   effectiveDuration?: number;
+  queueRevision?: number;
 }
 
 function getOrCreateHandler(target: any): BotCommandHandler {
@@ -152,6 +154,10 @@ function getOrCreateHandler(target: any): BotCommandHandler {
 }
 
 export class BotInstance extends EventEmitter {
+  private playGeneration = 0;
+  private activePlaybackGeneration = 0;
+  private musicCacheContext = '';
+  private queueNotificationsSuppressed = false;
   readonly id: string;
   name: string;
 
@@ -261,7 +267,9 @@ export class BotInstance extends EventEmitter {
       voicePort: options.tsOptions.port,
     };
     this.voiceServerScope = { ...this.configuredVoiceServerScope };
-    this.queue = new PlayQueue();
+    this.queue = new PlayQueue(() => {
+      if (!this.queueNotificationsSuppressed) this.emit('stateChange');
+    });
 
     // Restore persisted per-bot player settings (#125): volume + play mode
     // survive restarts. getPlayerSettings returns validated values (the in-memory
@@ -316,7 +324,7 @@ export class BotInstance extends EventEmitter {
     if (options.config.jellyfin?.serverUrl) {
       try {
         const u = new URL(options.config.jellyfin.serverUrl);
-        if (u.hostname) allowedCoverHosts.push(u.hostname);
+        if (u.hostname) allowedCoverHosts.push(options.config.jellyfin.serverUrl);
       } catch { /* ignore invalid url */ }
     }
 
@@ -327,6 +335,9 @@ export class BotInstance extends EventEmitter {
       profileConfig,
       options.tsOptions.nickname,
       allowedCoverHosts,
+      (url) => (this.jellyfinProvider as MusicProvider & {
+        getCoverImageFromUrl?: (url: string) => Promise<Buffer | null>;
+      }).getCoverImageFromUrl?.(url) ?? Promise.resolve(null),
     );
 
     // Best-effort: a corrupted/locked avatar file must not block bot startup.
@@ -357,22 +368,23 @@ export class BotInstance extends EventEmitter {
   }
 
   private setupPlayerEvents(): void {
+    const advance = () => {
+      const generation = this.activePlaybackGeneration;
+      this.runExclusive(() => generation === this.activePlaybackGeneration && this.connected
+        ? this.playNext() : Promise.resolve(false)).catch(err => this.logger.error({ err }, 'Automatic queue advance failed'));
+    };
     this.player.on("frame", (opusFrame: Buffer) => {
       this.tsClient.sendVoiceData(opusFrame);
     });
 
     this.player.on("trackEnd", () => {
       this.logger.debug("Track ended, advancing queue");
-      this.playNext().catch((err) => {
-        this.logger.error({ err }, "playNext failed after trackEnd");
-      });
+      advance();
     });
 
     this.player.on("error", (err: Error) => {
       this.logger.error({ err }, "Player error");
-      this.playNext().catch((err2) => {
-        this.logger.error({ err: err2 }, "playNext failed after player error");
-      });
+      advance();
     });
 
     // Spotify advances exclusively via the sidecar's WebSocket "trackEnded"
@@ -383,9 +395,7 @@ export class BotInstance extends EventEmitter {
     this.spotifyController.on("trackEnded", (_e: SpotifyTrackEndedEvent) => {
       if (this.queue.current()?.platform !== "spotify") return;
       this.logger.debug("Spotify track ended, advancing queue");
-      this.playNext().catch((err) => {
-        this.logger.error({ err }, "playNext failed after spotify trackEnded");
-      });
+      advance();
     });
   }
 
@@ -432,6 +442,8 @@ export class BotInstance extends EventEmitter {
     });
 
     this.tsClient.on("disconnected", () => {
+      this.invalidatePlayback?.();
+      if (this.connected) this.persistQueueSnapshot?.();
       // Capture pre-disconnect state snapshot for auto-reconnect if not manual disconnect
       const wasUnexpected = !this.manualDisconnect;
       if (wasUnexpected) {
@@ -485,7 +497,9 @@ export class BotInstance extends EventEmitter {
       this.currentSourceIsSpotify = false;
       this.player.stop();
       this.jellyfinReporter?.onStop();
+      this.queueNotificationsSuppressed = true;
       this.queue.clear();
+      this.queueNotificationsSuppressed = false;
       this.sweepLocalAudio("disconnected");
       // A lifecycle change must not leave a stale auto-resume armed.
       this.autoPaused = false;
@@ -713,10 +727,14 @@ export class BotInstance extends EventEmitter {
     // Feature 2 (#119): restore + resume the live queue persisted before the
     // last shutdown. Best-effort and gated on savedQueuesEnabled; runs after
     // the bot is fully connected so resolveAndPlay can actually push audio.
-    void this.restoreQueueFromSnapshot();
+    void this.runExclusive(() => this.restoreQueueFromSnapshot()).catch(err => this.logger.warn({ err }, 'Queue restore failed'));
   }
 
   disconnect(): void {
+    this.invalidatePlayback();
+    // Flush the newest queue before releasing its live references. A pending
+    // debounce must not lose the last mutation or overwrite it with empty state.
+    if (this.connected) this.persistQueueSnapshot();
     this.manualDisconnect = true;
     this._cancelReconnect();
     this.reconnectSnapshot = null;
@@ -743,7 +761,9 @@ export class BotInstance extends EventEmitter {
     this.currentSourceIsSpotify = false;
     this.player.stop();
     this.jellyfinReporter?.onStop();
+    this.queueNotificationsSuppressed = true;
     this.queue.clear();
+    this.queueNotificationsSuppressed = false;
     this.sweepLocalAudio("disconnected");
     this.connected = false;
     if (!this.disconnectEmitted) {
@@ -1295,8 +1315,9 @@ export class BotInstance extends EventEmitter {
     if (this.urlCache.has(cacheKey)) return;
 
     const provider = this.getProviderFor(nextSong.platform);
+    const context = this.musicCacheContext;
     provider.getSongUrl(nextSong.id).then((res) => {
-      if (res?.url) {
+      if (res?.url && this.musicCacheContext === context) {
         this.urlCache.set(cacheKey, res);
         this.logger.debug({ songId: nextSong.id }, "Pre-resolved next track URL");
       }
@@ -1305,6 +1326,13 @@ export class BotInstance extends EventEmitter {
 
   /** Resolve URL for a song and start playing it. Skips to next if URL fails. */
   async resolveAndPlay(song: QueuedSong): Promise<boolean> {
+    if (this.urlCache) {
+      const context = musicContext(this.config, [this.neteaseProvider, this.qqProvider, this.bilibiliProvider,
+        this.kugouProvider, this.spotifyProvider, this.jellyfinProvider].filter(Boolean));
+      if (context !== this.musicCacheContext) { this.urlCache.clear(); this.musicCacheContext = context; }
+    }
+    const generation = this.playGeneration = (this.playGeneration ?? 0) + 1;
+    const current = () => this.connected && this.playGeneration === generation;
     if (!this.connected) {
       this.logger.warn({ songId: song.id, name: song.name }, "resolveAndPlay called on disconnected bot — skipping");
       return false;
@@ -1363,7 +1391,7 @@ export class BotInstance extends EventEmitter {
       // during that window. Without this, we'd spawn ffmpeg on a
       // disconnected bot and land back in the same "connected=false but
       // playing=true" inconsistency that Bug C was about.
-      if (!this.connected) {
+      if (!current()) {
         this.logger.warn(
           { songId: song.id, name: song.name },
           "bot disconnected during URL resolve — aborting playback",
@@ -1376,6 +1404,7 @@ export class BotInstance extends EventEmitter {
       // fallback message + skip so the queue keeps moving.
       if (isSpotifyUri(result.url)) {
         const ready = await this.spotifyController.ensureStarted();
+        if (!current()) return false;
         if (!ready) {
           this.logger.info({ songId: song.id, name: song.name }, "Spotify backend unavailable — skipping");
           await this.tsClient.sendTextMessage(SPOTIFY_UNAVAILABLE_MESSAGE);
@@ -1387,6 +1416,7 @@ export class BotInstance extends EventEmitter {
         // sidecar failed the play (dead/errored backend): never attach the
         // player to a dead stream — send the same fallback and skip.
         const played = await this.spotifyController.playTrack(result.url);
+        if (!current()) return false;
         if (!played) {
           this.logger.info({ songId: song.id, name: song.name }, "Spotify playTrack failed — skipping");
           await this.tsClient.sendTextMessage(SPOTIFY_UNAVAILABLE_MESSAGE);
@@ -1401,6 +1431,7 @@ export class BotInstance extends EventEmitter {
         // (so NO player.stop() here). On the gapless auto-advance path the
         // player is still attached (isExternalActive() === true) so we do NOT
         // re-attach — the sidecar rolls the SAME FIFO into the next track.
+        this.activePlaybackGeneration = generation;
         if (!this.player.isExternalActive()) {
           this.player.playPcmStream(this.spotifyController.getPcmStream(), {
             // The sidecar PCM pipe is long-lived; per-track end arrives via the
@@ -1463,6 +1494,7 @@ export class BotInstance extends EventEmitter {
       song.url = result.url;
       // 试听片段用试听时长（让 player nearEnd 正确触发自动切歌）；完整曲回退 song.duration
       this.effectiveDuration = result.trialDuration ?? song.duration;
+      this.activePlaybackGeneration = generation;
       this.player.play(result.url, 0, this.effectiveDuration);
       this.preFetchNextTrack?.();
       // Jellyfin playback reporting: open a session for jellyfin tracks (the
@@ -1515,6 +1547,7 @@ export class BotInstance extends EventEmitter {
    */
   async playSingleSong(song: QueuedSong, requesterName?: string): Promise<boolean> {
     const s = this.withRequester(song, requesterName);
+    if (this.config.playKeepsQueue && this.queue.size() >= MAX_QUEUE_SONGS) throw new Error(`队列最多 ${MAX_QUEUE_SONGS} 首歌曲`);
     if (this.config.playKeepsQueue && !this.queue.isEmpty()) {
       const insertedAt =
         this.queue.getCurrentIndex() < 0
@@ -1560,6 +1593,7 @@ export class BotInstance extends EventEmitter {
     mode: "replace" | "append",
     requesterName?: string,
   ): Promise<void> {
+    if (mode === 'append' && this.queue.size() + songs.length > MAX_QUEUE_SONGS) throw new Error(`队列最多 ${MAX_QUEUE_SONGS} 首歌曲`);
     const tagged = songs.map((s) =>
       this.withRequester({ ...(s as QueuedSong) }, requesterName),
     );
@@ -1646,7 +1680,9 @@ export class BotInstance extends EventEmitter {
     try {
       const songs = await provider.getPersonalFm();
       if (songs.length === 0) return;
-      for (const song of songs) {
+      if (!this.isFmMode || this.fmProvider !== provider || !this.connected) return;
+      this.queue.trimPlayed(50);
+      for (const song of songs.slice(0, MAX_QUEUE_SONGS - this.queue.size())) {
         this.queue.add(this.withRequester({ ...song, platform: provider.platform }, this.fmRequesterName));
       }
       this.logger.debug({ count: songs.length, platform: provider.platform }, "FM queue refilled");
@@ -1903,6 +1939,13 @@ export class BotInstance extends EventEmitter {
     return next;
   }
 
+  invalidatePlayback(): void {
+    this.playGeneration = (this.playGeneration ?? 0) + 1;
+    this.activePlaybackGeneration = this.playGeneration;
+  }
+
+  invalidateMusicCache(): void { this.urlCache.clear(); }
+
   
 
   getStatus(): BotStatus {
@@ -1912,17 +1955,18 @@ export class BotInstance extends EventEmitter {
       connected: this.connected,
       playing: this.player.getState() === "playing",
       paused: this.player.getState() === "paused",
-      currentSong: this.queue.current(),
+      currentSong: this.queue.current() ? publicSong(this.queue.current()!) : null,
       queueSize: this.queue.size(),
       volume: this.player.getVolume(),
       playMode: this.queue.getMode(),
       elapsed: this.player.getElapsed(),
       effectiveDuration: this.effectiveDuration,
+      queueRevision: this.queue.getRevision(),
     };
   }
 
   getQueue(): QueuedSong[] {
-    return this.queue.list();
+    return this.queue.list().map(publicSong);
   }
 
   getPlayer(): AudioPlayer {
@@ -1964,6 +2008,10 @@ export class BotInstance extends EventEmitter {
 
   getProfileManager(): BotProfileManager {
     return this.profileManager;
+  }
+
+  updateAllowedCoverHosts(hosts: string[]): void {
+    this.profileManager.setAllowedCoverHosts(hosts);
   }
 
   getIdentityExport(): string | undefined {

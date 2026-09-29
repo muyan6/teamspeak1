@@ -4,6 +4,8 @@ import path from "node:path";
 import { CAPABILITIES, BOTS_ALL } from "./permissions.js";
 import { GUEST_USER_ID, GUEST_USERNAME } from "./users.js";
 import type { QueuedSong } from "../audio/queue.js";
+import { MAX_QUEUE_SONGS } from "../audio/queue.js";
+import { normalizeSong, publicSong, publicCoverUrl } from "../music/media-dto.js";
 
 /**
  * Reserved owner id for chat-saved / opt-in-shared queues. A `__`-bracketed
@@ -14,7 +16,7 @@ export const SHARED_QUEUE_OWNER = "__shared__";
 /** Cap per owner (private user OR the shared bucket). */
 export const MAX_SAVED_QUEUES = 50;
 /** Cap per saved queue / persisted live-queue snapshot. */
-export const MAX_QUEUE_SONGS = 1000;
+export { MAX_QUEUE_SONGS };
 /** Cap for play history entries retained per bot. */
 export const MAX_PLAY_HISTORY_PER_BOT = 1000;
 
@@ -149,6 +151,7 @@ export interface BotDatabase {
   setCustomAvatarPath(botId: string, path: string | null): void;
   addFavorite(userId: string, playlist: { platform: string; playlistId: string; name: string; coverUrl: string; songCount: number }): void;
   removeFavorite(userId: string, playlistId: string, platform: string): boolean;
+  removeFavoriteById(userId: string, id: number): boolean;
   getFavorites(userId: string): FavoritePlaylist[];
   isFavorited(userId: string, playlistId: string, platform: string): boolean;
   // Saved queues (Feature 1) — upsert by (ownerId, name), capped.
@@ -160,6 +163,7 @@ export interface BotDatabase {
   saveQueueState(state: QueueStateRow): void;
   getQueueState(botId: string): QueueStateRow | null;
   clearQueueState(botId: string): void;
+  getReferencedLocalSongIds(): Set<string>;
   close(): void;
 }
 
@@ -519,7 +523,9 @@ export function createDatabase(dbPath: string): BotDatabase {
   const parseSongs = (raw: string): StoredSong[] => {
     try {
       const v = JSON.parse(raw);
-      return Array.isArray(v) ? (v as StoredSong[]) : [];
+      return Array.isArray(v) ? v.slice(0, MAX_QUEUE_SONGS).flatMap(s => {
+        try { return [normalizeSong(s)]; } catch { return []; }
+      }) : [];
     } catch {
       return [];
     }
@@ -540,7 +546,7 @@ export function createDatabase(dbPath: string): BotDatabase {
     INSERT INTO saved_queues (ownerId, creatorId, name, songs, songCount)
     VALUES (@ownerId, @creatorId, @name, @songs, @songCount)
     ON CONFLICT(ownerId, name) DO UPDATE SET
-      creatorId = CASE WHEN @creatorId != '' THEN @creatorId ELSE saved_queues.creatorId END,
+      creatorId = saved_queues.creatorId,
       songs = excluded.songs,
       songCount = excluded.songCount,
       updatedAt = datetime('now')
@@ -584,7 +590,7 @@ export function createDatabase(dbPath: string): BotDatabase {
     db,
 
     addPlayHistory(record) {
-      insertHistory.run({ ...record, requestedBy: record.requestedBy ?? "" });
+      insertHistory.run({ ...record, coverUrl: publicCoverUrl(record.coverUrl), requestedBy: record.requestedBy ?? "" });
       const count = (historyInsertsPerBot.get(record.botId) ?? 0) + 1;
       if (count >= PRUNE_BATCH_SIZE) {
         historyInsertsPerBot.set(record.botId, 0);
@@ -600,7 +606,7 @@ export function createDatabase(dbPath: string): BotDatabase {
     },
 
     getPlayHistory(botId, limit) {
-      return selectHistory.all(botId, limit) as PlayHistoryRecord[];
+      return (selectHistory.all(botId, limit) as PlayHistoryRecord[]).map(r => ({ ...r, coverUrl: publicCoverUrl(r.coverUrl) }));
     },
 
     saveBotInstance(instance) {
@@ -639,6 +645,7 @@ export function createDatabase(dbPath: string): BotDatabase {
     },
 
     deleteBotInstance(id) {
+      deleteQueueState.run(id);
       const result = deleteInstance.run(id);
       return result.changes > 0;
     },
@@ -707,16 +714,19 @@ export function createDatabase(dbPath: string): BotDatabase {
     },
 
     addFavorite(userId, playlist) {
-      insertFavorite.run({ userId, ...playlist });
+      insertFavorite.run({ userId, ...playlist, coverUrl: publicCoverUrl(playlist.coverUrl) });
     },
 
     removeFavorite(userId, playlistId, platform) {
       const result = deleteFavorite.run(userId, playlistId, platform);
       return result.changes > 0;
     },
+    removeFavoriteById(userId, id) {
+      return db.prepare('DELETE FROM favorite_playlists WHERE userId = ? AND id = ?').run(userId, id).changes > 0;
+    },
 
     getFavorites(userId) {
-      return selectFavorites.all(userId) as FavoritePlaylist[];
+      return (selectFavorites.all(userId) as FavoritePlaylist[]).map(r => ({ ...r, coverUrl: publicCoverUrl(r.coverUrl) }));
     },
 
     isFavorited(userId, playlistId, platform) {
@@ -729,10 +739,7 @@ export function createDatabase(dbPath: string): BotDatabase {
         throw new Error(`保存失败：歌曲数量超过上限 ${MAX_QUEUE_SONGS}`);
       }
       // Strip any lazily-resolved url before persisting.
-      const stripped: StoredSong[] = songs.map((s) => {
-        const { url: _url, ...rest } = s as QueuedSong;
-        return rest;
-      });
+      const stripped: StoredSong[] = songs.map((s) => publicSong(normalizeSong(s)));
       // Enforce the per-owner cap only for a NEW name (an overwrite of an
       // existing saved queue must always be allowed).
       const existing = selectSavedQueueIdByOwnerName.get(ownerId, name) as
@@ -777,7 +784,7 @@ export function createDatabase(dbPath: string): BotDatabase {
     saveQueueState(state) {
       upsertQueueState.run({
         botId: state.botId,
-        songs: JSON.stringify(state.songs),
+        songs: JSON.stringify(state.songs.slice(0, MAX_QUEUE_SONGS).map(s => publicSong(normalizeSong(s)))),
         currentIndex: state.currentIndex,
         mode: state.mode,
         isFmMode: state.isFmMode ? 1 : 0,
@@ -802,6 +809,21 @@ export function createDatabase(dbPath: string): BotDatabase {
 
     clearQueueState(botId) {
       deleteQueueState.run(botId);
+    },
+
+    getReferencedLocalSongIds() {
+      const ids = new Set<string>();
+      // Include BOTH named queues and restart snapshots. A failed DB read
+      // must propagate so the local provider fails closed instead of evicting.
+      for (const row of db.prepare('SELECT songs FROM saved_queues UNION ALL SELECT songs FROM queue_state').all() as { songs: string }[]) {
+        const songs: unknown = JSON.parse(row.songs);
+        if (!Array.isArray(songs)) throw new Error('invalid stored queue reference data');
+        for (const raw of songs) {
+          const s = normalizeSong(raw);
+          if (s.platform === 'local') ids.add(s.id);
+        }
+      }
+      return ids;
     },
 
     close() {
@@ -842,4 +864,3 @@ export async function backupDatabase(
 
   return targetPath;
 }
-

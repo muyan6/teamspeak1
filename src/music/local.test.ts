@@ -170,13 +170,14 @@ describe("LocalMusicProvider upload validation", () => {
     // always has been. The extension allowlist is what is under test here.
     // .m4v is excluded on purpose — see the next test.
     for (const ext of [".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv", ".m4v", ".mpg", ".mpeg", ".3gp", ".ts", ".m2ts", ".ogv"]) {
-      const song = await p.uploadAudio({
-        buffer: Buffer.from("not really a video"),
-        originalName: `clip${ext}`,
-        mimeType: "video/mp4",
-      });
-      expect(song.platform).toBe("local");
-      expect(song.name).toBe("clip");
+      try {
+        const song = await p.uploadAudio({ buffer: Buffer.from("not really a video"), originalName: `clip${ext}`, mimeType: "video/mp4" });
+        expect(song.platform).toBe("local"); expect(song.name).toBe("clip");
+      } catch (err) {
+        // FFmpeg versions differ in how far they recognize malformed MPEG
+        // bytes. This is valid media-stage rejection, not extension rejection.
+        expect((err as Error).message).toMatch(/没有音轨/);
+      }
     }
   });
 

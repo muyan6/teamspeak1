@@ -1,6 +1,7 @@
 import { ref, onUnmounted } from 'vue';
 import { usePlayerStore } from '../stores/player.js';
 import { devLog, devWarn } from '../utils/log.js';
+import { useSession } from './useSession.js';
 
 const RECONNECT_BASE_MS = 3000;
 const RECONNECT_MAX_MS = 60000;
@@ -39,8 +40,10 @@ export function useWebSocket() {
     // distinguish it from a transient failure. Counting opens-per-attempt does.
     let openedThisAttempt = false;
     ws = new WebSocket(url);
+    const socket = ws;
 
     ws.onopen = () => {
+      if (disposed || ws !== socket) return;
       connected.value = true;
       openedThisAttempt = true;
       reconnectAttempts = 0;
@@ -49,6 +52,7 @@ export function useWebSocket() {
     };
 
     ws.onmessage = (event) => {
+      if (disposed || ws !== socket) return;
       // A malformed/unexpected frame must not abort the handler mid-switch.
       // The payload shape is server-defined and consumed field-by-field below,
       // so keep the existing untyped access the rest of the handler relies on.
@@ -63,15 +67,20 @@ export function useWebSocket() {
 
       switch (data.type) {
         case 'init':
+          if (!Array.isArray(data.bots)) return;
+          store.bots = data.bots;
+          if (!data.bots.some((b: { id: string }) => b.id === store.activeBotId)) store.activeBotId = data.bots[0]?.id ?? null;
+          for (const id of Object.keys(store.queues)) if (!data.bots.some((b: { id: string }) => b.id === id)) delete store.queues[id];
           for (const bot of data.bots) {
             store.updateBotStatus(bot.id, bot);
+            store.fetchQueueForBot(bot.id);
           }
           break;
         case 'stateChange':
           store.updateBotStatus(data.botId, data.status);
           if (data.queue) {
             store.setQueue(data.botId, data.queue);
-          } else {
+          } else if (data.queueChanged !== false) {
             // Queue not included in event; refresh for this specific bot
             store.fetchQueueForBot(data.botId);
           }
@@ -80,6 +89,7 @@ export function useWebSocket() {
           store.updateBotStatus(data.botId, data.status);
           break;
         case 'botDisconnected':
+          store.setQueue(data.botId, []);
           // Bot disconnected from TS3 but still exists — update status, don't remove
           if (data.status) {
             store.updateBotStatus(data.botId, data.status);
@@ -107,9 +117,17 @@ export function useWebSocket() {
     };
 
     ws.onclose = (event) => {
+      if (ws !== socket) return;
       connected.value = false;
       ws = null;
       if (disposed) return;
+      if (event.code === 4009) {
+        const session = useSession();
+        session.refresh().then(() => {
+          if (!disposed && session.isAuthenticated.value) connect();
+        }).catch(() => { if (!disposed) reconnectTimer = setTimeout(connect, RECONNECT_BASE_MS); });
+        return;
+      }
       // A rejected handshake (expired/revoked session, guest mode turned off) is
       // not transient: stop retrying and let the next API call's 401 handler
       // send the user to /login. Everything else backs off exponentially so a
@@ -155,12 +173,15 @@ export function useWebSocket() {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
-    ws?.close();
+    if (ws) {
+      ws.onclose = null; ws.onopen = null; ws.onmessage = null; ws.onerror = null;
+      ws.close();
+    }
     ws = null;
     connected.value = false;
   }
 
   onUnmounted(disconnect);
 
-  return { connected, connect, disconnect };
+  return { connected, connect: () => { disposed = false; connect(); }, disconnect };
 }

@@ -570,7 +570,7 @@ export function saveConfig(path: string, config: BotConfig): void {
   // concurrent writers from colliding on the temp name.
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
-    writeFileSync(tmp, json, "utf-8");
+    writeFileSync(tmp, json, { encoding: 'utf-8', mode: 0o600 });
     renameSync(tmp, path);
   } catch (err) {
     // Never leave a partial temp file behind on failure.

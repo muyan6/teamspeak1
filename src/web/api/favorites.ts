@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { BotDatabase } from "../../data/database.js";
 import type { Logger } from "../../logger.js";
+import { PLATFORMS, publicCoverUrl } from '../../music/media-dto.js';
 
 export function createFavoritesRouter(database: BotDatabase, logger: Logger): Router {
   const router = Router();
@@ -16,7 +17,11 @@ export function createFavoritesRouter(database: BotDatabase, logger: Logger): Ro
   router.post("/", (req, res) => {
     const userId = req.user!.id;
     const { platform, playlistId, name, coverUrl, songCount } = req.body ?? {};
-    if (!platform || !playlistId || !name) {
+    if (typeof platform !== 'string' || !PLATFORMS.includes(platform as any) ||
+      typeof playlistId !== 'string' || !playlistId || playlistId.length > 512 ||
+      typeof name !== 'string' || !name.trim() || name.length > 1000 ||
+      coverUrl !== undefined && (typeof coverUrl !== 'string' || coverUrl.length > 8192) ||
+      songCount !== undefined && (typeof songCount !== 'number' || !Number.isInteger(songCount) || songCount < 0)) {
       res.status(400).json({ error: "platform, playlistId, name are required" });
       return;
     }
@@ -25,7 +30,7 @@ export function createFavoritesRouter(database: BotDatabase, logger: Logger): Ro
         platform,
         playlistId,
         name,
-        coverUrl: coverUrl ?? "",
+        coverUrl: publicCoverUrl(coverUrl ?? ''),
         songCount: songCount ?? 0,
       });
       logger.info({ userId, platform, playlistId, name }, "Playlist favorited");
@@ -49,14 +54,11 @@ export function createFavoritesRouter(database: BotDatabase, logger: Logger): Ro
       res.status(400).json({ error: "invalid id" });
       return;
     }
-    const favorites = database.getFavorites(userId);
-    const fav = favorites.find((f) => f.id === favId);
-    if (!fav) {
+    if (!database.removeFavoriteById(userId, favId)) {
       res.status(404).json({ error: "favorite not found" });
       return;
     }
-    database.removeFavorite(userId, fav.playlistId, fav.platform);
-    logger.info({ userId, playlistId: fav.playlistId, platform: fav.platform }, "Playlist unfavorited");
+    logger.info({ userId, id: favId }, 'Playlist unfavorited');
     res.json({ success: true });
   });
 

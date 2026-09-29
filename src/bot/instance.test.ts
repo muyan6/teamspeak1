@@ -141,6 +141,7 @@ describe("BotInstance voice-ducking lifecycle integration", () => {
 
   function makeConnectContext(connectPromise: Promise<void>) {
     return {
+      runExclusive: (fn: () => Promise<unknown>) => fn(),
       disconnectEmitted: false,
       connected: false,
       manualDisconnect: false,
@@ -699,6 +700,8 @@ describe("BotInstance.resolveAndPlay — Spotify routing (C4)", () => {
 describe("BotInstance.setupPlayerEvents — controller trackEnded wiring", () => {
   function makeEventCtx(currentPlatform: string) {
     return {
+      connected: true,
+      runExclusive: (fn: () => Promise<unknown>) => fn(),
       spotifyController: { on: vi.fn() },
       player: { on: vi.fn() },
       queue: { current: vi.fn(() => ({ platform: currentPlatform })) },

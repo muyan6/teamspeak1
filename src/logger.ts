@@ -3,10 +3,13 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 export type Logger = pino.Logger;
+const redact = { paths: ['cookie', 'key', 'token', 'password', 'clientSecret', 'apiKey',
+  '*.cookie', '*.key', '*.token', '*.password', '*.clientSecret', '*.apiKey',
+  'req.headers.cookie', 'req.headers.authorization', 'err.config.headers', 'err.config.params', 'err.config.data', 'err.request'], censor: '[REDACTED]' };
 
 export function createLogger(logDir?: string): Logger {
   if (!logDir) {
-    return pino({ level: "info" });
+    return pino({ level: "info", redact });
   }
 
   mkdirSync(logDir, { recursive: true });
@@ -19,8 +22,8 @@ export function createLogger(logDir?: string): Logger {
         level: "info",
       },
       {
-        target: "pino/file",
-        options: { destination: join(logDir, "bot.log"), mkdir: true },
+        target: 'pino-roll',
+        options: { file: join(logDir, 'bot.log'), frequency: 'daily', size: '10m', limit: { count: 7 }, mkdir: true },
         level: "debug",
       },
     ],
@@ -32,5 +35,8 @@ export function createLogger(logDir?: string): Logger {
     console.error("Logger transport error:", err);
   });
 
-  return pino({ level: "debug" }, transport);
+  return pino({ level: "debug", redact, serializers: {
+    err: (err: Error) => ({ type: err.name, message: err.message.replace(/([?&](?:api_key|token|access_token)=)[^&\s]+/gi, '$1[REDACTED]') }),
+    url: (url: string) => String(url).replace(/([?&](?:api_key|token|access_token)=)[^&\s]+/gi, '$1[REDACTED]'),
+  } }, transport);
 }

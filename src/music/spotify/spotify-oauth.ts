@@ -203,6 +203,9 @@ export class SpotifyOAuth {
    *  a UI-entered Client ID takes effect without a process restart. Empty
    *  clientId disables OAuth (isAuthorized()/buildAuthorizeUrl() gate on it). */
   configure(clientId?: string, redirectUri?: string): void {
+    if (this.clientId !== (clientId?.trim() || '')) {
+      this.dropTokens(); this.pendingVerifiers.clear();
+    }
     this.clientId = clientId?.trim() || "";
     this.redirectUri = redirectUri || "";
   }

@@ -405,6 +405,7 @@ export class QQMusicProvider implements MusicProvider {
 
     const playable = new Set<string>();
     let allChunksFailed = true;
+    let someChunkFailed = false;
     // Shared cursor: JS is single-threaded and there is no await between reading
     // and incrementing `next`, so workers never claim the same slice.
     let next = 0;
@@ -417,12 +418,13 @@ export class QQMusicProvider implements MusicProvider {
           });
           const playUrlMap: Record<string, { url?: string }> | undefined =
             res.data?.data?.playUrl;
-          if (!playUrlMap) continue; // chunk-level failure, try next
+          if (!playUrlMap) { someChunkFailed = true; continue; }
           allChunksFailed = false;
           for (const [mid, info] of Object.entries(playUrlMap)) {
             if (info?.url) playable.add(mid);
           }
         } catch {
+          someChunkFailed = true;
           // chunk-level failure — keep going so a transient error on one
           // chunk doesn't poison the whole batch.
         }
@@ -431,7 +433,7 @@ export class QQMusicProvider implements MusicProvider {
     await Promise.all(
       Array.from({ length: Math.min(CONCURRENCY, slices.length) }, () => worker()),
     );
-    return allChunksFailed ? null : playable;
+    return allChunksFailed || someChunkFailed ? null : playable;
   }
 
   async getSongDetail(songId: string): Promise<Song | null> {

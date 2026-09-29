@@ -26,7 +26,7 @@ let cachedOpusEncoderClass: OpusEncoderConstructor | null = null;
 let loadAttempted = false;
 
 function loadOpusEncoderClass(): OpusEncoderConstructor | null {
-  if (loadAttempted) return cachedOpusEncoderClass;
+  if (cachedOpusEncoderClass) return cachedOpusEncoderClass;
   loadAttempted = true;
   try {
     const mod = require("@discordjs/opus");
@@ -66,13 +66,5 @@ export function createOpusEncoder(): Encoder {
     };
   }
 
-  // Graceful fallback for non-native / test environments
-  return {
-    encode(_pcm: Buffer): Buffer {
-      return Buffer.alloc(80);
-    },
-    decode(_opusData: Buffer): Buffer {
-      return Buffer.alloc(PCM_FRAME_BYTES);
-    },
-  };
+  throw new Error('Opus native encoder is missing or incompatible; run scripts/setup.bat or scripts/setup.sh');
 }

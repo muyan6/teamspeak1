@@ -113,7 +113,17 @@ const canModeCtl = computed(() => can('player.control') || guestCan('playMode'))
 const theme = computed(() => playerStore.theme);
 const route = useRoute();
 const router = useRouter();
-const { connect, connected: wsConnected } = useWebSocket();
+const { connect, disconnect, connected: wsConnected } = useWebSocket();
+watch(() => session.currentUser.value?.id, (id, previous) => {
+  disconnect();
+  if (id !== previous) playerStore.resetSessionData();
+  if (id) {
+    connect();
+    playerStore.fetchBots().catch(() => {});
+    playerStore.fetchFavorites();
+    if (!session.isGuest.value) playerStore.fetchBotSettings();
+  }
+}, { immediate: true });
 const currentSong = computed(() => playerStore.currentSong);
 // Volume slider decoupled from the 60fps updateMobileProgress() rAF re-render
 // so it isn't reset mid-drag (#111 — same root cause as the desktop player).
@@ -331,7 +341,7 @@ function cycleMobileMode() {
 
 onMounted(async () => {
   playerStore.loadTheme();
-  connect();
+  if (session.isAuthenticated.value) connect();
   // Hydrate favorites once per session so deep-links / hard refreshes onto
   // Search or Playlist render hearts correctly without first visiting Home.
   // (fire-and-forget; fetchFavorites swallows the 401 when not yet logged in.)
@@ -348,7 +358,8 @@ onMounted(async () => {
   // Reconcile the dedicated-link scope only after the bot list is known: the
   // router guard sets scopedBotId tentatively from ?bot, but applyScopeFromQuery
   // validates it against the loaded bots (locks if it exists, clears if stale).
-  await playerStore.fetchBots();
+  if (!session.isAuthenticated.value) return;
+  await playerStore.fetchBots().catch(() => {});
   // Read from the authoritative current route (not a possibly-stale reactive
   // snapshot) so the scope reconciles against the ?bot present at refresh time.
   const routeBot = router.currentRoute.value.query.bot;
