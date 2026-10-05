@@ -4,7 +4,7 @@
       <h3 class="queue-title">播放队列</h3>
       <span class="queue-count">{{ botQueue.length }} 首</span>
       <button
-        v-if="botQueue.length > 0 && (can('player.control') || guestCan('removeClear'))"
+        v-if="botQueue.length > 0 && (can('player.queue') || guestCan('removeClear'))"
         class="clear-btn"
         @click="clearAndStop"
         title="清空队列并停止播放"
@@ -94,16 +94,16 @@ async function removeSong(index: number) {
     await axios.delete(`/api/player/${store.activeBotId}/queue/${index + 1}`);
     await store.fetchQueue();
   } catch {
-    // Ignore
+    store.notify("队列操作失败，请重试", "error");
   }
 }
 
 async function clearAndStop() {
   try {
-    await store.stop();
+    await store.clearQueue();
     await store.fetchQueue();
   } catch {
-    // Ignore
+    store.notify("队列操作失败，请重试", "error");
   }
 }
 </script>

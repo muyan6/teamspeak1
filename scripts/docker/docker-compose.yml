@@ -6,6 +6,7 @@ services:
     image: ghcr.1ms.run/muyan6/teamspeak1:latest
     container_name: tsmusicbot-custom
     network_mode: host
+    # Existing bind mounts must be writable by container UID/GID 1000:1000.
     volumes:
       - /data/musicbot:/app/data   # 将数据直接保存在宿主机的 /data/musicbot 文件夹
       # 可选：将 librespot 或 go-librespot 放在宿主机此目录，容器会从 /app/bin 自动发现

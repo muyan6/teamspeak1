@@ -4,6 +4,16 @@
 
 <h1 align="center">TSMusicBot</h1>
 
+### 2026-10-05 联动修复升级说明
+
+- **升级顺序**：先备份数据库、配置及源码，更新音乐机器人后端，再更新分发站。分发站通过 `/api/integration/v1/capabilities` 核验幂等创建、租约与原子初始授权，旧端不再走不受保护的开通流程。
+- **权限变化**：全局行为/音源设置仅管理员可保存。`bot.manage` 仍用于已授权实例的管理。`POST /api/users` 新建成员默认无权限；需要立即授权时，同一个请求携带 `permissions: { capabilities: [...], bots: [...] }`，用户与范围在一个事务中生效。管理员创建后仍为管理员。
+- **租约执行**：托管机器人的有效期由音乐站持久化，启动、重连、播放恢复均检查租约；后台每秒检查运行实例并停止过期实例。旧的独立机器人保持原行为，分发站同步后自动纳入租约。续费采用单调递增 revision，旧消息不会覆盖新有效期。
+- **幂等与取消**：`POST /api/integration/v1/bots` 接收稳定 serviceId、bot 配置和 lease；相同编号重试返回同一个实例，配置冲突返回 409。`DELETE /api/integration/v1/services/:serviceId` 即使先于创建到达也保留取消记录。集成接口要求管理员会话和原有 CSRF 检查，不能授予普通租户。
+- **密码迁移**：新账号及显式改密使用版本化 scrypt，完整处理允许长度内的 UTF-8 密码。旧 bcrypt 保持可登录，页面提示重新设置密码。旧哈希从未存储超过 72 字节的尾部，升级不会凭某次登录输入静默重写；原账号应主动改密完成迁移。
+- **依赖安装**：保留源码中的 `vendor` 目录，使用锁文件安装。网易云所需的无填充 RSA 加密改由 Node 原生 crypto 兼容模块提供，不再加载含签名验证漏洞的 node-forge 实现；FTP 依赖已定向升级。Docker 构建与运行阶段均携带该本地依赖。
+- **回退边界**：集成表为附加表；源码回退还需要按对应锁文件重装依赖、重建前后端。旧版本不识别新的 scrypt 密码，回退运行应配套恢复升级前数据库备份，而不是直接用旧认证代码打开升级后数据。回退前评估升级期间新增账号、改密及订单的数据保留。
+
 <p align="center">
   <strong>TeamSpeak 音乐机器人</strong> — 网易云音乐 + QQ 音乐 + 酷狗音乐 + 哔哩哔哩 + YouTube（可选），Jellyfin / Spotify 可选启用，YesPlayMusic 风格 WebUI 控制面板
 </p>
@@ -786,6 +796,8 @@ OAuth 相关端点：`/api/spotify/login`、`/api/spotify/callback`、`/api/spot
 
 当 WebUI 部署在反向代理（nginx / Caddy / Cloudflare 等）之后时，请务必在 `config.json` 中设置 `"trustProxy": true`：
 
+同时通过 `trustedProxies` 配置实际代理的 IP/CIDR（默认仅 `loopback`），并设置 `publicUrl`。远程或多跳代理的每个受信任节点都需列入允许列表；仅开启布尔开关不再信任任意地址。
+
 - **Cookie Secure 标志**：未启用 `trustProxy` 时，Express 无法从 `X-Forwarded-Proto` 正确判断请求实际是否为 HTTPS，会话 cookie 不会被标记为 `Secure`。
 - **登录限流**：登录限流以 `req.ip` 为键，未启用 `trustProxy` 时所有请求都会被识别为代理本身的 IP，单个攻击者会拖累所有合法用户共用同一个限流桶。
 - **审计日志的客户端 IP**（如果未来添加该字段）也需要 `trustProxy` 才能正确记录。
@@ -1108,3 +1120,14 @@ A：本项目内置 `/login` 限流（每 IP 每分钟 5 次），但生产部�
 ## 开源许可
 
 [MIT](LICENSE)
+
+## 2026 年 10 月升级说明
+
+本轮修复收紧了共享账号和共享队列的写入规则，并修复播放取消、断线恢复和多机器人界面的状态同步。现有账号、数据库和音乐文件格式保持兼容。
+
+- 音乐账号凭据写入、二维码登录确认、短信登录和 Spotify 授权只允许管理员。二维码状态确认改为 `POST /api/auth/qrcode/status`，JSON 请求体包含 `platform` 和 `key`；需要使用生成二维码的同一登录会话，并携带正常的同源 Origin。旧 GET 请求返回 405，且没有修改凭据的副作用。
+- 聊天 `!save` 可以创建新的共享队列，但同名队列的覆盖需由创建者或管理员在 WebUI 完成。使用新名称仍可在聊天中另存。
+- 上传现在流式写盘，并对全部进行中的上传预留容量。配额不足返回 507，不再删除被引用的文件或默许超额上传；单文件仍以 500 MB 为上限。
+- Docker 镜像现在使用 UID/GID `1000:1000` 的非 root 用户。升级已有绑定目录部署前，确保挂载的数据目录及现有文件对该用户可写。例如，使用本文默认路径的 Linux 部署可在停止容器并备份后执行 `sudo chown -R 1000:1000 /data/musicbot`。路径不同的部署请使用实际绑定目录；原生 Windows 启动不涉及此步骤。
+- 反向代理部署的 `trustProxy: true` 不再信任任意来源，默认仅信任 loopback。远程代理请在 `data/config.json` 中设置准确的 `trustedProxies` 地址/CIDR 列表，并设置 `publicUrl`；多跳代理应列入每个实际代理节点，不应包含客户端网段。示例：`"trustedProxies": ["loopback", "10.0.0.10/32"]`。代理还应覆盖 Host 转发头；`publicUrl` 只用于 origin 检查，不替代可信 IP 配置。
+- Node 版本检查由安装脚本共用，最低版本与 package.json 一致。镜像发布现在等待 Windows/Linux 测试矩阵通过。

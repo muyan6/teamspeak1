@@ -10,11 +10,9 @@ import { authorize } from "../middleware/authorize.js";
 import { musicContext } from '../../music/media-dto.js';
 
 /**
- * Body cap for a local upload. express.raw buffers the whole body in memory,
- * so this is also the peak RAM one upload can cost — raised from 200mb for
- * video (#149), which is far bigger than audio for the same song, but kept
- * well short of "any video file at all" for that reason. Only the audio track
- * survives to disk.
+ * Per-upload cap. Production uploads stream to disk with backpressure and
+ * aggregate quota reservations. Only legacy injected Buffer-based providers
+ * use the bounded raw-body compatibility parser below.
  */
 export const LOCAL_UPLOAD_LIMIT = "500mb";
 /** Keep concurrent raw-body buffers bounded across slow disk/ffmpeg uploads. */
@@ -127,13 +125,14 @@ export function createMusicRouter(
   });
 
   let cacheContext = '';
-  router.use((_req, _res, next) => {
+  router.use((_req, res, next) => {
     const context = musicContext(config, [neteaseProvider, qqProvider, bilibiliProvider,
       localProvider, kugouProvider, spotifyProvider, jellyfinProvider].filter((p): p is MusicProvider => !!p));
     if (context !== cacheContext) {
       for (const cache of [lyricsCache, albumCache, songDetailCache, playlistSongsCache, searchCache]) cache.clear();
       cacheContext = context;
     }
+    res.locals.musicContext = context;
     next();
   });
 
@@ -162,7 +161,8 @@ export function createMusicRouter(
       activeLocalUploads = Math.max(0, activeLocalUploads - 1);
     };
     res.once("finish", release);
-    res.once("close", release);
+    res.once("close", () => { if (!res.locals.uploadProcessing) release(); });
+    res.locals.releaseUploadSlot = release;
     next();
   };
 
@@ -208,21 +208,34 @@ export function createMusicRouter(
       next();
     },
     reserveLocalUploadSlot,
-    localUploadBody,
+    (req, res, next) => {
+      // Legacy injected providers may still consume a Buffer; the production provider streams.
+      if (typeof (localProvider as any)?.uploadStream === 'function') {
+        if (!req.is(['audio/*', 'video/*', 'application/octet-stream'])) {
+          res.status(415).json({ error: 'raw audio body is required' }); return;
+        }
+        if (Number(req.headers['content-length']) > 500 * 1024 * 1024) {
+          res.set('Connection', 'close').status(413).json({ error: '单个文件上限 500 MB' }); return;
+        }
+        next();
+      } else localUploadBody(req, res, next);
+    },
     async (req, res) => {
+      res.locals.uploadProcessing = true;
       try {
         if (!localProvider) {
           res.status(501).json({ error: "Local upload is not configured" });
           return;
         }
         const uploadCapable = localProvider as MusicProvider & {
+          uploadStream?: (input: { stream: AsyncIterable<Uint8Array>; originalName: string; mimeType?: string; signal?: AbortSignal }) => Promise<unknown>;
           uploadAudio?: (input: { buffer: Buffer; originalName: string; mimeType?: string }) => Promise<unknown>;
         };
-        if (typeof uploadCapable.uploadAudio !== "function") {
+        if (!uploadCapable.uploadStream && typeof uploadCapable.uploadAudio !== "function") {
           res.status(501).json({ error: "Local upload is not supported" });
           return;
         }
-        if (!Buffer.isBuffer(req.body)) {
+        if (!uploadCapable.uploadStream && !Buffer.isBuffer(req.body)) {
           res.status(400).json({ error: "raw audio body is required" });
           return;
         }
@@ -233,16 +246,25 @@ export function createMusicRouter(
         } catch {
           // Keep the raw header value if it is not URI encoded.
         }
-        const song = await uploadCapable.uploadAudio({
-          buffer: req.body,
-          originalName,
-          mimeType: req.header("content-type") || undefined,
-        });
+        const abort = new AbortController();
+        const onClose = () => { if (!res.writableFinished) abort.abort(new Error('Upload cancelled')); };
+        res.once('close', onClose);
+        let song: unknown;
+        try {
+          const metadata = { originalName, mimeType: req.header('content-type') || undefined };
+          song = uploadCapable.uploadStream
+            ? await uploadCapable.uploadStream({ ...metadata, stream: req.iterator({ destroyOnReturn: false }), signal: abort.signal })
+            : await uploadCapable.uploadAudio!({ ...metadata, buffer: req.body });
+        } finally { res.off('close', onClose); }
+
         res.json({ song });
       } catch (err) {
         logger.warn({ err }, "Local audio upload failed");
-        res.status(400).json({ error: (err as Error).message });
-      }
+        req.resume();
+        if (!req.complete) res.set("Connection", "close");
+        const status = (err as { status?: number }).status;
+        res.status(status === 413 || status === 507 ? status : 400).json({ error: (err as Error).message });
+      } finally { res.locals.releaseUploadSlot?.(); }
     },
   );
 
@@ -266,7 +288,7 @@ export function createMusicRouter(
       const parsedType = (typeof type === "string" && ["song", "playlist", "album", "all"].includes(type))
         ? (type as SearchType)
         : "all";
-      const cacheKey = `${provider.platform}:${String(q).trim().toLowerCase()}:${parsedLimit}:${parsedOffset}:${parsedType}`;
+      const cacheKey = `${res.locals.musicContext}:${provider.platform}:${String(q).trim().toLowerCase()}:${parsedLimit}:${parsedOffset}:${parsedType}`;
       const cached = searchCache.get(cacheKey);
       if (cached) {
         res.json(cached);
@@ -300,7 +322,7 @@ export function createMusicRouter(
         return;
       }
       const parsedLimit = Math.min(100, Math.max(1, parseInt(limit as string) || 20));
-      const cacheKey = `all:${String(q).trim().toLowerCase()}:${parsedLimit}`;
+      const cacheKey = `${res.locals.musicContext}:all:${String(q).trim().toLowerCase()}:${parsedLimit}`;
       const cached = searchCache.get(cacheKey);
       if (cached) {
         res.json(cached);
@@ -382,7 +404,7 @@ export function createMusicRouter(
       const provider = resolveProvider(req.query.platform, res);
       if (!provider) return;
       const platKey = String(req.query.platform ?? "default");
-      const cacheKey = `${platKey}:${req.params.id}`;
+      const cacheKey = `${res.locals.musicContext}:${platKey}:${req.params.id}`;
       const cached = songDetailCache.get(cacheKey);
       if (cached) {
         res.json(cached);
@@ -405,7 +427,7 @@ export function createMusicRouter(
       const provider = resolveProvider(req.query.platform, res);
       if (!provider) return;
       const platKey = String(req.query.platform ?? "default");
-      const cacheKey = `${platKey}:${req.params.id}`;
+      const cacheKey = `${res.locals.musicContext}:${platKey}:${req.params.id}`;
       const cached = playlistSongsCache.get(cacheKey);
       if (cached) {
         res.json({ songs: cached });
@@ -435,7 +457,7 @@ export function createMusicRouter(
       const provider = resolveProvider(req.query.platform, res);
       if (!provider) return;
       const platKey = String(req.query.platform ?? "default");
-      const cacheKey = `${platKey}:${req.params.id}`;
+      const cacheKey = `${res.locals.musicContext}:${platKey}:${req.params.id}`;
       const cached = albumCache.get(cacheKey);
       if (cached) {
         res.json({ songs: cached });
@@ -454,7 +476,7 @@ export function createMusicRouter(
       const provider = resolveProvider(req.query.platform, res);
       if (!provider) return;
       const platKey = String(req.query.platform ?? "default");
-      const cacheKey = `${platKey}:${req.params.id}`;
+      const cacheKey = `${res.locals.musicContext}:${platKey}:${req.params.id}`;
       const cached = lyricsCache.get(cacheKey);
       if (cached) {
         res.json({ lyrics: cached });
@@ -539,9 +561,10 @@ export function createMusicRouter(
   // B站热门视频
   router.get("/bilibili/popular", async (req, res) => {
     try {
+      if (!resolveProvider('bilibili', res)) return;
       const provider = bilibiliProvider as any;
       if (provider.getPopularVideos) {
-        const limit = parseInt(req.query.limit as string) || 20;
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 20));
         const songs = await provider.getPopularVideos(limit);
         res.json({ songs });
       } else {

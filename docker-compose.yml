@@ -10,6 +10,7 @@ services:
     # 如果不用 host 模式（例如 3000 端口已被旧容器占用，可映射到其他端口如 3001）：
     # ports:
     #   - "3001:3000"
+    # Existing bind mounts must be writable by container UID/GID 1000:1000.
     volumes:
       - /data/musicbot:/app/data   # 将数据直接保存在宿主机的 /data/musicbot 文件夹
       # 可选：将 librespot 或 go-librespot 放在宿主机此目录，容器会从 /app/bin 自动发现

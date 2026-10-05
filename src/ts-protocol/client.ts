@@ -613,6 +613,7 @@ export class TS3Client extends EventEmitter {
           return;
         }
         this.logger.error({ err, channelName }, "Failed to join channel");
+        throw err;
       }
       return;
     }
@@ -622,8 +623,7 @@ export class TS3Client extends EventEmitter {
       const channel = channels.find((ch) => ch.name === channelName);
 
       if (!channel) {
-        this.logger.warn({ channelName }, "Channel not found");
-        return;
+        throw new Error(`Channel not found: ${channelName}`);
       }
 
       if (this.currentChannelId === channel.id) {
@@ -646,9 +646,11 @@ export class TS3Client extends EventEmitter {
           return;
         }
         this.logger.error({ err, channelName }, "Failed to join channel");
+        throw err;
       }
     } catch (err) {
       this.logger.error({ err, channelName }, "Failed to join channel");
+      throw err;
     }
   }
 

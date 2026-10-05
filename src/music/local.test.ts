@@ -179,7 +179,7 @@ describe("LocalMusicProvider upload validation", () => {
         expect((err as Error).message).toMatch(/没有音轨/);
       }
     }
-  });
+  }, 30_000);
 
   it("the error message names both audio and video formats", async () => {
     const p = new LocalMusicProvider(dir);
@@ -270,36 +270,19 @@ describe("LocalMusicProvider quota", () => {
     expect(result.songs.map((s) => s.id).sort()).not.toContain("a");
   });
 
-  it("does not evict a referenced upload even when over the cap", async () => {
-    const a = makeRecord("a");
-    const b = makeRecord("b");
-    seed([b, a]);
+  it("rejects new uploads when referenced files occupy the quota", async () => {
+    const a = makeRecord("a"); seed([a]);
     const p = new LocalMusicProvider(dir, { maxFiles: 1 });
-    p.setInUseResolver(() => new Set<string>(["a"])); // "a" is queued
-
-    await p.uploadAudio({
-      buffer: Buffer.alloc(16, 7),
-      originalName: "c.mp3",
-      mimeType: "audio/mpeg",
-    });
-
-    expect(existsSync(a.filePath)).toBe(true); // protected: still queued
+    p.setInUseResolver(() => new Set(["a"]));
+    await expect(p.uploadAudio({ buffer: Buffer.alloc(16, 7), originalName: "c.mp3" })).rejects.toMatchObject({ status: 507 });
+    expect(existsSync(a.filePath)).toBe(true);
+    expect((await p.search('')).songs.map(s => s.id)).toEqual(['a']);
   });
 
-  it("never evicts the just-uploaded file, even when every older file is referenced", async () => {
-    const a = makeRecord("a");
-    seed([a]);
-    const p = new LocalMusicProvider(dir, { maxFiles: 1 });
-    p.setInUseResolver(() => new Set<string>(["a"])); // the only older file is queued
-
-    const song = await p.uploadAudio({
-      buffer: Buffer.alloc(16, 7),
-      originalName: "c.mp3",
-      mimeType: "audio/mpeg",
-    });
-
-    // The returned song must actually exist and be playable — not a phantom.
-    expect(await p.getSongUrl(song.id)).not.toBeNull();
+  it("rejects a single oversized upload without publishing a phantom entry", async () => {
+    const p = new LocalMusicProvider(dir, { maxTotalBytes: 8 });
+    await expect(p.uploadAudio({ buffer: Buffer.alloc(16, 7), originalName: "c.mp3" })).rejects.toMatchObject({ status: 507 });
+    expect((await p.search('')).songs).toEqual([]);
   });
 });
 

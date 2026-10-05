@@ -74,7 +74,7 @@
 import { ref, computed, watch, onMounted } from 'vue';
 import { RouterLink } from 'vue-router';
 import { Icon } from '@iconify/vue';
-import axios from 'axios';
+import { useBotHistory } from '../composables/useBotHistory.js';
 import { usePlayerStore, type Song, type Source } from '../stores/player.js';
 import { loadTabSource, saveTabSource } from '../stores/sourceTabs.js';
 import CoverArt from '../components/CoverArt.vue';
@@ -83,8 +83,7 @@ import SourceTabs from '../components/SourceTabs.vue';
 
 const store = usePlayerStore();
 
-const history = ref<Song[]>([]);
-const historyLoading = ref(true);
+const { history, loading: historyLoading } = useBotHistory(() => store.activeBotId);
 
 const userAvailable = computed<Source[]>(() => store.availableSources);
 
@@ -99,23 +98,9 @@ const userSourceSafe = computed<Source>(() =>
 
 const currentUserPlaylists = computed(() => store.userPlaylists[userSourceSafe.value] ?? []);
 
-onMounted(async () => {
-  if (!store.activeBotId) {
-    await store.fetchBots();
-  }
-
-  store.fetchHomeData();
-
-  if (store.activeBotId) {
-    try {
-      const res = await axios.get(`/api/player/${store.activeBotId}/history`);
-      history.value = res.data.history ?? [];
-    } catch {
-      // API may not be ready
-    }
-  }
-
-  historyLoading.value = false;
+onMounted(() => {
+  if (!store.activeBotId) void store.fetchBots().catch(() => {});
+  void store.fetchHomeData();
 });
 </script>
 

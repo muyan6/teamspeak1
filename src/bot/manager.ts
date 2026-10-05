@@ -17,6 +17,7 @@ import type { AvatarStore } from "../data/avatars.js";
 import type { PermissionStore } from "../data/permissions.js";
 import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
 import { ManagedVoiceClientRegistry } from "./managed-voice-clients.js";
+import { createIntegrationStore, IntegrationError, leaseAllowsRun, type BotLease } from '../data/integration.js';
 
 /**
  * Run bot.connect() with a hard deadline. If the handshake hangs (e.g. the
@@ -135,6 +136,8 @@ export class BotManager extends EventEmitter {
   private avatarStore: AvatarStore;
   private permissions: PermissionStore;
   private configPath: string;
+  private readonly integration: ReturnType<typeof createIntegrationStore>;
+  private leaseTimer?: ReturnType<typeof setInterval>;
   private readonly spotifyPortAllocations = new Map<
     string,
     ReturnType<typeof spotifyPortsForBotId>
@@ -180,9 +183,10 @@ export class BotManager extends EventEmitter {
     this.avatarStore = avatarStore;
     this.permissions = permissions;
     this.configPath = configPath;
+    this.integration = createIntegrationStore(database.db);
   }
 
-  async createBot(params: CreateBotParams): Promise<BotInstance> {
+  async createBot(params: CreateBotParams, managed?: { serviceId: string; payloadHash: string; lease: BotLease }): Promise<BotInstance> {
     const id = crypto.randomUUID();
     const { host: serverAddress, port: serverPort } = normalizeServerAddress(
       params.serverAddress,
@@ -204,14 +208,69 @@ export class BotManager extends EventEmitter {
       ts6ApiKey: params.ts6ApiKey ?? "",
       serverPassword: params.serverPassword ?? "",
     };
-    this.database.saveBotInstance(savedRecord);
+    this.database.db.transaction(() => {
+      this.database.saveBotInstance(savedRecord);
+      if (managed) this.integration.insert({ ...managed.lease, serviceId: managed.serviceId,
+        payloadHash: managed.payloadHash, botId: id, deleted: false });
+    })();
 
     const bot = this.buildBotInstance(savedRecord);
     this.bots.set(id, bot);
     this.emit("botInstance", bot);
 
     this.logger.info({ botId: id, name: params.name }, "Bot instance created");
+    if (managed) this.startLeaseMonitor();
     return bot;
+  }
+
+  async createManagedBot(serviceId: string, payloadHash: string, params: CreateBotParams, lease: BotLease) {
+    const previous = this.integration.getByService(serviceId);
+    if (previous) {
+      if (previous.deleted) throw new IntegrationError('Service has been cancelled', 410);
+      if (previous.payloadHash !== payloadHash) throw new IntegrationError('serviceId already used with different bot configuration', 409);
+      let bot = this.bots.get(previous.botId);
+      if (!bot) {
+        const saved = this.getBotConfig(previous.botId);
+        if (!saved) throw new IntegrationError('Managed bot record missing', 409);
+        bot = this.buildBotInstance(saved); this.bots.set(bot.id, bot); this.emit('botInstance', bot);
+      }
+      this.startLeaseMonitor();
+      return { bot, created: false };
+    }
+    return { bot: await this.createBot({ ...params, autoStart: false }, { serviceId, payloadHash, lease }), created: true };
+  }
+
+  getManagedService(serviceId: string) { return this.integration.getByService(serviceId); }
+
+  async cancelManagedService(serviceId: string): Promise<void> {
+    const record = this.integration.getByService(serviceId);
+    if (record?.deleted) return;
+    if (record) { await this.removeBot(record.botId); return; }
+    // Tombstone even an unknown operation: a delayed create must never resurrect it.
+    this.integration.insert({ serviceId, botId: `cancelled:${serviceId}`, payloadHash: '',
+      expiresAt: null, suspended: true, revision: 1, deleted: true });
+  }
+
+  canRunBot(id: string): boolean {
+    const service = this.integration.getByBot(id);
+    return !service?.deleted && leaseAllowsRun(service);
+  }
+
+  setBotLease(id: string, lease: BotLease): void {
+    if (!this.getBotConfig(id)) throw new IntegrationError('Bot not found', 404);
+    this.integration.setLease(id, lease);
+    if (!this.canRunBot(id)) this.stopBot(id);
+    this.startLeaseMonitor();
+  }
+
+  private startLeaseMonitor(): void {
+    if (this.leaseTimer) return;
+    this.leaseTimer = setInterval(() => {
+      for (const bot of this.bots.values()) {
+        if (!this.canRunBot(bot.id) && !bot.isManualDisconnect()) this.stopBot(bot.id);
+      }
+    }, 1000);
+    this.leaseTimer.unref();
   }
 
   async removeBot(id: string): Promise<void> {
@@ -222,7 +281,10 @@ export class BotManager extends EventEmitter {
       this.bots.delete(id);
     }
     this.spotifyPortAllocations.delete(id);
-    this.database.deleteBotInstance(id);
+    this.database.db.transaction(() => {
+      this.integration.markDeleted(id);
+      this.database.deleteBotInstance(id);
+    })();
     this.permissions.pruneBot(id);
     // Prune the deleted bot from the guest scope allow-list (mirrors permissions.pruneBot).
     if (Array.isArray(this.config.guestMode.bots) && this.config.guestMode.bots.includes(id)) {
@@ -286,14 +348,14 @@ export class BotManager extends EventEmitter {
   getReferencedLocalSongIds(): Set<string> {
     const ids = this.database.getReferencedLocalSongIds();
     for (const bot of this.bots.values()) {
-      for (const song of bot.getQueueManager().list()) {
-        if (song.platform === "local") ids.add(song.id);
-      }
+      for (const id of bot.getReferencedLocalSongIds()) ids.add(id);
     }
     return ids;
   }
 
   async startBot(id: string): Promise<void> {
+    if (!this.canRunBot(id)) throw new IntegrationError('Bot subscription expired or suspended', 403);
+    if (this.integration.getByBot(id)) this.startLeaseMonitor();
     const version = this.nextLifecycle(id);
     const oldBot = this.bots.get(id);
     if (!oldBot) throw new Error(`Bot ${id} not found`);
@@ -318,6 +380,7 @@ export class BotManager extends EventEmitter {
       this.emit("botInstance", bot);
       await connectWithTimeout(bot, 25_000, this.logger);
       if (this.bots.get(id) !== bot || this.lifecycleVersions.get(id) !== version || !bot.isConnected()) throw new Error('Bot start was cancelled');
+      if (!this.canRunBot(id)) { this.stopBot(id); throw new IntegrationError('Bot subscription expired or suspended', 403); }
       // Mark as autoStart so it reconnects on Docker / service restart, and persist identity
       const identity = bot.getIdentityExport() || saved.identity;
       const latest = this.getBotConfig(id);
@@ -404,7 +467,7 @@ export class BotManager extends EventEmitter {
       this.bots.set(saved.id, bot);
       this.emit("botInstance", bot);
 
-      if (saved.autoStart) {
+      if (saved.autoStart && this.canRunBot(saved.id)) {
         pendingConnects.push({ saved, bot });
       } else {
         this.logger.info(
@@ -416,7 +479,7 @@ export class BotManager extends EventEmitter {
 
     const connectAll = async () => {
       for (const { saved, bot } of pendingConnects) {
-        const shouldConnect = () => this.bots.get(saved.id) === bot &&
+        const shouldConnect = () => this.canRunBot(saved.id) && this.bots.get(saved.id) === bot &&
           this.database.getBotInstances().some(b => b.id === saved.id && b.autoStart);
         if (!shouldConnect()) continue;
         try {
@@ -439,6 +502,8 @@ export class BotManager extends EventEmitter {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     };
+
+    if (savedInstances.some(saved => this.integration.getByBot(saved.id))) this.startLeaseMonitor();
 
     if (awaitConnections) {
       await connectAll();
@@ -496,6 +561,7 @@ export class BotManager extends EventEmitter {
   }
 
   shutdown(): void {
+    if (this.leaseTimer) { clearInterval(this.leaseTimer); this.leaseTimer = undefined; }
     for (const bot of this.bots.values()) {
       bot.disconnect();
     }
@@ -511,6 +577,7 @@ export class BotManager extends EventEmitter {
     );
     return new BotInstance({
       id: saved.id,
+      canRun: () => this.canRunBot(saved.id),
       name: saved.name,
       tsOptions: {
         host: serverAddress,

@@ -1,19 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import bcrypt from "bcryptjs";
-
-const BCRYPT_ROUNDS = 12;
-
-/**
- * A real bcrypt hash of an unguessable random string, compared against when the
- * requested username does not exist. Without it the login path skipped bcrypt
- * entirely for unknown users, so "user does not exist" returned noticeably
- * faster than "wrong password" — a username-enumeration oracle.
- */
-export const DUMMY_PASSWORD_HASH = bcrypt.hashSync(
-  "tsmusicbot-nonexistent-user-placeholder",
-  BCRYPT_ROUNDS,
-);
+import { hashPassword, verifyPassword } from './passwords.js';
+import { createPermissionStore, type BotAccess } from './permissions.js';
+export { DUMMY_PASSWORD_HASH } from './passwords.js';
 
 export type UserRole = "admin" | "member" | "guest";
 
@@ -35,17 +24,22 @@ export interface UserRow {
 export interface UserStore {
   countUsers(): number;
   countAdmins(): number;
-  createUser(username: string, password: string, role: UserRole): Promise<UserRow>;
+  createUser(username: string, password: string, role: UserRole, initialPermissions?: { capabilities: string[]; bots: BotAccess }): Promise<UserRow>;
   createFirstUser(username: string, password: string): Promise<UserRow | null>;
   findByUsername(username: string): UserRow | null;
   findById(id: string): UserRow | null;
   verifyPassword(plain: string, hash: string): Promise<boolean>;
-  changePassword(userId: string, newPassword: string): Promise<void>;
+  changePassword(userId: string, newPassword: string, expectedHash?: string): Promise<void>;
   setRole(userId: string, role: UserRole): boolean;
   setRoleIfNotLastAdmin(id: string, newRole: UserRole): "ok" | "not_found" | "would_orphan";
   deleteUser(id: string): boolean;
   deleteUserIfNotLastAdmin(id: string): "ok" | "not_found" | "would_orphan";
   listUsers(): Array<{ id: string; username: string; createdAt: number; role: UserRole }>;
+}
+
+export class CredentialsChangedError extends Error {
+  readonly status = 409;
+  constructor() { super('Credentials changed; authenticate again'); }
 }
 
 export class UsernameTakenError extends Error {
@@ -56,6 +50,7 @@ export class UsernameTakenError extends Error {
 }
 
 export function createUserStore(db: Database.Database): UserStore {
+  const permissions = createPermissionStore(db);
   const countStmt = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role != 'guest'");
   const countAdminsStmt = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'");
   const insertStmt = db.prepare(
@@ -69,6 +64,9 @@ export function createUserStore(db: Database.Database): UserStore {
   );
   const updatePasswordStmt = db.prepare(
     "UPDATE users SET passwordHash = ?, updatedAt = ? WHERE id = ?"
+  );
+  const compareAndSetPasswordStmt = db.prepare(
+    "UPDATE users SET passwordHash = ?, updatedAt = ? WHERE id = ? AND passwordHash = ?"
   );
   const updateRoleStmt = db.prepare(
     "UPDATE users SET role = ?, updatedAt = ? WHERE id = ?"
@@ -87,12 +85,17 @@ export function createUserStore(db: Database.Database): UserStore {
       return (countAdminsStmt.get() as { n: number }).n;
     },
 
-    async createUser(username, password, role) {
-      const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    async createUser(username, password, role, initialPermissions) {
+      const hash = await hashPassword(password);
       const id = randomUUID();
       const now = Date.now();
       try {
-        insertStmt.run(id, username, hash, now, now, role);
+        db.transaction(() => {
+          insertStmt.run(id, username, hash, now, now, role);
+          if (role === 'member') {
+            permissions.setPermissions(id, initialPermissions ?? { capabilities: [], bots: [] });
+          }
+        })();
       } catch (err) {
         if (err && typeof err === "object" && (err as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") {
           throw new UsernameTakenError(username);
@@ -103,7 +106,7 @@ export function createUserStore(db: Database.Database): UserStore {
     },
 
     async createFirstUser(username, password) {
-      const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      const hash = await hashPassword(password);
       const id = randomUUID();
       const now = Date.now();
       const run = db.transaction(() => {
@@ -131,12 +134,15 @@ export function createUserStore(db: Database.Database): UserStore {
     },
 
     verifyPassword(plain, hash) {
-      return bcrypt.compare(plain, hash);
+      return verifyPassword(plain, hash);
     },
 
-    async changePassword(userId, newPassword) {
-      const hash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-      updatePasswordStmt.run(hash, Date.now(), userId);
+    async changePassword(userId, newPassword, expectedHash) {
+      const hash = await hashPassword(newPassword);
+      const result = expectedHash === undefined
+        ? updatePasswordStmt.run(hash, Date.now(), userId)
+        : compareAndSetPasswordStmt.run(hash, Date.now(), userId, expectedHash);
+      if (!result.changes) throw new CredentialsChangedError();
     },
 
     setRole(userId, role) {

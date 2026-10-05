@@ -7,6 +7,7 @@ interface User {
   capabilities?: string[];
   bots?: "all" | string[];
   guest?: Record<string, boolean> | null;
+  passwordUpgradeRecommended?: boolean;
 }
 
 const currentUser = ref<User | null>(null);

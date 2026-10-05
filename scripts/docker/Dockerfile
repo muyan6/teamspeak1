@@ -16,6 +16,7 @@ RUN mkdir -p /app/bin
 
 # Install backend dependencies
 COPY package*.json ./
+COPY vendor ./vendor
 RUN npm ci
 
 # Install frontend dependencies
@@ -47,6 +48,7 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/web/dist ./web/dist
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/vendor ./vendor
 COPY --from=builder /app/bin ./bin
 # package.json declares a `prestart` preflight, so `npm start` inside the
 # container needs this file. The image's own CMD calls node directly and never
@@ -55,7 +57,7 @@ COPY --from=builder /app/bin ./bin
 COPY --from=builder /app/scripts/check-native.mjs ./scripts/check-native.mjs
 
 # Data directory for database, cookies, logs
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && chown node:node /app/data
 VOLUME ["/app/data"]
 
 EXPOSE 3000
@@ -64,4 +66,5 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
     CMD node -e "const fs=require('node:fs');let p=3000;try{const c=JSON.parse(fs.readFileSync('/app/data/config.json','utf8'));if(Number.isInteger(c.webPort)&&c.webPort>0&&c.webPort<65536)p=c.webPort}catch{}fetch('http://127.0.0.1:'+p+'/api/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"
 
+USER node
 CMD ["node", "dist/index.js"]

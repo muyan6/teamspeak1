@@ -131,6 +131,7 @@ export function createFileOAuthTokenStore(filePath: string): OAuthTokenStore {
  * are never logged.
  */
 export class SpotifyOAuth {
+  private epoch = 0;
   private clientId: string;
   private redirectUri: string;
   private store: OAuthTokenStore;
@@ -203,7 +204,8 @@ export class SpotifyOAuth {
    *  a UI-entered Client ID takes effect without a process restart. Empty
    *  clientId disables OAuth (isAuthorized()/buildAuthorizeUrl() gate on it). */
   configure(clientId?: string, redirectUri?: string): void {
-    if (this.clientId !== (clientId?.trim() || '')) {
+    if (this.clientId !== (clientId?.trim() || '') || this.redirectUri !== (redirectUri || '')) {
+      this.epoch++; this.refreshInFlight = null;
       this.dropTokens(); this.pendingVerifiers.clear();
     }
     this.clientId = clientId?.trim() || "";
@@ -261,6 +263,9 @@ export class SpotifyOAuth {
       this.pendingVerifiers.delete(state);
       return false;
     }
+    const epoch = ++this.epoch;
+    this.refreshInFlight = null;
+    this.pendingVerifiers.delete(state); // consume before the network await
     const verifier = entry.verifier;
     // C3.7: drop the state->verifier entry on EVERY terminal path (success,
     // rejected token exchange, or throw) so a failed login can't leak/replay it.
@@ -275,7 +280,7 @@ export class SpotifyOAuth {
       const { data } = await this.http.post("/api/token", body.toString(), {
         headers: FORM_HEADERS,
       });
-      if (!data?.access_token || !data?.refresh_token) return false;
+      if (epoch !== this.epoch || !data?.access_token || !data?.refresh_token) return false;
       this.persistTokens(this.toTokens(data, data.refresh_token, data.scope));
       return true;
     } catch {
@@ -295,13 +300,15 @@ export class SpotifyOAuth {
     // Collapse concurrent refreshes: rotation makes a second in-flight refresh
     // use a refresh token the first one already invalidated.
     if (this.refreshInFlight) return this.refreshInFlight;
-    this.refreshInFlight = this.refresh(tokens).finally(() => {
-      this.refreshInFlight = null;
+    const pending = this.refresh(tokens).finally(() => {
+      if (this.refreshInFlight === pending) this.refreshInFlight = null;
     });
-    return this.refreshInFlight;
+    this.refreshInFlight = pending;
+    return pending;
   }
 
   private async refresh(current: OAuthTokens): Promise<string | null> {
+    const epoch = this.epoch;
     const body = new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: current.refreshToken,
@@ -311,7 +318,7 @@ export class SpotifyOAuth {
       const { data } = await this.http.post("/api/token", body.toString(), {
         headers: FORM_HEADERS,
       });
-      if (!data?.access_token) return null;
+      if (epoch !== this.epoch || !data?.access_token) return null;
       // PKCE rotates the refresh token; fall back to the current one if omitted.
       const rotated = data.refresh_token || current.refreshToken;
       const saved = this.toTokens(data, rotated, data.scope ?? current.scope);
@@ -319,7 +326,7 @@ export class SpotifyOAuth {
       return saved.accessToken;
     } catch (err: any) {
       // invalid_grant => refresh token revoked/expired: discard, force re-login.
-      if (err?.response?.data?.error === "invalid_grant") this.dropTokens();
+      if (epoch === this.epoch && err?.response?.data?.error === "invalid_grant") this.dropTokens();
       return null;
     }
   }

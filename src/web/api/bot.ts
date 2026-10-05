@@ -7,6 +7,7 @@ import type { BotDatabase } from "../../data/database.js";
 import type { AvatarStore } from "../../data/avatars.js";
 import { requirePermission, requireBotAccess } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
+import { requireAdmin } from "../middleware/requireAdmin.js";
 import { GUEST_PERMISSION_FLAGS } from "../../data/permissions.js";
 import type { ServerProtocol } from "../../ts-protocol/client.js";
 
@@ -158,48 +159,13 @@ export function createBotRouter(
     });
   });
 
-  /**
-   * Settings blocks that rewrite PROCESS-WIDE security state rather than
-   * cosmetic bot behaviour. `bot.manage` is a grantable capability, so allowing
-   * it to write these let a non-admin member open guest mode, change the
-   * enabled-source set / default platform, edit the admin TS groups, or replace
-   * the Spotify secret and the Jellyfin URL + credentials.
-   */
-  // NOTE: `defaultPlatform` and `enabledProviders` are deliberately NOT in this
-  // list. The Settings UI exposes the "默认音源" picker to every `bot.manage`
-  // holder (Settings.vue), so gating those here would 403 a legitimate member
-  // action. Every remaining key lives in a section the UI already hides behind
-  // `platform.auth` or `session.isAdmin`, so this gate is defence-in-depth
-  // against a future grant rather than a change to any reachable action.
-  const ADMIN_ONLY_SETTINGS_KEYS = [
-    "guestMode",
-    "adminGroups",
-    "spotify",
-    "jellyfin",
-  ] as const;
-
-  // POST /api/bot/settings — 保存全局 bot 行为设置
-  // A bot.manage member may toggle cosmetic playback behaviour; anything that
-  // touches credentials, guest policy, provider gating or admin groups is
-  // admin-only.
-  router.post("/settings", requirePermission("bot.manage"), (req, res) => {
+  // Process-wide settings are platform administration, not scoped bot management.
+  router.post("/settings", requireAdmin, (req, res) => {
+    const candidate = structuredClone(config);
     const prefix = req.body?.commandPrefix;
     if (prefix !== undefined && (typeof prefix !== 'string' || !prefix || prefix.length > 16 || /[\s\x00-\x1f]/.test(prefix))) {
       res.status(400).json({ error: 'commandPrefix must be 1-16 non-whitespace characters' }); return;
     }
-    const isAdmin = req.user?.role === "admin";
-    if (!isAdmin) {
-      const touched = ADMIN_ONLY_SETTINGS_KEYS.filter(
-        (k) => req.body?.[k] !== undefined,
-      );
-      if (touched.length > 0) {
-        res.status(403).json({
-          error: `admin required to change: ${touched.join(", ")}`,
-        });
-        return;
-      }
-    }
-
     const {
       idleTimeoutMinutes,
       autoPauseOnEmpty,
@@ -220,14 +186,14 @@ export function createBotRouter(
     const hasLoudness = typeof req.body.loudnessNormalization === "boolean";
     const hasFade = typeof req.body.audioFade === "boolean";
 
-    if (hasIdle) config.idleTimeoutMinutes = idleTimeoutMinutes;
-    if (typeof prefix === 'string') config.commandPrefix = prefix;
-    if (hasAutoPause) config.autoPauseOnEmpty = autoPauseOnEmpty;
-    if (hasLocalAudioEnabled) config.localAudioEnabled = localAudioEnabled;
-    if (hasLoudness) config.loudnessNormalization = req.body.loudnessNormalization;
-    if (hasFade) config.audioFade = req.body.audioFade;
+    if (hasIdle) candidate.idleTimeoutMinutes = idleTimeoutMinutes;
+    if (typeof prefix === 'string') candidate.commandPrefix = prefix;
+    if (hasAutoPause) candidate.autoPauseOnEmpty = autoPauseOnEmpty;
+    if (hasLocalAudioEnabled) candidate.localAudioEnabled = localAudioEnabled;
+    if (hasLoudness) candidate.loudnessNormalization = req.body.loudnessNormalization;
+    if (hasFade) candidate.audioFade = req.body.audioFade;
     if (typeof req.body.autoSourceFallback === "boolean") {
-      config.autoSourceFallback = req.body.autoSourceFallback;
+      candidate.autoSourceFallback = req.body.autoSourceFallback;
     }
 
     // Voice ducking is a partial settings block. Merge only known, strictly
@@ -239,7 +205,7 @@ export function createBotRouter(
       !Array.isArray(voiceDucking);
     if (hasVoiceDucking) {
       if (typeof voiceDucking.enabled === "boolean") {
-        config.voiceDucking.enabled = voiceDucking.enabled;
+        candidate.voiceDucking.enabled = voiceDucking.enabled;
       }
       if (
         typeof voiceDucking.volumePercent === "number" &&
@@ -247,7 +213,7 @@ export function createBotRouter(
         voiceDucking.volumePercent >= 0 &&
         voiceDucking.volumePercent <= 100
       ) {
-        config.voiceDucking.volumePercent = voiceDucking.volumePercent;
+        candidate.voiceDucking.volumePercent = voiceDucking.volumePercent;
       }
     }
 
@@ -255,15 +221,15 @@ export function createBotRouter(
     // config by BotInstance / the saved-queues router, so no per-bot push needed;
     // only a literal boolean mutates the stored value (junk is ignored).
     if (typeof req.body.savedQueuesEnabled === "boolean") {
-      config.savedQueuesEnabled = req.body.savedQueuesEnabled;
+      candidate.savedQueuesEnabled = req.body.savedQueuesEnabled;
     }
     if (typeof req.body.playKeepsQueue === "boolean") {
-      config.playKeepsQueue = req.body.playKeepsQueue;
+      candidate.playKeepsQueue = req.body.playKeepsQueue;
     }
 
     const hasGuestMode = guestMode !== undefined && guestMode !== null && typeof guestMode === "object";
     if (hasGuestMode) {
-      const gm = config.guestMode;
+      const gm = candidate.guestMode;
       if (typeof guestMode.enabled === "boolean") gm.enabled = guestMode.enabled;
       if (guestMode.bots === "all") {
         gm.bots = "all";
@@ -280,20 +246,20 @@ export function createBotRouter(
     }
 
     if (Array.isArray(adminGroups)) {
-      config.adminGroups = adminGroups.filter(
+      candidate.adminGroups = adminGroups.filter(
         (g: unknown): g is number =>
           typeof g === "number" && Number.isInteger(g) && g >= 0,
       );
     }
 
-    // Partial-merge the spotify block (mirrors config.ts validation). Invalid
+    // Partial-merge the spotify block (mirrors candidate.ts validation). Invalid
     // sub-fields are ignored rather than 400-ing the whole request. Omitting
-    // `spotify` entirely leaves config.spotify untouched.
+    // `spotify` entirely leaves candidate.spotify untouched.
     const VALID_BACKENDS = ["auto", "go-librespot", "librespot"] as const;
     const VALID_BITRATES = [96, 160, 320];
     const sp = req.body?.spotify;
     if (sp && typeof sp === "object") {
-      const t = config.spotify;
+      const t = candidate.spotify;
       if (typeof sp.enabled === "boolean") t.enabled = sp.enabled;
       if (typeof sp.backend === "string" && (VALID_BACKENDS as readonly string[]).includes(sp.backend)) {
         t.backend = sp.backend as SpotifyConfig["backend"];
@@ -316,7 +282,7 @@ export function createBotRouter(
     // when non-empty so a blank (masked) field never wipes them.
     const jf = req.body?.jellyfin;
     if (jf && typeof jf === "object") {
-      const t = config.jellyfin;
+      const t = candidate.jellyfin;
       if (typeof jf.serverUrl === "string") {
         t.serverUrl = jf.serverUrl.trim().replace(/\/+$/, "");
       }
@@ -333,7 +299,7 @@ export function createBotRouter(
     // still needs a restart; jellyfin and the rest take effect immediately.
     const ep = req.body?.enabledProviders;
     if (Array.isArray(ep)) {
-      config.enabledProviders = ep.filter((p: unknown): p is GateableProvider =>
+      candidate.enabledProviders = ep.filter((p: unknown): p is GateableProvider =>
         (GATEABLE_PROVIDERS as readonly string[]).includes(p as string),
       );
     }
@@ -345,23 +311,25 @@ export function createBotRouter(
     //      keeping the persisted config consistent with loadConfig's invariant.
     //   2) Apply an explicit change — `null`/`""` clears it (back to priority
     //      order); a known+enabled provider sets it; anything else is ignored.
-    if (config.defaultPlatform && !config.enabledProviders.includes(config.defaultPlatform)) {
-      config.defaultPlatform = null;
+    if (candidate.defaultPlatform && !candidate.enabledProviders.includes(candidate.defaultPlatform)) {
+      candidate.defaultPlatform = null;
     }
     if ("defaultPlatform" in req.body) {
       const dp = req.body.defaultPlatform;
       if (dp === null || dp === "") {
-        config.defaultPlatform = null;
+        candidate.defaultPlatform = null;
       } else if (
         typeof dp === "string" &&
         (GATEABLE_PROVIDERS as readonly string[]).includes(dp) &&
-        config.enabledProviders.includes(dp as GateableProvider)
+        candidate.enabledProviders.includes(dp as GateableProvider)
       ) {
-        config.defaultPlatform = dp as GateableProvider;
+        candidate.defaultPlatform = dp as GateableProvider;
       }
     }
 
-    saveConfig(configPath, config);
+    // Persist the candidate before publishing any new policy to live readers.
+    saveConfig(configPath, candidate);
+    Object.assign(config, candidate);
 
     // Hot-apply the (possibly re-pointed) Jellyfin connection to the live
     // provider — a Settings save must work without a restart.
@@ -697,7 +665,7 @@ export function createBotRouter(
       await botManager.startBot(req.params.id);
       res.json({ success: true });
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      res.status((err as { status?: number }).status === 403 ? 403 : 500).json({ error: (err as Error).message });
     }
   });
 

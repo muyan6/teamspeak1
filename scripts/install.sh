@@ -46,10 +46,11 @@ case $OS in
 esac
 
 echo "[2/6] Installing Node.js 20 LTS..."
-if ! command -v node &> /dev/null || [[ $(node -v | cut -d. -f1 | tr -d 'v') -lt 20 ]]; then
+if ! command -v node &> /dev/null || ! node "$SCRIPT_DIR/check-node-version.cjs"; then
     curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
     sudo apt-get install -y -qq nodejs 2>/dev/null || sudo yum install -y nodejs 2>/dev/null
 fi
+node "$SCRIPT_DIR/check-node-version.cjs"
 echo "Node.js $(node -v) installed"
 
 echo "[3/6] Installing dependencies..."

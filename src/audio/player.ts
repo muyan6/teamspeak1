@@ -177,6 +177,15 @@ export interface PlayerEvents {
 
 export type PlayerState = "idle" | "playing" | "paused";
 
+/** A process-wide playback backend failure, not another unplayable queue item. */
+export class AudioBackendUnavailableError extends Error {
+  readonly code = "AUDIO_BACKEND_UNAVAILABLE";
+  constructor() {
+    super("ffmpeg unavailable");
+    this.name = "AudioBackendUnavailableError";
+  }
+}
+
 const FRAME_DURATION_MS = 20;
 
 export class AudioPlayer extends EventEmitter {
@@ -306,7 +315,8 @@ export class AudioPlayer extends EventEmitter {
     return frame;
   }
 
-  play(url: string, seekSeconds = 0, songDuration = 0, startPaused = false): void {
+  /** True means startup was accepted, not that asynchronous decoding has succeeded. */
+  play(url: string, seekSeconds = 0, songDuration = 0, startPaused = false): boolean {
     // 1. 停止当前所有播放，自增 sessionId 屏蔽旧回调 （
     this.stop();
 
@@ -323,15 +333,15 @@ export class AudioPlayer extends EventEmitter {
     if (this.consecutiveFailures >= AudioPlayer.MAX_CONSECUTIVE_FAILURES) {
       this.logger.error({ failures: this.consecutiveFailures }, "FFmpeg failures limit reached");
       this.state = "idle";
-      this.emit("error", new Error("ffmpeg unavailable"));
-      return;
+      this.emit("error", new AudioBackendUnavailableError());
+      return false;
     }
 
     this.triggerFadeIn(400);
 
     if (shouldUsePowerShellDownload(url)) {
       this.playViaPowerShellDownload(url, seekSeconds, currentSessionId, startPaused);
-      return;
+      return true;
     }
 
     const args = buildFfmpegArgs(url, seekSeconds, {
@@ -394,6 +404,7 @@ export class AudioPlayer extends EventEmitter {
 
     this.state = startPaused ? "paused" : "playing";
     this.startFrameLoop();
+    return true;
   }
 
   private playViaPowerShellDownload(url: string, seekSeconds: number, sessionId: number, startPaused = false): void {
@@ -404,6 +415,7 @@ export class AudioPlayer extends EventEmitter {
     const psScript = [
       "$ErrorActionPreference = 'Stop'",
       "$ProgressPreference = 'SilentlyContinue'",
+      "Add-Type -AssemblyName System.Net.Http",
       "$client = New-Object System.Net.Http.HttpClient",
       "$client.Timeout = [TimeSpan]::FromMinutes(10)",
       "$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', $env:DL_UA)",
@@ -463,7 +475,9 @@ export class AudioPlayer extends EventEmitter {
         this.emit("error", new Error(`PowerShell download exited ${code}`));
         return;
       }
-      this.spawnFfmpegFromFile(tempFile, seekSeconds, sessionId, startPaused);
+      // pause/resume can change while downloading; only the session's LATEST
+      // state is authoritative, not startPaused captured before that await.
+      this.spawnFfmpegFromFile(tempFile, seekSeconds, sessionId, this.state === "paused");
     });
 
     ps.on("error", (err) => {

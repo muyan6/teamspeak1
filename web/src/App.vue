@@ -2,7 +2,7 @@
   <div class="app" :data-theme="theme">
     <Navbar />
     <main class="main-content">
-      <RouterView />
+      <RouterView :key="`${String(route.name)}:${String(route.params.id ?? '')}:${String(route.query.platform ?? '')}`" />
     </main>
     <Player />
     <Toast />
@@ -118,6 +118,10 @@ watch(() => session.currentUser.value?.id, (id, previous) => {
   disconnect();
   if (id !== previous) playerStore.resetSessionData();
   if (id) {
+    // resetSessionData also clears tentative scope from initial navigation.
+    // Restore it before starting either REST or WebSocket synchronization.
+    const requestedBot = router.currentRoute.value.query.bot;
+    if (typeof requestedBot === 'string' && requestedBot) playerStore.setScope(requestedBot);
     connect();
     playerStore.fetchBots().catch(() => {});
     playerStore.fetchFavorites();
@@ -355,16 +359,8 @@ onMounted(async () => {
     }
   }, 5000);
   mobileRaf = requestAnimationFrame(updateMobileProgress);
-  // Reconcile the dedicated-link scope only after the bot list is known: the
-  // router guard sets scopedBotId tentatively from ?bot, but applyScopeFromQuery
-  // validates it against the loaded bots (locks if it exists, clears if stale).
-  if (!session.isAuthenticated.value) return;
-  await playerStore.fetchBots().catch(() => {});
-  // Read from the authoritative current route (not a possibly-stale reactive
-  // snapshot) so the scope reconciles against the ?bot present at refresh time.
-  const routeBot = router.currentRoute.value.query.bot;
-  const qBot = typeof routeBot === 'string' ? routeBot : null;
-  playerStore.applyScopeFromQuery(qBot);
+  // Identity watcher + shared acceptBotList reconcile dedicated scope on every
+  // login and reconnect; this must not be a one-time mounted-only operation.
 });
 
 onUnmounted(() => {

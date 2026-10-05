@@ -169,6 +169,7 @@ export class BotCommandHandler {
     const { song, error } = await this.resolvePlayQuery(cmd);
     if (error) return error;
     const s = song!;
+    this.bot.assertPlaybackCurrent?.();
 
     const wasIdle = this.bot.player.getState() === "idle";
     this.bot.queue.add(this.bot.withRequester(s, requesterName));
@@ -176,8 +177,9 @@ export class BotCommandHandler {
     if (wasIdle) {
       this.bot.queue.playAt(this.bot.queue.size() - 1);
       this.bot.player.resetFailures();
-      await this.bot.resolveAndPlay(this.bot.queue.current()!);
+      const ok = await this.bot.resolveAndPlay(this.bot.queue.current()!);
       this.bot.emit("stateChange");
+      if (!ok) return `Cannot play: ${s.name}`;
       return `Now playing: ${s.name} - ${s.artist}`;
     }
 
@@ -190,6 +192,7 @@ export class BotCommandHandler {
     const { song, error } = await this.resolvePlayQuery(cmd);
     if (error) return error;
     const s = song!;
+    this.bot.assertPlaybackCurrent?.();
 
     const wasIdle = this.bot.player.getState() === "idle";
     const insertedAt =
@@ -261,12 +264,32 @@ export class BotCommandHandler {
   }
 
   async cmdPrev(): Promise<string> {
+    let attempted = false;
     for (let i = 0; i < 4; i++) {
+      this.bot.assertPlaybackCurrent?.();
       const prev = this.bot.queue.prev();
-      if (!prev) return "No previous song";
+      if (!prev) break;
+      if (!attempted) {
+        // The queue pointer now refers to a different track. Never keep the
+        // former one audible if every candidate fails to resolve.
+        if (this.bot.currentSourceIsSpotify) this.bot.spotifyController.stop();
+        this.bot.currentSourceIsSpotify = false;
+        this.bot.player.stop();
+        this.bot.jellyfinReporter?.onStop();
+        this.bot.autoPaused = false;
+        this.bot.player.resetFailures();
+        this.bot.emit("stateChange");
+        attempted = true;
+      }
       const ok = await this.bot.resolveAndPlay(prev);
+      this.bot.assertPlaybackCurrent?.();
       if (ok) return `Now playing: ${prev.name} - ${prev.artist}`;
     }
+    if (!attempted) return "No previous song";
+    this.bot.profileManager.onSongChange(null).catch((err) => {
+      this.bot.logger.warn({ err }, "Profile restore failed after previous-track lookup");
+    });
+    this.bot.emit("stateChange");
     return "Cannot play any previous songs (all failed to resolve)";
   }
 
@@ -390,12 +413,11 @@ export class BotCommandHandler {
     if (songs.length > MAX_QUEUE_SONGS) return `队列最多 ${MAX_QUEUE_SONGS} 首歌曲`;
     if (songs.length === 0) return "Playlist is empty or not found";
 
+    this.bot.assertPlaybackCurrent?.();
     this.bot.player.stop();
     this.bot.queue.clear();
     this.bot.disableFmMode();
-    for (const song of songs) {
-      this.bot.queue.add(this.bot.withRequester({ ...song, platform: provider.platform }, requesterName));
-    }
+    this.bot.queue.addMany(songs.map(song => this.bot.withRequester({ ...song, platform: provider.platform }, requesterName)));
     const first = this.bot.queue.play();
     if (first) await this.bot.resolveAndPlay(first);
     this.bot.sweepLocalAudio("queue_replaced");
@@ -426,12 +448,11 @@ export class BotCommandHandler {
     if (songs.length > MAX_QUEUE_SONGS) return `队列最多 ${MAX_QUEUE_SONGS} 首歌曲`;
     if (songs.length === 0) return "Album is empty or not found";
 
+    this.bot.assertPlaybackCurrent?.();
     this.bot.player.stop();
     this.bot.queue.clear();
     this.bot.disableFmMode();
-    for (const song of songs) {
-      this.bot.queue.add(this.bot.withRequester({ ...song, platform: provider.platform }, requesterName));
-    }
+    this.bot.queue.addMany(songs.map(song => this.bot.withRequester({ ...song, platform: provider.platform }, requesterName)));
     const first = this.bot.queue.play();
     if (first) await this.bot.resolveAndPlay(first);
     this.bot.sweepLocalAudio("queue_replaced");
@@ -459,12 +480,11 @@ export class BotCommandHandler {
       filtered = result.songs.slice(0, 20);
     }
 
+    this.bot.assertPlaybackCurrent?.();
     this.bot.player.stop();
     this.bot.queue.clear();
     this.bot.disableFmMode();
-    for (const song of filtered) {
-      this.bot.queue.add(this.bot.withRequester({ ...song, platform: provider.platform }, requesterName));
-    }
+    this.bot.queue.addMany(filtered.map(song => this.bot.withRequester({ ...song, platform: provider.platform }, requesterName)));
     this.bot.queue.setMode(PlayMode.Loop);
     this.bot.player.resetFailures();
 
@@ -488,9 +508,7 @@ export class BotCommandHandler {
 
     if (votes >= needed) {
       this.bot.voteSkipUsers.clear();
-      this.bot.playNext().catch((err) => {
-        this.bot.logger.error({ err }, "playNext failed after vote skip");
-      });
+      await this.bot.playNext();
       return `Vote passed (${votes}/${needed}). Skipping to next song.`;
     }
     return `Vote to skip: ${votes}/${needed} (need ${needed - votes} more)`;
@@ -550,6 +568,8 @@ export class BotCommandHandler {
     const songs = this.bot.queue.list();
     if (songs.length === 0) return "队列为空，无法保存";
     try {
+      const existing = this.bot.database.listSavedQueues(SHARED_QUEUE_OWNER, false).find(q => q.name === name);
+      if (existing) return '该共享队列已存在，请使用新名称；覆盖操作请由创建者或管理员在网页完成';
       const saved = this.bot.database.saveQueue(SHARED_QUEUE_OWNER, name, songs);
       return `已保存队列「${name}」（${saved.songCount} 首）`;
     } catch (err) {

@@ -38,6 +38,9 @@
           </span>
         </div>
       </div>
+      <p v-if="session.currentUser.value?.passwordUpgradeRecommended" class="profile-section-hint">
+        此账号仍使用旧密码格式，建议重新设置密码以启用完整长度校验。
+      </p>
       <form class="change-pw-form" @submit.prevent="onChangeOwnPassword">
         <input v-model="ownPw.old" type="password" autocomplete="current-password" class="input" placeholder="当前密码" required />
         <input v-model="ownPw.new" type="password" autocomplete="new-password" minlength="8" class="input" placeholder="新密码 (≥8 位)" required />
@@ -118,9 +121,11 @@
       </div>
 
       <!-- Edit Bot Modal -->
-      <div v-if="editingBot" class="edit-modal-overlay" @click.self="editingBot = null">
+      <div v-if="editingBot" class="edit-modal-overlay" @click.self="botEditor.close()">
         <div class="edit-modal">
           <h3 class="modal-title">编辑机器人</h3>
+          <div v-if="editLoading" class="user-empty">加载配置中…</div>
+          <template v-else>
           <div class="form-group">
             <label>名称</label>
             <input v-model="editForm.name" class="input" />
@@ -159,9 +164,11 @@
             <label>自定义头像</label>
             <CustomAvatarRow :bot-id="editingBot" />
           </div>
+          </template>
+          <p v-if="editError" class="user-error">{{ editError }}</p>
           <div class="modal-actions">
-            <button class="btn-secondary" @click="editingBot = null">取消</button>
-            <button class="btn-primary" @click="saveEditBot">保存（需重启机器人生效）</button>
+            <button class="btn-secondary" @click="botEditor.close()">取消</button>
+            <button class="btn-primary" :disabled="!canSaveBot" @click="saveEditBot">{{ editSaving ? '保存中…' : '保存（需重启机器人生效）' }}</button>
           </div>
         </div>
       </div>
@@ -212,7 +219,7 @@
          visible even while the source is disabled: the enable toggle below is
          the only UI that flips its enabledProviders membership, so hiding the
          card would leave no way to turn Jellyfin on. -->
-    <section v-if="can('platform.auth')" class="settings-section">
+    <section v-if="session.isAdmin.value" class="settings-section">
       <h2 class="section-title">Jellyfin 音乐库（可选）</h2>
 
       <div class="account-card">
@@ -314,7 +321,7 @@
 
     <!-- Music Account - QR Code Login (platform auth) requires platform.auth.
          Cards for sources disabled via enabledProviders are hidden. -->
-    <section v-if="can('platform.auth') && (providerOn('netease') || providerOn('qq') || providerOn('bilibili') || providerOn('kugou'))" class="settings-section">
+    <section v-if="session.isAdmin.value && (providerOn('netease') || providerOn('qq') || providerOn('bilibili') || providerOn('kugou'))" class="settings-section">
       <h2 class="section-title">音乐账号</h2>
 
       <!-- NetEase -->
@@ -599,8 +606,8 @@
 
     <!-- Default music source (issue #126): the source used by chat commands
          (!play/!add …) and the WebUI when no platform flag is given. Saving is a
-         global bot setting, so gate on bot.manage like the other behavior rows. -->
-    <section v-if="can('bot.manage')" class="settings-section">
+         global bot setting, so only administrators can change it. -->
+    <section v-if="session.isAdmin.value" class="settings-section">
       <h2 class="section-title">默认音源</h2>
       <p class="profile-section-hint">
         设置不带音源参数时（如聊天里的 <code>!play 歌名</code> 或网页搜索）默认使用的音源。
@@ -627,8 +634,8 @@
       <p v-if="defaultSourceMessage" class="spotify-message" :class="`tone-${defaultSourceMessageTone}`">{{ defaultSourceMessage }}</p>
     </section>
 
-    <!-- Spotify (Connect) playback via librespot — requires platform.auth -->
-    <section v-if="can('platform.auth')" class="settings-section">
+    <!-- Spotify account changes are administrator-only. -->
+    <section v-if="session.isAdmin.value" class="settings-section">
       <h2 class="section-title">Spotify 播放（实验性）</h2>
       <p class="spotify-disclaimer">{{ SPOTIFY_DISCLAIMER }}</p>
 
@@ -769,7 +776,7 @@
     </section>
 
     <!-- Command Prefix -->
-    <section class="settings-section">
+    <section v-if="session.isAdmin.value" class="settings-section">
       <h2 class="section-title">命令设置</h2>
       <div class="setting-row">
         <div class="setting-label">
@@ -784,7 +791,7 @@
     </section>
 
     <!-- Idle Timeout -->
-    <section v-if="can('bot.manage')" class="settings-section">
+    <section v-if="session.isAdmin.value" class="settings-section">
       <h2 class="section-title">行为设置</h2>
       <div class="setting-row">
         <div class="setting-label">
@@ -1170,8 +1177,8 @@
 
               <p v-if="permError" class="user-error">{{ permError }}</p>
               <div class="form-actions">
-                <button class="btn-sm" @click="permEditingId = null">取消</button>
-                <button class="btn-sm btn-primary" :disabled="permSaving" @click="onSavePermissions(u)">
+                <button class="btn-sm" @click="permissionEditor.close()">取消</button>
+                <button class="btn-sm btn-primary" :disabled="!canSavePermissions" @click="onSavePermissions(u)">
                   {{ permSaving ? '保存中…' : '保存' }}
                 </button>
               </div>
@@ -1193,6 +1200,7 @@
           {{ creatingUser ? '创建中…' : '添加用户' }}
         </button>
       </form>
+      <p v-if="newUser.role === 'member'" class="profile-section-hint">新成员默认没有操作权限或机器人访问权限。创建后请通过「权限」按钮按需授权。</p>
       <p v-if="userMutationError" class="user-error">{{ userMutationError }}</p>
 
       <!-- Reset password modal -->
@@ -1245,6 +1253,7 @@ import CustomAvatarRow from '../components/CustomAvatarRow.vue';
 import QRCode from 'qrcode';
 import { usePlayerStore } from '../stores/player.js';
 import { useSession } from '../composables/useSession.js';
+import { useTargetEditor } from '../composables/useTargetEditor.js';
 import { devWarn } from '../utils/log.js';
 import {
   buildSpotifyPayload,
@@ -1281,8 +1290,7 @@ const newBotServerPassword = ref('');
 const newBotAvatar = ref<string | null>(null);
 
 // Edit bot
-const editingBot = ref<string | null>(null);
-const editForm = reactive({
+const botEditor = useTargetEditor(() => ({
   name: '',
   serverAddress: '',
   serverPort: 9987,
@@ -1291,7 +1299,9 @@ const editForm = reactive({
   channelId: '',
   channelPassword: '',
   serverPassword: '',
-});
+}));
+const { targetId: editingBot, draft: editForm, loading: editLoading,
+  saving: editSaving, error: editError, canSave: canSaveBot } = botEditor;
 
 const neteaseCookie = ref('');
 const qqCookie = ref('');
@@ -1401,7 +1411,7 @@ async function saveDefaultSource() {
   } catch (err: any) {
     defaultSourceMessageTone.value = 'warn';
     defaultSourceMessage.value = err?.response?.status === 403
-      ? '没有权限修改设置（需要 bot.manage）'
+      ? '全局设置仅管理员可修改'
       : '保存失败，请稍后重试';
   } finally {
     defaultSourceSaving.value = false;
@@ -1475,7 +1485,7 @@ async function saveJellyfin() {
   } catch (err: any) {
     jellyfinMessageTone.value = 'warn';
     jellyfinMessage.value = err?.response?.status === 403
-      ? '没有权限修改设置（需要 bot.manage）'
+      ? '全局设置仅管理员可修改'
       : '保存失败，请稍后重试';
   } finally {
     jellyfinSaving.value = false;
@@ -1603,9 +1613,7 @@ async function pollQrStatus(platform: string) {
   if (!qr.key) return;
 
   try {
-    const res = await axios.get('/api/auth/qrcode/status', {
-      params: { key: qr.key, platform },
-    });
+    const res = await axios.post('/api/auth/qrcode/status', { key: qr.key, platform });
     qr.status = res.data.status;
 
     if (qr.status === 'confirmed') {
@@ -1731,39 +1739,25 @@ async function batchStopSelected() {
 }
 
 async function openEditBot(bot: any) {
-  editingBot.value = bot.id;
-  editForm.name = bot.name;
-  // Fetch saved config to fill all fields
-  try {
-    const res = await axios.get(`/api/bot/${bot.id}/config`);
-    editForm.serverAddress = res.data.serverAddress ?? '';
-    editForm.serverPort = res.data.serverPort ?? 9987;
-    editForm.nickname = res.data.nickname ?? '';
-    editForm.defaultChannel = res.data.defaultChannel ?? '';
-    editForm.channelId = res.data.channelId ?? '';
-    editForm.channelPassword = res.data.channelPassword ?? '';
-    editForm.serverPassword = res.data.serverPassword ?? '';
-  } catch {
-    // Config not found — use defaults
-    editForm.serverAddress = '';
-    editForm.serverPort = 9987;
-    editForm.nickname = bot.name;
-    editForm.defaultChannel = '';
-    editForm.channelId = '';
-    editForm.channelPassword = '';
-    editForm.serverPassword = '';
-  }
+  await botEditor.open(bot.id, async (id, signal) => {
+    const res = await axios.get(`/api/bot/${id}/config`, { signal });
+    return {
+      name: res.data.name ?? bot.name,
+      serverAddress: res.data.serverAddress ?? '', serverPort: res.data.serverPort ?? 9987,
+      nickname: res.data.nickname ?? '', defaultChannel: res.data.defaultChannel ?? '',
+      channelId: res.data.channelId ?? '',
+      // Passwords are write-only. Blank fields preserve existing secrets.
+      channelPassword: '', serverPassword: '',
+    };
+  });
 }
 
 async function saveEditBot() {
   if (!editingBot.value) return;
-  try {
-    await axios.put(`/api/bot/${editingBot.value}`, editForm);
-    editingBot.value = null;
-    await store.fetchBots();
-  } catch {
-    // Ignore
-  }
+  const saved = await botEditor.save(editingBot.value, async (id, submitted) => {
+    await axios.put(`/api/bot/${id}`, submitted);
+  });
+  if (saved) await store.fetchBots().catch(() => {});
 }
 
 async function toggleBot(botId: string, connected: boolean) {
@@ -2240,6 +2234,7 @@ async function onChangeOwnPassword() {
     ownPw.confirm = '';
     ownPwSuccess.value = '密码已更新';
     // The server kills other sessions but keeps the current one. No reload needed.
+    await session.refresh().catch(() => {});
   } catch (e) {
     ownPwError.value = (e as Error).message;
   } finally {
@@ -2377,48 +2372,32 @@ const CAPABILITIES: { token: string; label: string }[] = [
   { token: 'player.queue', label: '队列管理' },
   { token: 'bot.manage', label: '机器人管理' },
   { token: 'bot.create', label: '创建新实例' },
-  { token: 'platform.auth', label: '平台登录凭据' },
+  { token: 'platform.auth', label: '平台连接测试' },
   { token: 'quality', label: '音质设置' },
 ];
 
-const permEditingId = ref<string | null>(null);
-const permLoading = ref(false);
-const permSaving = ref(false);
-const permError = ref('');
-const permDraft = reactive<{ capabilities: string[]; botsAll: boolean; selectedBotIds: string[] }>({
-  capabilities: [],
+const permissionEditor = useTargetEditor(() => ({
+  capabilities: [] as string[],
   botsAll: true,
-  selectedBotIds: [],
-});
+  selectedBotIds: [] as string[],
+}));
+const { targetId: permEditingId, draft: permDraft, loading: permLoading,
+  saving: permSaving, error: permError, canSave: canSavePermissions } = permissionEditor;
 
 async function onTogglePermEditor(u: UserListEntry) {
   if (permEditingId.value === u.id) {
-    permEditingId.value = null;
+    permissionEditor.close();
     return;
   }
-  permEditingId.value = u.id;
-  permError.value = '';
-  permLoading.value = true;
-  permDraft.capabilities = [];
-  permDraft.botsAll = true;
-  permDraft.selectedBotIds = [];
-  try {
-    const res = await fetch(`/api/users/${u.id}/permissions`);
+  await permissionEditor.open(u.id, async (id, signal) => {
+    const res = await fetch(`/api/users/${id}/permissions`, { signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body = await res.json();
-    permDraft.capabilities = Array.isArray(body.capabilities) ? [...body.capabilities] : [];
-    if (body.bots === 'all') {
-      permDraft.botsAll = true;
-      permDraft.selectedBotIds = [];
-    } else {
-      permDraft.botsAll = false;
-      permDraft.selectedBotIds = Array.isArray(body.bots) ? [...body.bots] : [];
-    }
-  } catch (e) {
-    permError.value = (e as Error).message;
-  } finally {
-    permLoading.value = false;
-  }
+    return {
+      capabilities: Array.isArray(body.capabilities) ? [...body.capabilities] : [],
+      botsAll: body.bots === 'all', selectedBotIds: Array.isArray(body.bots) ? [...body.bots] : [],
+    };
+  });
 }
 
 function toggleCapability(token: string, checked: boolean) {
@@ -2434,27 +2413,20 @@ function toggleBotSelection(id: string, checked: boolean) {
 }
 
 async function onSavePermissions(u: UserListEntry) {
-  permSaving.value = true;
-  permError.value = '';
-  try {
-    const res = await fetch(`/api/users/${u.id}/permissions`, {
+  await permissionEditor.save(u.id, async (id, submitted) => {
+    const res = await fetch(`/api/users/${id}/permissions`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        capabilities: [...permDraft.capabilities],
-        bots: permDraft.botsAll ? 'all' : [...permDraft.selectedBotIds],
+        capabilities: submitted.capabilities,
+        bots: submitted.botsAll ? 'all' : submitted.selectedBotIds,
       }),
     });
     if (!res.ok && res.status !== 204) {
       const b = await res.json().catch(() => ({}));
       throw new Error(b.error ?? `HTTP ${res.status}`);
     }
-    permEditingId.value = null;
-  } catch (e) {
-    permError.value = (e as Error).message;
-  } finally {
-    permSaving.value = false;
-  }
+  });
 }
 
 function formatDate(ms: number): string {
@@ -2532,6 +2504,8 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  botEditor.close();
+  permissionEditor.close();
   if (neteaseQr.pollTimer) clearInterval(neteaseQr.pollTimer);
   if (qqQr.pollTimer) clearInterval(qqQr.pollTimer);
   if (bilibiliQr.pollTimer) clearInterval(bilibiliQr.pollTimer);

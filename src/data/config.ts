@@ -161,6 +161,7 @@ export interface BotConfig {
   // (nginx/Caddy/Cloudflare). Required for correct protocol/host detection
   // behind HTTPS-terminating proxies.
   trustProxy: boolean;
+  trustedProxies?: string[]; // Express IP/CIDR allow-list; default loopback only
   guestMode: GuestModeConfig;
   spotify: SpotifyConfig;
   jellyfin: JellyfinConfig;
@@ -225,6 +226,7 @@ export function getDefaultConfig(): BotConfig {
     autoSourceFallback: true,
     publicUrl: "",
     trustProxy: false,
+    trustedProxies: ["loopback"],
     guestMode: {
       enabled: false,
       bots: "all",
@@ -544,6 +546,7 @@ export function loadConfig(path: string): BotConfig {
         typeof partial.publicUrl === "string" ? partial.publicUrl : defaults.publicUrl,
       trustProxy:
         typeof partial.trustProxy === "boolean" ? partial.trustProxy : defaults.trustProxy,
+      trustedProxies: Array.isArray(partial.trustedProxies) ? partial.trustedProxies.filter((v): v is string => typeof v === "string" && v.length > 0) : defaults.trustedProxies,
       guestMode: gm,
       spotify,
       jellyfin,

@@ -319,7 +319,7 @@ describe("users router", () => {
     expect(res.status).toBe(404);
   });
 
-  it("POST / seeds the basic tier for a new member", async () => {
+  it("POST / defaults a new member to no grants until explicitly provisioned", async () => {
     const res = await request(app)
       .post("/api/users")
       .set("Cookie", aliceCookie)
@@ -330,8 +330,8 @@ describe("users router", () => {
       .set("Cookie", aliceCookie);
     expect(perms.status).toBe(200);
     expect(perms.body).toEqual({
-      capabilities: ["player.control", "player.queue"],
-      bots: "all",
+      capabilities: [],
+      bots: [],
     });
   });
 

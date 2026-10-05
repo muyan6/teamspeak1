@@ -42,7 +42,8 @@ export function csrfOriginCheck(req: Request, res: Response, next: NextFunction)
   // (instead of setting) X-Forwarded-Host lets a spoofed first entry pass.
   // Configuring `publicUrl` enables the canonical-host path above, which is
   // immune; that is the recommended setup for proxied deployments.
-  const isProxyTrusted = Boolean(req.app?.get("trust proxy"));
+  const trust = req.app?.get('trust proxy fn') as ((ip: string, hop: number) => boolean) | undefined;
+  const isProxyTrusted = trust?.(req.socket?.remoteAddress ?? '', 0) ?? false;
   const forwardedHost = isProxyTrusted
     ? req.get("x-forwarded-host")?.split(",")[0].trim()
     : undefined;

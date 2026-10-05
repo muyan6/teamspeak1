@@ -73,25 +73,25 @@
                 <Icon icon="mdi:link-variant" /> 连接
               </button>
               <button
-                v-if="bot.playing || bot.paused"
+                v-if="bot.playing && !bot.paused"
                 class="bot-ctrl-btn"
                 :disabled="!bot.connected"
-                @click.stop="store.pause()"
+                @click.stop="store.pause(bot.id)"
               >
-                <Icon icon="mdi:stop" /> 停止
+                <Icon icon="mdi:pause" /> 暂停
               </button>
               <button
                 v-else
                 class="bot-ctrl-btn"
                 :disabled="!bot.connected"
-                @click.stop="store.resume()"
+                @click.stop="store.resume(bot.id)"
               >
                 <Icon icon="mdi:play" /> 播放
               </button>
               <button
                 class="bot-ctrl-btn"
                 :disabled="!bot.connected || (!bot.playing && !bot.paused)"
-                @click.stop="store.next()"
+                @click.stop="store.next(bot.id)"
                 title="下一首"
               >
                 <Icon icon="mdi:skip-next" />

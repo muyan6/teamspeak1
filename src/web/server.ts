@@ -16,6 +16,7 @@ import { createPlayerRouter } from "./api/player.js";
 import { createAuthRouter } from "./api/auth.js";
 import { createSessionRouter } from "./api/session.js";
 import { createUsersRouter } from "./api/users.js";
+import { createIntegrationRouter } from './api/integration.js';
 import { createAuditStore } from "../data/audit.js";
 import { createAuditRouter } from "./api/audit.js";
 import { createFavoritesRouter } from "./api/favorites.js";
@@ -75,31 +76,8 @@ export function createWebServer(options: WebServerOptions): WebServer {
   const logger = options.logger.child({ component: "web" });
 
   if (options.config.trustProxy) {
-    // Keep Express's permissive `true` so multi-hop deployments
-    // (Cloudflare -> nginx -> app) resolve req.ip to the REAL client and every
-    // user keeps their own rate-limit bucket. Pinning this to a hop count (1)
-    // would make req.ip the CDN/proxy address for two-or-more-hop setups and
-    // collapse /setup and /guest into ONE shared bucket for all visitors.
-    //
-    // Known trade-off, documented rather than silently changed: with `true`
-    // Express uses the LEFTMOST X-Forwarded-For entry, which a client can set.
-    // That only matters if the fronting proxy APPENDS to XFF instead of
-    // replacing it; nginx's `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`
-    // does append, so bind the app to the proxy (do not expose webPort publicly)
-    // if per-IP throttling must be trustworthy.
-    app.set("trust proxy", true);
-    // The permissive `true` above only yields trustworthy per-IP throttling when
-    // the operator has ALSO pinned the canonical host via publicUrl. Without it,
-    // the CSRF fallback compares two client-supplied headers against each other.
-    // That is a documented trade-off, not a bug — but it should be visible in
-    // the startup log rather than only in this comment.
-    if (!(options.config.publicUrl ?? "").trim()) {
-      logger.warn(
-        "trustProxy is enabled but publicUrl is empty — set publicUrl to the public " +
-          "origin so CSRF host checks and per-IP rate limiting cannot be spoofed via " +
-          "forwarded headers",
-      );
-    }
+    app.set('trust proxy', options.config.trustedProxies ?? ['loopback']);
+    if (!(options.config.publicUrl ?? '').trim()) logger.warn('Set publicUrl for canonical origin checks behind a trusted proxy');
   }
 
   // Canonical origin for CSRF host comparison (config.publicUrl when set), so
@@ -310,6 +288,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
   );
 
   // admin-only routes
+  app.use('/api/integration/v1', requireAdmin, createIntegrationRouter(options.botManager));
   app.use(
     "/api/users",
     requireAdmin,
@@ -373,7 +352,8 @@ export function createWebServer(options: WebServerOptions): WebServer {
     // Express trust-proxy setting does not apply to this hand-rolled path;
     // behind a proxy this throttles per proxy hop, which is strictly safer than
     // not throttling at all.
-    const wsKey = req.socket?.remoteAddress ?? "unknown";
+    const proxyRequest = Object.assign(Object.create(app.request), { app, headers: req.headers, socket: req.socket }) as express.Request;
+    const wsKey = proxyRequest.ip ?? req.socket?.remoteAddress ?? 'unknown';
     const wsVerdict = wsUpgradeLimit.tryConsume(wsKey);
     if (wsVerdict !== true) {
       socket.write(
@@ -383,7 +363,7 @@ export function createWebServer(options: WebServerOptions): WebServer {
       return;
     }
     const canonicalHost = app.get("canonicalHost") as string | undefined;
-    const isProxyTrusted = Boolean(options.config.trustProxy);
+    const isProxyTrusted = (app.get('trust proxy fn') as (ip: string, hop: number) => boolean)(req.socket.remoteAddress ?? '', 0);
     const forwardedHost = isProxyTrusted
       ? (req.headers["x-forwarded-host"] as string | undefined)?.split(",")[0].trim()
       : undefined;

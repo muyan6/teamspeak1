@@ -171,7 +171,7 @@ function stopSync() {
   }
 }
 
-watch(currentSong, () => {
+watch(() => `${currentSong.value?.platform}:${currentSong.value?.id}`, () => {
   fetchLyrics();
   lineRefs.value = {};
 });

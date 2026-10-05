@@ -1,0 +1,10 @@
+{
+  "name": "@tsmusicbot/netease-rsa-compat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Narrow Node.js RSA adapter for NeteaseCloudMusicApi; not a general node-forge implementation",
+  "main": "index.cjs",
+  "files": ["index.cjs", "README.md"],
+  "engines": { "node": ">=20.19.0" },
+  "license": "MIT"
+}

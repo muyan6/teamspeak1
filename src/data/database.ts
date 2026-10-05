@@ -583,6 +583,18 @@ export function createDatabase(dbPath: string): BotDatabase {
   const selectQueueState = db.prepare("SELECT * FROM queue_state WHERE botId = ?");
   const deleteQueueState = db.prepare("DELETE FROM queue_state WHERE botId = ?");
 
+  db.exec(`CREATE TABLE IF NOT EXISTS queue_reference_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
+    INSERT OR IGNORE INTO queue_reference_revision VALUES (1, 0);`);
+  for (const table of ['saved_queues', 'queue_state']) {
+    for (const event of ['INSERT', 'UPDATE', 'DELETE']) {
+      db.exec(`CREATE TRIGGER IF NOT EXISTS refs_${table}_${event} AFTER ${event} ON ${table}
+        BEGIN UPDATE queue_reference_revision SET revision=revision+1 WHERE id=1; END;`);
+    }
+  }
+  const referenceRevision = db.prepare('SELECT revision FROM queue_reference_revision WHERE id=1');
+  let cachedReferenceRevision = -1;
+  let cachedLocalReferences = new Set<string>();
+
   const historyInsertsPerBot = new Map<string, number>();
   const PRUNE_BATCH_SIZE = 50;
 
@@ -812,6 +824,8 @@ export function createDatabase(dbPath: string): BotDatabase {
     },
 
     getReferencedLocalSongIds() {
+      const revision = (referenceRevision.get() as { revision: number }).revision;
+      if (cachedReferenceRevision === revision) return new Set(cachedLocalReferences);
       const ids = new Set<string>();
       // Include BOTH named queues and restart snapshots. A failed DB read
       // must propagate so the local provider fails closed instead of evicting.
@@ -823,7 +837,8 @@ export function createDatabase(dbPath: string): BotDatabase {
           if (s.platform === 'local') ids.add(s.id);
         }
       }
-      return ids;
+      cachedLocalReferences = ids; cachedReferenceRevision = revision;
+      return new Set(ids);
     },
 
     close() {

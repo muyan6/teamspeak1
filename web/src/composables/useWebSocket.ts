@@ -24,6 +24,23 @@ export function useWebSocket() {
   // handler re-arms the reconnect — so a deliberate teardown (route change /
   // unmount) silently resurrected the connection and leaked a socket + timer.
   let disposed = false;
+  let lifecycle = 0;
+  function scheduleReconnect() {
+    if (disposed) return;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** reconnectAttempts);
+    reconnectAttempts = Math.min(reconnectAttempts + 1, 10);
+    reconnectTimer = setTimeout(connect, delay);
+  }
+  const wake = () => {
+    if (!disposed && !ws && !(typeof document !== 'undefined' && document.hidden)) {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      connect();
+    }
+  };
+  window.addEventListener?.('online', wake);
+  if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', wake);
+
 
   function connect() {
     if (disposed) return;
@@ -41,6 +58,7 @@ export function useWebSocket() {
     let openedThisAttempt = false;
     ws = new WebSocket(url);
     const socket = ws;
+    const version = lifecycle;
 
     ws.onopen = () => {
       if (disposed || ws !== socket) return;
@@ -68,11 +86,8 @@ export function useWebSocket() {
       switch (data.type) {
         case 'init':
           if (!Array.isArray(data.bots)) return;
-          store.bots = data.bots;
-          if (!data.bots.some((b: { id: string }) => b.id === store.activeBotId)) store.activeBotId = data.bots[0]?.id ?? null;
-          for (const id of Object.keys(store.queues)) if (!data.bots.some((b: { id: string }) => b.id === id)) delete store.queues[id];
+          store.acceptBotList(data.bots);
           for (const bot of data.bots) {
-            store.updateBotStatus(bot.id, bot);
             store.fetchQueueForBot(bot.id);
           }
           break;
@@ -124,8 +139,8 @@ export function useWebSocket() {
       if (event.code === 4009) {
         const session = useSession();
         session.refresh().then(() => {
-          if (!disposed && session.isAuthenticated.value) connect();
-        }).catch(() => { if (!disposed) reconnectTimer = setTimeout(connect, RECONNECT_BASE_MS); });
+          if (!disposed && version === lifecycle && session.isAuthenticated.value) connect();
+        }).catch(() => { if (!disposed && version === lifecycle) scheduleReconnect(); });
         return;
       }
       // A rejected handshake (expired/revoked session, guest mode turned off) is
@@ -145,19 +160,16 @@ export function useWebSocket() {
       if (!openedThisAttempt) {
         consecutiveFailedHandshakes += 1;
         if (consecutiveFailedHandshakes >= MAX_FAILED_HANDSHAKES) {
-          devWarn('WebSocket handshake rejected repeatedly; stopping reconnect');
-          import('../composables/useSession.js')
-            .then(({ useSession }) => useSession().refresh())
-            .catch(() => {});
+          const session = useSession();
+          session.refresh().then(() => {
+            if (!disposed && version === lifecycle && session.isAuthenticated.value) scheduleReconnect();
+          }).catch(() => { if (!disposed && version === lifecycle) scheduleReconnect(); });
           return;
         }
       } else {
         consecutiveFailedHandshakes = 0;
       }
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** reconnectAttempts);
-      reconnectAttempts = Math.min(reconnectAttempts + 1, 10);
-      reconnectTimer = setTimeout(connect, delay);
+      scheduleReconnect();
     };
 
     ws.onerror = () => {
@@ -167,6 +179,7 @@ export function useWebSocket() {
 
   function disconnect() {
     disposed = true;
+    lifecycle++;
     reconnectAttempts = 0;
     consecutiveFailedHandshakes = 0;
     if (reconnectTimer) {
@@ -181,7 +194,11 @@ export function useWebSocket() {
     connected.value = false;
   }
 
-  onUnmounted(disconnect);
+  onUnmounted(() => {
+    disconnect();
+    window.removeEventListener?.('online', wake);
+    if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', wake);
+  });
 
   return { connected, connect: () => { disposed = false; connect(); }, disconnect };
 }

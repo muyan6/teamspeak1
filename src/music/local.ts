@@ -1,3 +1,5 @@
+import { open } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -273,6 +275,8 @@ export class LocalMusicProvider implements MusicProvider {
    *  ffmpeg on Windows still releasing a just-stopped track). */
   private retrying = new Set<string>();
   private indexLock = Promise.resolve();
+  private reservedBytes = 0;
+  private reservedFiles = 0;
   /**
    * Lazily-filled "does this file still exist" cache for the READ paths.
    *
@@ -281,7 +285,7 @@ export class LocalMusicProvider implements MusicProvider {
    * uploads that is thousands of syscalls to render a 20-row page.
    *
    * Only the read paths consult this. The DELETION paths (unlinkRecordAt,
-   * sweepUnreferenced, enforceQuota) deliberately keep doing a real stat: for
+   * sweepUnreferenced, ensureCapacity) deliberately keep doing a real stat: for
    * them "the file is still present" is the signal that it is merely locked
    * (ffmpeg on Windows holding a just-stopped track) and must be retried later,
    * so caching that answer would make the retry loop give up immediately.
@@ -420,11 +424,13 @@ export class LocalMusicProvider implements MusicProvider {
     }
   }
 
-  async uploadAudio(input: {
-    buffer: Buffer;
-    originalName: string;
-    mimeType?: string;
-  }): Promise<Song> {
+  async uploadAudio(input: { buffer: Buffer; originalName: string; mimeType?: string }): Promise<Song> {
+    if (!input.buffer?.length) throw new Error('上传文件为空');
+    return this.uploadStream({ ...input, stream: Readable.from([input.buffer]) });
+  }
+
+  /** Bounded, backpressured ingestion; reservations cover all concurrent uploads. */
+  async uploadStream(input: { stream: AsyncIterable<Uint8Array>; originalName: string; mimeType?: string; signal?: AbortSignal }): Promise<Song> {
     const originalName = safeFileName(input.originalName || "audio");
     const ext = path.extname(originalName).toLowerCase();
     // Validate by the (sanitised) file extension only — never trust the
@@ -437,96 +443,137 @@ export class LocalMusicProvider implements MusicProvider {
         "和视频文件（mp4、mov、avi、mkv、flv、wmv 等，仅取其中的音轨播放）",
       );
     }
-    if (!input.buffer || input.buffer.length === 0) {
-      throw new Error("上传文件为空");
-    }
 
     const id = crypto.randomUUID();
     const isVideo = VIDEO_EXTENSIONS.has(ext);
     let filePath = path.join(this.uploadDir, `${id}${ext}`);
-    writeFileSync(filePath, input.buffer);
-
-    let probe: MediaProbe;
+    let reserved = 0, committed = false;
+    this.ensureCapacity(0, 1);
+    this.reservedFiles++;
     try {
-      probe = await probeMedia(filePath);
-    } catch {
-      probe = { durationSeconds: 0, hasAudio: false, audioCodec: null, recognized: false, probed: false };
-    }
+      const file = await open(filePath, 'wx');
+      try {
+        for await (const raw of input.stream) {
+          input.signal?.throwIfAborted();
+          const chunk = Buffer.from(raw);
+          if (reserved + chunk.length > 500 * 1024 * 1024) {
+            throw Object.assign(new Error('单个文件上限 500 MB'), { status: 413 });
+          }
+          this.ensureCapacity(chunk.length, 0);
+          reserved += chunk.length; this.reservedBytes += chunk.length;
+          let offset = 0;
+          while (offset < chunk.length) offset += (await file.write(chunk, offset)).bytesWritten;
+        }
+      } finally { await file.close(); }
+      input.signal?.throwIfAborted();
+      if (!reserved) throw new Error('上传文件为空');
 
-    // Reject a video with no audio track up front (#149). Left to playback it
-    // would produce a silent, zero-byte stream that just looks like a broken
-    // song. Require `recognized` as well as `probed`: bytes ffmpeg cannot open
-    // at all report hasAudio false for a different reason, and those have
-    // always been accepted (a truncated upload lands with duration 0) — this
-    // change must not start rejecting them.
-    if (isVideo && probe.probed && probe.recognized && !probe.hasAudio) {
-      rmSync(filePath, { force: true });
-      throw new Error("这个视频里没有音轨，无法播放");
-    }
-
-    let size = input.buffer.length;
-    if (isVideo) {
-      // Keep only the audio. The video bytes are dead weight against the
-      // upload-directory quota and would never be used.
-      // Preferred container first; if that remux fails (a codec the container
-      // will not take), retry into Matroska, which takes almost anything.
-      const preferredExt = extractedAudioExt(probe.audioCodec);
-      let extracted = path.join(this.uploadDir, `${id}${preferredExt}`);
-      let ok = await extractAudioTrack(filePath, extracted);
-      if (!ok && preferredExt !== EXTRACTED_AUDIO_EXT) {
-        rmSync(extracted, { force: true });
-        extracted = path.join(this.uploadDir, `${id}${EXTRACTED_AUDIO_EXT}`);
-        ok = await extractAudioTrack(filePath, extracted);
+      let probe: MediaProbe;
+      try {
+        probe = await probeMedia(filePath);
+      } catch {
+        probe = { durationSeconds: 0, hasAudio: false, audioCodec: null, recognized: false, probed: false };
       }
-      if (ok) {
-        try {
-          // Commit filePath and size TOGETHER, and only after the source is
-          // actually gone. rmSync(force) still throws EBUSY/EPERM on Windows,
-          // and assigning size first would leave the record claiming the
-          // small extracted size while still pointing at the whole video —
-          // which makes totalBytes() under-count and lets the upload
-          // directory grow past its quota.
-          const extractedSize = statSync(extracted).size;
-          rmSync(filePath, { force: true });
-          filePath = extracted;
-          size = extractedSize;
-        } catch {
-          // Could not stat/remove (Windows lock) — keep playing the original
-          // container and drop the half-finished extract.
+
+      // Reject a video with no audio track up front (#149). Left to playback it
+      // would produce a silent, zero-byte stream that just looks like a broken
+      // song. Require `recognized` as well as `probed`: bytes ffmpeg cannot open
+      // at all report hasAudio false for a different reason, and those have
+      // always been accepted (a truncated upload lands with duration 0) — this
+      // change must not start rejecting them.
+      if (isVideo && probe.probed && probe.recognized && !probe.hasAudio) {
+        rmSync(filePath, { force: true });
+        throw new Error("这个视频里没有音轨，无法播放");
+      }
+
+      let size = reserved;
+      if (isVideo) {
+        // Keep only the audio. The video bytes are dead weight against the
+        // upload-directory quota and would never be used.
+        // Preferred container first; if that remux fails (a codec the container
+        // will not take), retry into Matroska, which takes almost anything.
+        const preferredExt = extractedAudioExt(probe.audioCodec);
+        let extracted = path.join(this.uploadDir, `${id}${preferredExt}`);
+        let ok = await extractAudioTrack(filePath, extracted);
+        if (!ok && preferredExt !== EXTRACTED_AUDIO_EXT) {
+          rmSync(extracted, { force: true });
+          extracted = path.join(this.uploadDir, `${id}${EXTRACTED_AUDIO_EXT}`);
+          ok = await extractAudioTrack(filePath, extracted);
+        }
+        if (ok) {
+          try {
+            // Commit filePath and size TOGETHER, and only after the source is
+            // actually gone. rmSync(force) still throws EBUSY/EPERM on Windows,
+            // and assigning size first would leave the record claiming the
+            // small extracted size while still pointing at the whole video —
+            // which makes totalBytes() under-count and lets the upload
+            // directory grow past its quota.
+            const extractedSize = statSync(extracted).size;
+            rmSync(filePath, { force: true });
+            filePath = extracted;
+            size = extractedSize;
+          } catch {
+            // Could not stat/remove (Windows lock) — keep playing the original
+            // container and drop the half-finished extract.
+            rmSync(extracted, { force: true });
+          }
+        } else {
+          // Extraction failed (exotic codec Matroska won't take, timeout, …).
+          // The original container still plays: ffmpeg picks its audio stream.
           rmSync(extracted, { force: true });
         }
-      } else {
-        // Extraction failed (exotic codec Matroska won't take, timeout, …).
-        // The original container still plays: ffmpeg picks its audio stream.
-        rmSync(extracted, { force: true });
+      }
+
+      const song: LocalSongRecord = {
+        id,
+        name: titleFromFileName(originalName),
+        artist: "本地上传",
+        album: "本地音乐",
+        duration: probe.durationSeconds,
+        coverUrl: "",
+        platform: "local",
+        filePath,
+        originalName,
+        uploadedAt: new Date().toISOString(),
+        size,
+        mimeType: input.mimeType || "application/octet-stream",
+      };
+
+      await this.withIndexLock(() => {
+        input.signal?.throwIfAborted();
+        this.ensureCapacity(Math.max(0, size - reserved), 0);
+        this.records.unshift(song);
+        try { this.saveIndex(); }
+        catch (err) { this.records.shift(); throw err; }
+        this.indexSearchRecord(song);
+        this.markFilePresent(id);
+        committed = true;
+      });
+      return this.toSong(song);
+    } finally {
+      this.reservedBytes -= reserved; this.reservedFiles--;
+      if (!committed) {
+        for (const candidate of new Set([filePath, path.join(this.uploadDir, `${id}${ext}`),
+          path.join(this.uploadDir, `${id}.mka`), path.join(this.uploadDir, `${id}.m4a`)])) {
+          try { rmSync(candidate, { force: true }); } catch { /* a locked file is retried by the OS/operator */ }
+        }
       }
     }
+  }
 
-    const song: LocalSongRecord = {
-      id,
-      name: titleFromFileName(originalName),
-      artist: "本地上传",
-      album: "本地音乐",
-      duration: probe.durationSeconds,
-      coverUrl: "",
-      platform: "local",
-      filePath,
-      originalName,
-      uploadedAt: new Date().toISOString(),
-      size,
-      mimeType: input.mimeType || "application/octet-stream",
-    };
-
-    await this.withIndexLock(() => {
-      this.records.unshift(song);
-      this.indexSearchRecord(song);
-      this.markFilePresent(id); // just written — skip the stat on the next read
-      this.saveIndex();
-      // Never evict the file we just accepted, even if every older file is still
-      // queued — returning success for a file we deleted would be a phantom entry.
-      this.enforceQuota(id);
-    });
-    return this.toSong(song);
+  private ensureCapacity(bytes: number, files: number): void {
+    const fits = () => this.records.length + this.reservedFiles + files <= this.maxFiles &&
+      this.totalBytes() + this.reservedBytes + bytes <= this.maxTotalBytes;
+    if (fits()) return;
+    const refs = this.referencedIds();
+    if (refs) {
+      let changed = false;
+      for (let i = this.records.length - 1; i >= 0 && !fits(); i--) {
+        if (!refs.has(this.records[i].id) && this.unlinkRecordAt(i)) changed = true;
+      }
+      if (changed) this.saveIndex();
+    }
+    if (!fits()) throw Object.assign(new Error('本地音频存储配额已满，请释放空间后重试'), { status: 507 });
   }
 
   private toSong(record: LocalSongRecord): Song {
@@ -582,34 +629,6 @@ export class LocalMusicProvider implements MusicProvider {
     }
     if (deleted.length) this.saveIndex();
     return deleted;
-  }
-
-  /** Evict oldest, never-referenced uploads until under the file-count and
-   *  total-byte caps. Bounds disk use from uploads that are never played.
-   *  `protectId` is never evicted (the file just uploaded in this same call). */
-  private enforceQuota(protectId?: string): void {
-    if (this.records.length <= this.maxFiles &&
-        this.totalBytes() <= this.maxTotalBytes) {
-      return;
-    }
-    const inUse = this.referencedIds();
-    if (!inUse) return; // can't safely evict without knowing references
-    let count = this.records.length;
-    let bytes = this.totalBytes();
-    let changed = false;
-    for (let i = this.records.length - 1;
-         i >= 0 && (count > this.maxFiles || bytes > this.maxTotalBytes);
-         i--) {
-      const r = this.records[i];
-      if (inUse.has(r.id) || r.id === protectId) continue; // never evict these
-      const size = r.size || 0;
-      if (this.unlinkRecordAt(i)) {
-        count--;
-        bytes -= size;
-        changed = true;
-      }
-    }
-    if (changed) this.saveIndex();
   }
 
   /**

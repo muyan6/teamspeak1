@@ -70,8 +70,10 @@ router.beforeEach(async (to) => {
   const store = usePlayerStore();
   const qBot = typeof to.query.bot === 'string' && to.query.bot ? to.query.bot : null;
   if (qBot) {
-    // URL carries a scope — set tentatively; App.vue's applyScopeFromQuery (after fetchBots) validates/clears it.
-    store.scopedBotId = qBot;
+    // Bind both scope and action target immediately, including login returns.
+    // Snapshot reconciliation validates tentative ids when the list arrives.
+    if (store.botsLoaded) store.applyScopeFromQuery(qBot);
+    else store.setScope(qBot);
     return true;
   }
   if (store.scopedBotId) {

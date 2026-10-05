@@ -6,7 +6,8 @@ import type { SessionStore } from "../../data/sessions.js";
 import type { AuditStore } from "../../data/audit.js";
 import { resolvePermissionContext, type PermissionStore } from "../../data/permissions.js";
 import { SESSION_TTL_MS, GUEST_SESSION_TTL_MS } from "../../data/sessions.js";
-import { GUEST_USER_ID, GUEST_USERNAME, DUMMY_PASSWORD_HASH } from "../../data/users.js";
+import { GUEST_USER_ID, GUEST_USERNAME, DUMMY_PASSWORD_HASH, CredentialsChangedError } from "../../data/users.js";
+import { isLegacyPasswordHash } from '../../data/passwords.js';
 import type { GuestModeConfig } from "../../data/config.js";
 import { SESSION_COOKIE_NAME, validateSessionFromHeaders, extractSessionToken } from "../auth/validateSession.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
@@ -117,17 +118,19 @@ export function createSessionRouter(
       return;
     }
     const user = users.findByUsername(username);
-    // Always run exactly one bcrypt comparison — even for an unknown username —
-    // so response time does not reveal whether the account exists.
+    // Always perform a password KDF, including for unknown accounts.
     const ok = await users.verifyPassword(password, user?.passwordHash ?? DUMMY_PASSWORD_HASH);
-    if (!user || !ok) {
+    const current = user ? users.findById(user.id) : null;
+    // No await between checking the current credential and issuing the session.
+    // A password reset while the KDF was in flight must not mint a fresh token.
+    if (!user || !ok || !current || current.passwordHash !== user.passwordHash) {
       await delay(FAILED_LOGIN_DELAY_MS);
       res.status(401).json({ error: "invalid credentials" });
       return;
     }
-    const { token } = sessions.createSession(user.id);
+    const { token } = sessions.createSession(current.id);
     setSessionCookie(res, token);
-    res.json({ id: user.id, username: user.username, role: user.role });
+    res.json({ id: current.id, username: current.username, role: current.role, passwordUpgradeRecommended: isLegacyPasswordHash(current.passwordHash) });
   });
 
   router.post("/guest", (_req, res) => {
@@ -186,6 +189,7 @@ export function createSessionRouter(
       capabilities: [...ctx.capabilities],
       bots: ctx.bots === "all" ? "all" : [...ctx.bots],
       guest: ctx.guest ?? null,
+      passwordUpgradeRecommended: isLegacyPasswordHash(users.findById(user.id)?.passwordHash ?? ''),
     });
   });
 
@@ -205,7 +209,11 @@ export function createSessionRouter(
       res.status(400).json({ error: "invalid request" });
       return;
     }
-    await users.changePassword(u.id, newPassword);
+    try { await users.changePassword(u.id, newPassword, u.passwordHash); }
+    catch (err) {
+      if (err instanceof CredentialsChangedError) { res.status(409).json({ error: err.message }); return; }
+      throw err;
+    }
     const currentToken = extractSessionToken(req.headers.cookie);
     sessions.deleteAllForUser(u.id, currentToken ?? undefined);
     onSessionsRevoked?.(u.id, currentToken ?? undefined);

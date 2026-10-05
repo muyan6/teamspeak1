@@ -1,6 +1,6 @@
 import { Router } from "express";
 import type { Logger } from "pino";
-import { requirePermission } from "../middleware/requirePermission.js";
+import { requireAdmin } from "../middleware/requireAdmin.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
 
 /** Minimal structural seam over SpotifyOAuth so this router needs no real
@@ -33,7 +33,7 @@ export function createSpotifyRouter(opts: SpotifyRouterOptions): Router {
   // Start the Authorization Code + PKCE flow: hand the WebUI the accounts.spotify.com
   // authorize URL (verifier is stashed by state inside SpotifyOAuth). Gated like the
   // other platform logins in auth.ts.
-  router.get("/login", requirePermission("platform.auth"), (_req, res) => {
+  router.get("/login", requireAdmin, (_req, res) => {
     try {
       const { url } = oauth.buildAuthorizeUrl();
       res.json({ url });
@@ -47,7 +47,7 @@ export function createSpotifyRouter(opts: SpotifyRouterOptions): Router {
   // top-level browser navigation carrying the SameSite=Lax session cookie, so the
   // global requireAuth passes; state is the CSRF guard for the flow itself. Always
   // redirect (never JSON) so the user lands back in the UI.
-  router.get("/callback", async (req, res) => {
+  router.get("/callback", requireAdmin, async (req, res) => {
     const code = typeof req.query.code === "string" ? req.query.code : "";
     const state = typeof req.query.state === "string" ? req.query.state : "";
     if (!code || !state) {

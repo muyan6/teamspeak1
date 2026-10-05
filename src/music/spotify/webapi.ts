@@ -70,6 +70,7 @@ export class SpotifyWebApi {
   private getCreds: () => SpotifyCreds;
   private http: AxiosInstance;
   private auth: AxiosInstance;
+  private epoch = 0;
   private token = "";
   private tokenExpiresAt = 0;
 
@@ -83,6 +84,7 @@ export class SpotifyWebApi {
   }
 
   setCreds(_c: SpotifyCreds): void {
+    this.epoch++;
     // Creds are read live via getCreds(); force a token refresh on next call.
     this.token = "";
     this.tokenExpiresAt = 0;
@@ -97,6 +99,7 @@ export class SpotifyWebApi {
   private async getToken(): Promise<string | null> {
     if (!this.hasCreds()) return null;
     if (this.token && Date.now() < this.tokenExpiresAt) return this.token;
+    const epoch = this.epoch;
     const { clientId, clientSecret } = this.getCreds();
     const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
     try {
@@ -110,6 +113,7 @@ export class SpotifyWebApi {
           },
         }
       );
+      if (epoch !== this.epoch) return null;
       this.token = data?.access_token ?? "";
       this.tokenExpiresAt = Date.now() + ((data?.expires_in ?? 3600) - 30) * 1000;
       return this.token || null;

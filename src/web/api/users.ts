@@ -1,10 +1,10 @@
 import { Router } from "express";
 import type { Logger } from "../../logger.js";
 import type { UserStore } from "../../data/users.js";
-import { UsernameTakenError, GUEST_USER_ID } from "../../data/users.js";
+import { UsernameTakenError, GUEST_USER_ID, CredentialsChangedError } from "../../data/users.js";
 import type { SessionStore } from "../../data/sessions.js";
 import type { AuditStore } from "../../data/audit.js";
-import { isCapability, BASIC_TIER_CAPABILITIES, type PermissionStore } from "../../data/permissions.js";
+import { isCapability, type PermissionStore, type BotAccess } from "../../data/permissions.js";
 import { extractSessionToken } from "../auth/validateSession.js";
 
 function isValidUsername(v: unknown): v is string {
@@ -13,6 +13,18 @@ function isValidUsername(v: unknown): v is string {
 
 function isValidPassword(v: unknown): v is string {
   return typeof v === "string" && v.length >= 8 && v.length <= 200;
+}
+
+/** Creation must not publish a broadly-authorized account between HTTP calls. */
+function initialPermissions(value: unknown): { capabilities: string[]; bots: BotAccess } | null {
+  if (value === undefined) return { capabilities: [], bots: [] };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const p = value as Record<string, unknown>;
+  if (!Array.isArray(p.capabilities) || p.capabilities.length > 32 ||
+    !p.capabilities.every(c => typeof c === 'string' && isCapability(c))) return null;
+  if (p.bots !== 'all' && (!Array.isArray(p.bots) || p.bots.length > 500 ||
+    !p.bots.every(b => typeof b === 'string' && b.trim().length > 0 && b.length <= 128))) return null;
+  return { capabilities: [...new Set(p.capabilities as string[])], bots: p.bots === 'all' ? 'all' : [...new Set((p.bots as string[]).map(b => b.trim()))] };
 }
 
 export function createUsersRouter(
@@ -50,11 +62,10 @@ export function createUsersRouter(
       return;
     }
     const role: "admin" | "member" = roleInput === "admin" ? "admin" : "member";
+    const grants = initialPermissions(req.body?.permissions);
+    if (!grants) { res.status(400).json({ error: 'invalid initial permissions' }); return; }
     try {
-      const u = await users.createUser(username, password, role);
-      if (u.role === "member") {
-        permissions.setPermissions(u.id, { capabilities: BASIC_TIER_CAPABILITIES, bots: "all" });
-      }
+      const u = await users.createUser(username, password, role, grants);
       try {
         audit.record({
           actorId: req.user!.id, actorUsername: req.user!.username,
@@ -127,7 +138,11 @@ export function createUsersRouter(
       res.status(404).json({ error: "not found" });
       return;
     }
-    await users.changePassword(targetId, newPassword);
+    try { await users.changePassword(targetId, newPassword, target.passwordHash); }
+    catch (err) {
+      if (err instanceof CredentialsChangedError) { res.status(409).json({ error: err.message }); return; }
+      throw err;
+    }
     // Invalidate all sessions for the target user (except current actor's if it's the same user)
     const exceptToken = targetId === req.user!.id
       ? (extractSessionToken(req.headers.cookie) ?? undefined)

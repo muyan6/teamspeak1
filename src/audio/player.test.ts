@@ -481,7 +481,7 @@ describe("AudioPlayer external-PCM mode (playPcmStream)", () => {
     (player as any).currentUrl = "http://example.com/audio.mp3";
     (player as any).state = "paused";
 
-    const playSpy = vi.spyOn(player, "play").mockImplementation(() => {});
+    const playSpy = vi.spyOn(player, "play").mockReturnValue(true);
 
     player.seek(45);
 

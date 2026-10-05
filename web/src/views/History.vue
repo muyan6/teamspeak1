@@ -30,7 +30,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { Icon } from '@iconify/vue';
-import axios from 'axios';
+import { useBotHistory } from '../composables/useBotHistory.js';
 import { usePlayerStore } from '../stores/player.js';
 import SongCard from '../components/SongCard.vue';
 
@@ -38,25 +38,9 @@ const store = usePlayerStore();
 
 import { Song } from '../stores/player.js';
 
-const history = ref<Song[]>([]);
-const loading = ref(true);
+const { history, loading } = useBotHistory(() => store.activeBotId);
 
-onMounted(async () => {
-  if (!store.activeBotId) {
-    await store.fetchBots();
-  }
-
-  if (store.activeBotId) {
-    try {
-      const res = await axios.get(`/api/player/${store.activeBotId}/history`);
-      history.value = res.data.history;
-    } catch {
-      // Ignore if API not ready
-    }
-  }
-
-  loading.value = false;
-});
+onMounted(() => { if (!store.activeBotId) void store.fetchBots().catch(() => {}); });
 </script>
 
 <style lang="scss" scoped>

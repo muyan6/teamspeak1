@@ -298,13 +298,13 @@ export class NeteaseProvider implements MusicProvider {
   }
 
   async loginWithSms(phone: string, code: string): Promise<boolean> {
-    const res = await this.api.get("/captcha/verify", {
+    const res = await this.api.get("/login/cellphone", {
       params: { phone, captcha: code },
     });
     if (res.data?.cookie) {
       this.cookie = res.data.cookie;
     }
-    return res.data?.code === 200;
+    return res.data?.code === 200 && typeof res.data?.cookie === "string" && res.data.cookie.length > 0;
   }
 
   setCookie(cookie: string): void {

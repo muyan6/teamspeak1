@@ -29,13 +29,13 @@ echo "[OK] Node.js $(node -v)"
 
 # Newest Node major this project is regularly tested against. Anything above
 # still works, it just may have no prebuilt addons and fall back to a source build.
-TESTED_NODE_MAJOR=22
+TESTED_NODE_MAJOR=24
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 
 # The floor is not just a major version, so let node decide: @honeybbq/teamspeak-client
 # needs >=20.19, @sansenjian/qq-music-api needs >=20.17 / >=22.9, and the odd majors
 # (21 / 23) are excluded by better-sqlite3 and vitest. Keep in sync with package.json "engines".
-if ! node -e 'const v=process.versions.node.split(".").map(Number); process.exit((v[0]===20&&v[1]>=19)||(v[0]===22&&v[1]>=12)||v[0]>=24?0:1)'; then
+if ! node "$SCRIPT_DIR/check-node-version.cjs"; then
     echo "[ERROR] Node.js $(node -v) is not supported. Use Node 20.19+ LTS or Node 22.12+ LTS."
     echo "        https://nodejs.org/  |  https://nodejs.cn/"
     exit 1

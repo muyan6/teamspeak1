@@ -11,3 +11,7 @@ cookies/
 .claude/
 docs/superpowers/
 test-*.ts
+
+docs/reviews/
+docs/fixes/
+*.log

@@ -15,6 +15,7 @@ import { requireNotGuest } from "../middleware/requireNotGuest.js";
 declare module "express-serve-static-core" {
   interface Request {
     bot?: BotInstance;
+    playbackCurrent?: () => boolean;
   }
 }
 
@@ -42,8 +43,16 @@ export function createPlayerRouter(
       return;
     }
     req.bot = bot;
+    req.playbackCurrent = bot.capturePlaybackIntent?.();
     next();
   });
+
+  function runPlayback<T>(req: Request, task: () => Promise<T>): Promise<T> {
+    return requestBot(req).runExclusive(async () => {
+      if (req.playbackCurrent && !req.playbackCurrent()) throw Object.assign(new Error('Playback operation cancelled'), { status: 409 });
+      return task();
+    });
+  }
 
   const SUPPORTED_PLATFORMS = new Set<Platform>([
     "netease",
@@ -171,7 +180,7 @@ export function createPlayerRouter(
       const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)), timeoutMs);
       res.json({ message: response });
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -194,7 +203,7 @@ export function createPlayerRouter(
       const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)), timeoutMs);
       res.json({ message: response });
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -205,7 +214,7 @@ export function createPlayerRouter(
       const response = await executeWithTimeout(bot.executeCommand(cmd));
       res.json({ message: response });
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   };
 
@@ -227,16 +236,16 @@ export function createPlayerRouter(
         return;
       }
       const provider = bot.getProviderFor(selectedPlatform);
-      const message = await executeWithTimeout(bot.startFm(provider, requesterName(req)));
+      const message = await executeWithTimeout(runPlayback(req, () => bot.startFm(provider, requesterName(req))));
       res.json({
         ok:
           !message.startsWith("No FM songs") &&
           !message.includes("not available") &&
-          !message.includes("not connected"),
+          !message.includes("not connected") && !message.includes("cancelled"),
         message,
       });
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -262,7 +271,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -282,7 +291,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -308,7 +317,7 @@ export function createPlayerRouter(
       bot.seek(position);
       res.json({ message: `Seeked to ${Math.floor(position)}s`, seekOffset: position });
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -330,7 +339,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -346,7 +355,7 @@ export function createPlayerRouter(
       // Serialize the index-validation + stop/reset/playAt/resolveAndPlay so a
       // concurrent request can't interleave between mutating the queue and
       // starting playback (audible track must match queue.currentIndex).
-      const result = await bot.runExclusive(async () => {
+      const result = await runPlayback(req, async () => {
         const queue = bot.getQueueManager();
         // Validate the index BEFORE stopping current playback — otherwise an
         // invalid index silently kills the user's current song and leaves the
@@ -372,7 +381,7 @@ export function createPlayerRouter(
       }
       res.json(result.body);
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -390,7 +399,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd, undefined, requesterName(req));
       res.json({ message: response });
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -445,14 +454,13 @@ export function createPlayerRouter(
       const loadedMsg = queueable.length < totalCount
         ? `已加载 ${queueable.length}/${totalCount} 首（其余区域/版权限制）`
         : `已加载 ${queueable.length} 首`;
-      const result = await bot.runExclusive(async () => {
+      const result = await runPlayback(req, async () => {
         bot.getPlayer().stop();
         bot.getPlayer().resetFailures();
         const queue = bot.getQueueManager();
+        bot.disableFmMode();
         queue.clear();
-        for (const song of queueable) {
-          queue.add({ ...song, platform: provider.platform, requestedBy: requesterName(req) });
-        }
+        queue.addMany(queueable.map(song => ({ ...song, platform: provider.platform, requestedBy: requesterName(req) })));
         bot.cleanupQueuedLocalSongs?.("queue_replaced");
 
         const mode = queue.getMode();
@@ -475,8 +483,23 @@ export function createPlayerRouter(
       }
     } catch (err) {
       logger.error({ err }, "Play playlist failed");
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
+  });
+
+  router.post('/:botId/play-songs', authorize({ capability: 'player.control', guestFlag: 'playCollection' }), async (req, res) => {
+    const bot = requestBot(req);
+    if (!Array.isArray(req.body?.songs) || !req.body.songs.length || req.body.songs.length > MAX_QUEUE_SONGS) {
+      res.status(400).json({ error: `songs must contain 1-${MAX_QUEUE_SONGS} entries` }); return;
+    }
+    const songs = req.body.songs.map(normalizeSong);
+    for (const song of songs) if (selectPlatform(bot, song.platform, res) === null) return;
+    await runPlayback(req, async () => {
+      if (!bot.isConnected()) throw Object.assign(new Error('Bot is not connected'), { status: 409 });
+      await bot.loadSavedQueue(songs, 'replace', requesterName(req));
+    });
+    const playing = bot.getPlayer().getState() === 'playing';
+    res.json({ ok: playing, loaded: songs.length, message: playing ? `已加载 ${songs.length} 首` : '已加载队列，但未能开始播放' });
   });
 
   // Play an album by ID — mirrors play-playlist but calls getAlbumSongs
@@ -522,14 +545,13 @@ export function createPlayerRouter(
       const loadedMsg = queueable.length < totalCount
         ? `已加载 ${queueable.length}/${totalCount} 首（其余区域/版权限制）`
         : `已加载 ${queueable.length} 首`;
-      const result = await bot.runExclusive(async () => {
+      const result = await runPlayback(req, async () => {
         bot.getPlayer().stop();
         bot.getPlayer().resetFailures();
         const queue = bot.getQueueManager();
+        bot.disableFmMode();
         queue.clear();
-        for (const song of queueable) {
-          queue.add({ ...song, platform: provider.platform, requestedBy: requesterName(req) });
-        }
+        queue.addMany(queueable.map(song => ({ ...song, platform: provider.platform, requestedBy: requesterName(req) })));
         bot.cleanupQueuedLocalSongs?.("queue_replaced");
 
         const mode = queue.getMode();
@@ -552,7 +574,7 @@ export function createPlayerRouter(
       }
     } catch (err) {
       logger.error({ err }, "play-album failed");
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -581,7 +603,7 @@ export function createPlayerRouter(
         res.status(404).json({ error: "Song not found" });
         return;
       }
-      const body = await bot.runExclusive(async () => {
+      const body = await runPlayback(req, async () => {
         const ok = await bot.playSingleSong({ ...song, platform: selectedPlatform }, requesterName(req));
         return ok
           ? { ok: true, message: `正在播放：${song.name || songId} - ${song.artist || ""}` }
@@ -589,7 +611,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -606,7 +628,7 @@ export function createPlayerRouter(
       // The cleanupQueuedLocalSongs sweep now lives inside playSingleSong's
       // clear branch — do NOT also call it here, or it would delete retained
       // local uploads in keep-queue mode.
-      const body = await bot.runExclusive(async () => {
+      const body = await runPlayback(req, async () => {
         const ok = await bot.playSingleSong({ ...song, platform: selectedPlatform }, requesterName(req));
         return ok
           ? { ok: true, message: `正在播放：${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` }
@@ -614,7 +636,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -632,7 +654,7 @@ export function createPlayerRouter(
       }
       // Serialize the queue mutation + playback so concurrent requests can't
       // interleave (audible track must match queue.currentIndex).
-      const body = await bot.runExclusive(async () => {
+      const body = await runPlayback(req, async () => {
         const queue = bot.getQueueManager();
         const wasIdle = bot.getPlayer().getState() === "idle";
         // Capture the slot addNext WILL insert at, before mutating the queue.
@@ -659,7 +681,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -678,22 +700,24 @@ export function createPlayerRouter(
       }
       // Serialize the insert-after-current + promote + playback so concurrent
       // requests can't interleave (audible track must match queue.currentIndex).
-      const body = await bot.runExclusive(async () => {
+      const body = await runPlayback(req, async () => {
         const queue = bot.getQueueManager();
         const insertedAt =
           queue.getCurrentIndex() < 0 ? queue.size() : queue.getCurrentIndex() + 1;
         queue.addNext({ ...song, platform: selectedPlatform, requestedBy: requesterName(req) });
+        bot.getPlayer().stop();
         queue.playAt(insertedAt);
         bot.getPlayer().resetFailures();
         const ok = await bot.resolveAndPlay(queue.current()!);
         if (!ok) {
+          bot.emit("stateChange");
           return { ok: false, message: `无法播放「${song.name || song.id}」（区域/版权限制）` };
         }
         return { ok: true, message: `正在播放：${song.name || "Unknown"} - ${song.artist || "Unknown"}` };
       });
       res.json(body);
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -709,7 +733,7 @@ export function createPlayerRouter(
       }
       // Serialize the queue mutation + (possible) playback so concurrent
       // requests can't interleave (audible track must match queue.currentIndex).
-      const body = await bot.runExclusive(async () => {
+      const body = await runPlayback(req, async () => {
         const queue = bot.getQueueManager();
         const wasIdle = bot.getPlayer().getState() === "idle";
         queue.add({ ...song, platform: selectedPlatform, requestedBy: requesterName(req) });
@@ -718,15 +742,16 @@ export function createPlayerRouter(
         if (wasIdle) {
           queue.playAt(queue.size() - 1);
           bot.getPlayer().resetFailures();
-          await bot.resolveAndPlay(queue.current()!);
-          return { message: `Now playing: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` };
+          const ok = await bot.resolveAndPlay(queue.current()!);
+          if (!ok) return { ok: false, message: `未能开始播放：${song.name || song.id}` };
+          return { ok: true, message: `Now playing: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'}` };
         }
 
         return { message: `Added to queue: ${song.name || 'Unknown'} - ${song.artist || 'Unknown'} (position ${queue.size()})` };
       });
       res.json(body);
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -754,7 +779,7 @@ export function createPlayerRouter(
       }
 
       const queue = bot.getQueueManager();
-      const body = await bot.runExclusive(async () => {
+      const body = await runPlayback(req, async () => {
         const wasIdle = bot.getPlayer().getState() === "idle";
         queue.add({ ...song, platform: selectedPlatform, requestedBy: requesterName(req) });
 
@@ -762,8 +787,9 @@ export function createPlayerRouter(
         if (wasIdle) {
           queue.playAt(queue.size() - 1);
           bot.getPlayer().resetFailures();
-          await bot.resolveAndPlay(queue.current()!);
-          return { message: `Now playing: ${song.name || "Unknown"} - ${song.artist || "Unknown"}` };
+          const ok = await bot.resolveAndPlay(queue.current()!);
+          if (!ok) return { ok: false, message: `未能开始播放：${song.name || song.id}` };
+          return { ok: true, message: `Now playing: ${song.name || "Unknown"} - ${song.artist || "Unknown"}` };
         }
 
         return { message: `Added: ${song.name} - ${song.artist} (position ${queue.size()})` };
@@ -771,7 +797,7 @@ export function createPlayerRouter(
 
       res.json(body);
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 
@@ -792,7 +818,7 @@ export function createPlayerRouter(
       }
       res.json(pm.getConfig());
     } catch (err) {
-      res.status((err as { status?: number }).status === 400 ? 400 : 500).json({ error: (err as Error).message });
+      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
     }
   });
 

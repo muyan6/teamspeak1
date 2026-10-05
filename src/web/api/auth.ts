@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { createHash } from "node:crypto";
+import { extractSessionToken } from "../auth/validateSession.js";
 import type { MusicProvider } from "../../music/provider.js";
 import { YouTubeProvider } from "../../music/youtube.js";
 import type { CookieStore } from "../../music/auth.js";
@@ -41,6 +43,14 @@ export function createAuthRouter(
   config?: BotConfig
 ): Router {
   const router = Router();
+  const pendingQr = new Map<string, { owner: string; expiresAt: number; busy: boolean }>();
+  const owner = (req: import('express').Request) => createHash('sha256')
+    .update(`${req.user?.id ?? ''}:${extractSessionToken(req.headers.cookie) ?? ''}`).digest('hex');
+  const qrId = (platform: string, key: string) => `${platform}:${key}`;
+  function pruneQr() {
+    for (const [id, pending] of pendingQr) if (pending.expiresAt <= Date.now()) pendingQr.delete(id);
+    while (pendingQr.size >= 100) pendingQr.delete(pendingQr.keys().next().value!);
+  }
   // YouTube is auth-less; we only use this instance so /auth/status can
   // report whether yt-dlp is actually installed (loggedIn=false otherwise).
   const youtubeProvider: MusicProvider = new YouTubeProvider();
@@ -74,7 +84,9 @@ export function createAuthRouter(
       const { platform } = req.body;
       const provider = getProvider(platform);
       const qr = await provider.getQrCode();
-      logger.info({ platform, key: qr.key }, "QR code generated");
+      pruneQr();
+      pendingQr.set(qrId(provider.platform, qr.key), { owner: owner(req), expiresAt: Date.now() + 5 * 60_000, busy: false });
+      logger.info({ platform }, "QR code generated");
       res.json(qr);
     } catch (err) {
       logger.error({ err }, "QR code generation failed");
@@ -82,15 +94,28 @@ export function createAuthRouter(
     }
   });
 
-  router.get("/qrcode/status", requireNotGuest, async (req, res) => {
+  router.get('/qrcode/status', requireAdmin, (_req, res) => {
+    res.set('Allow', 'POST').status(405).json({ error: 'Use POST to confirm a QR login' });
+  });
+  router.post("/qrcode/status", requireAdmin, async (req, res) => {
     try {
-      const { key, platform } = req.query;
-      if (!key) {
+      const { key, platform } = req.body ?? {};
+      if (typeof key !== "string" || !key || key.length > 4096) {
         res.status(400).json({ error: "key is required" });
         return;
       }
       const provider = getProvider(platform as string);
-      const status = await provider.checkQrCodeStatus(key as string);
+      const id = qrId(provider.platform, key);
+      const pending = pendingQr.get(id);
+      if (!pending || pending.owner !== owner(req) || pending.expiresAt <= Date.now()) {
+        res.status(403).json({ error: 'QR login does not belong to this session or has expired' }); return;
+      }
+      if (pending.busy) { res.status(409).json({ error: 'QR check already pending' }); return; }
+      pending.busy = true;
+      let status: Awaited<ReturnType<MusicProvider['checkQrCodeStatus']>>;
+      try { status = await provider.checkQrCodeStatus(key); }
+      finally { pending.busy = false; }
+      if (status === 'confirmed' || status === 'expired') pendingQr.delete(id);
       logger.info({ platform, status, key }, "QR status check");
 
       // When confirmed, persist cookie
@@ -179,7 +204,7 @@ export function createAuthRouter(
     }
   });
 
-  router.post("/sms/send", requirePermission("platform.auth"), async (req, res) => {
+  router.post("/sms/send", requireAdmin, async (req, res) => {
     try {
       const { phone } = req.body;
       if (!phone) {
@@ -199,7 +224,7 @@ export function createAuthRouter(
     }
   });
 
-  router.post("/sms/verify", requirePermission("platform.auth"), async (req, res) => {
+  router.post("/sms/verify", requireAdmin, async (req, res) => {
     try {
       const { phone, code } = req.body;
       if (!phone || !code) {
@@ -224,8 +249,8 @@ export function createAuthRouter(
   // cookie that every user of the bot plays through, so a mere `platform.auth`
   // grant was enough to hijack the operator's logged-in account.
   router.post("/cookie", requireAdmin, (req, res) => {
-    const { platform, cookie } = req.body;
-    if (!cookie) {
+    const { platform, cookie } = req.body ?? {};
+    if (typeof cookie !== 'string' || !cookie.trim()) {
       res.status(400).json({ error: "cookie is required" });
       return;
     }
@@ -243,6 +268,10 @@ export function createAuthRouter(
       res
         .status(400)
         .json({ error: "Jellyfin 通过 Settings 配置连接，不支持手动 Cookie" });
+      return;
+    }
+    if (!['netease', 'qq', 'bilibili', 'kugou'].includes(platform)) {
+      res.status(400).json({ error: 'platform does not support Cookie authentication' });
       return;
     }
     const provider = getProvider(platform);

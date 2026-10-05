@@ -232,7 +232,14 @@ export function setupWebSocket(
     for (const id of Array.from(attachedBots.keys())) {
       detachBotListener(id);
     }
-    for (const ws of clients) { try { ws.terminate(); } catch {} }
+    // `clients` is the authorized broadcast set, NOT the transport lifetime
+    // registry: revocation/session expiry removes a socket there immediately
+    // after close(), while ws keeps its CLOSING TCP connection in wss.clients
+    // until the peer answers the close frame (or the 30s close timer expires).
+    // Shutdown must terminate those removed/closing peers too, otherwise both
+    // wss.close() and the HTTP server's close callback can remain pending.
+    const transports = new Set([...clients, ...(wss.clients ?? [])]);
+    for (const ws of transports) { try { ws.terminate(); } catch {} }
     clients.clear();
   };
 
