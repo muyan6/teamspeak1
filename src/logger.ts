@@ -7,9 +7,31 @@ const redact = { paths: ['cookie', 'key', 'token', 'password', 'clientSecret', '
   '*.cookie', '*.key', '*.token', '*.password', '*.clientSecret', '*.apiKey',
   'req.headers.cookie', 'req.headers.authorization', 'err.config.headers', 'err.config.params', 'err.config.data', 'err.request'], censor: '[REDACTED]' };
 
+export const serializers = {
+  err: (err: unknown) => {
+    if (!err) return { type: "Error", message: "" };
+    if (typeof err === "string") {
+      return {
+        type: "Error",
+        message: err.replace(/([?&](?:api_key|token|access_token)=)[^&\s]+/gi, '$1[REDACTED]'),
+      };
+    }
+    const errObj = err as Record<string, unknown>;
+    const type = typeof errObj.name === "string" ? errObj.name : "Error";
+    const rawMsg = typeof errObj.message === "string" ? errObj.message : String(err);
+    const message = rawMsg.replace(/([?&](?:api_key|token|access_token)=)[^&\s]+/gi, '$1[REDACTED]');
+    return {
+      type,
+      message,
+      stack: typeof errObj.stack === "string" ? errObj.stack : undefined,
+    };
+  },
+  url: (url: unknown) => (url ? String(url).replace(/([?&](?:api_key|token|access_token)=)[^&\s]+/gi, '$1[REDACTED]') : ""),
+};
+
 export function createLogger(logDir?: string): Logger {
   if (!logDir) {
-    return pino({ level: "info", redact });
+    return pino({ level: "info", redact, serializers });
   }
 
   mkdirSync(logDir, { recursive: true });
@@ -35,8 +57,5 @@ export function createLogger(logDir?: string): Logger {
     console.error("Logger transport error:", err);
   });
 
-  return pino({ level: "debug", redact, serializers: {
-    err: (err: Error) => ({ type: err.name, message: err.message.replace(/([?&](?:api_key|token|access_token)=)[^&\s]+/gi, '$1[REDACTED]') }),
-    url: (url: string) => String(url).replace(/([?&](?:api_key|token|access_token)=)[^&\s]+/gi, '$1[REDACTED]'),
-  } }, transport);
+  return pino({ level: "debug", redact, serializers }, transport);
 }

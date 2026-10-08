@@ -457,7 +457,7 @@ export class TS3Client extends EventEmitter {
     });
 
     this.client.on("disconnected", (err) => {
-      this.logger.warn({ err: err?.message }, "Connection closed");
+      this.logger.warn({ err: err instanceof Error ? err : (err ? new Error(String(err)) : undefined) }, "Connection closed");
       this.clientId = 0;
       this.clearVisibleClientUids();
       this.visibleClients.clear();
