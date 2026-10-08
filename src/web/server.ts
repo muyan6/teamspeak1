@@ -465,7 +465,14 @@ export function createWebServer(options: WebServerOptions): WebServer {
       controller.cleanup();
       await Promise.all([
         new Promise<void>(resolve => wss.close(() => resolve())),
-        new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); }),
+        new Promise<void>(resolve => {
+          server.close(() => resolve());
+          if (typeof (server as any).closeAllConnections === "function") {
+            (server as any).closeAllConnections();
+          } else {
+            server.closeIdleConnections();
+          }
+        }),
       ]);
     },
   };

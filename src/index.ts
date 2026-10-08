@@ -236,7 +236,10 @@ async function main() {
     // finish, then close the DB and exit.
     try {
       db.close();
-      await new Promise<void>(resolve => logger.flush(() => resolve()));
+      try {
+        (logger as any).flush?.();
+      } catch {}
+      await new Promise<void>(resolve => setTimeout(resolve, 100));
     } catch (err) {
       logger.warn({ err }, "Error while closing database");
     }

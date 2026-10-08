@@ -66,6 +66,8 @@
     "file-type": "^21.3.4",
     "qs": "^6.15.4",
     "basic-ftp": "6.2.2",
+    "proxy-addr": "^2.0.8",
+    "source-map-js": "^1.2.2",
     "NeteaseCloudMusicApi": {
       "node-forge": "$node-forge"
     }
