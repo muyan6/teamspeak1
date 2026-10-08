@@ -617,29 +617,47 @@ async function ensureBetterSqlite3() {
   // This is the case the old size check could not see: the file is there, it is
   // ~1.9 MB, and it is completely useless because it targets another ABI.
   log(`${name}: unusable — ${describeProbe(before)}`);
-  log(`${name}: replacing the native binary with a build for ABI ${NODE_ABI}...`);
-
-  const version = readInstalledVersion(name) || "12.11.1";
-  const url = `${CDN}/${name}/v${version}/${name}-v${version}-node-v${NODE_ABI}-${PLATFORM}-${ARCH}.tar.gz`;
+  const installedVersion = readInstalledVersion(name) || "12.9.1";
+  const candidateVersions = [installedVersion];
+  if (installedVersion !== "12.9.1") {
+    candidateVersions.push("12.9.1");
+  }
 
   const backup = stash(dest);
   let staging = null;
   try {
-    try {
-      log(`${name}: GET ${url}`);
-      const buf = await verifiedDownload(url, `https://github.com/WiseLibs/better-sqlite3/releases/download/v${version}/${url.split('/').pop()}`);
-      staging = mkdtempSync(join(pkgDir, ".tsmb-staging-"));
-      await extractTarGz(buf, staging);
-      const staged = join(staging, "build", "Release", "better_sqlite3.node");
-      if (!existsSync(staged)) {
-        throw new Error("tarball did not contain build/Release/better_sqlite3.node");
+    let prebuiltInstalled = false;
+    for (const v of candidateVersions) {
+      const file = `${name}-v${v}-node-v${NODE_ABI}-${PLATFORM}-${ARCH}.tar.gz`;
+      const url = `${CDN}/${name}/v${v}/${file}`;
+      const official = `https://github.com/WiseLibs/better-sqlite3/releases/download/v${v}/${file}`;
+      try {
+        log(`${name}: GET ${url}`);
+        const buf = await verifiedDownload(url, official);
+        staging = mkdtempSync(join(pkgDir, ".tsmb-staging-"));
+        await extractTarGz(buf, staging);
+        const staged = join(staging, "build", "Release", "better_sqlite3.node");
+        if (!existsSync(staged)) {
+          throw new Error("tarball did not contain build/Release/better_sqlite3.node");
+        }
+        mkdirSync(dirname(dest), { recursive: true });
+        rmSync(dest, { force: true });
+        renameSync(staged, dest); // atomic swap, same volume
+        log(`${name}: prebuilt binary installed (${humanSize(dest)})`);
+        prebuiltInstalled = true;
+        break;
+      } catch (cdnErr) {
+        log(`${name}: prebuilt install for v${v} skipped or failed (${cdnErr.message})`);
+        if (staging) {
+          try {
+            rmSync(staging, { recursive: true, force: true });
+          } catch {}
+          staging = null;
+        }
       }
-      mkdirSync(dirname(dest), { recursive: true });
-      rmSync(dest, { force: true });
-      renameSync(staged, dest); // atomic swap, same volume
-      log(`${name}: prebuilt binary installed (${humanSize(dest)})`);
-    } catch (cdnErr) {
-      log(`${name}: CDN install failed (${cdnErr.message})`);
+    }
+
+    if (!prebuiltInstalled) {
       log(`${name}: falling back to a source build — 'npm rebuild ${name} --build-from-source' (可能需要几分钟)`);
       buildFromSource(`npm rebuild ${name} --build-from-source`);
     }
