@@ -72,12 +72,27 @@ export function parseLyrics(lrc: string, tlyric?: string): LyricLine[] {
   return lines.sort((a, b) => a.time - b.time);
 }
 
+/** Join artist names into "A / B", tolerating upstream shape changes. `ar` /
+ *  `artists` is normally an array, but a reshaped payload can deliver an object
+ *  (or scalar); a bare `.map` on that would throw and 500 the whole search. */
+function joinArtists(raw: any): string {
+  const list: any[] = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object"
+      ? Object.values(raw)
+      : [];
+  return list
+    .map((x: any) => (x && typeof x === "object" ? x.name ?? "" : x == null ? "" : String(x)))
+    .filter(Boolean)
+    .join(" / ");
+}
+
 export function mapNeteaseAlbums(raw: any[] | null | undefined): Album[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((a) => ({
     id: String(a.id),
     name: a.name ?? "",
-    artist: (a.artists ?? []).map((x: any) => x.name).join(" / "),
+    artist: joinArtists(a.artists),
     coverUrl: a.picUrl ?? "",
     songCount: a.size ?? 0,
     platform: "netease",
@@ -89,7 +104,7 @@ export function mapNeteaseSongs(raw: any[] | null | undefined): Song[] {
   return raw.map((s: any) => ({
     id: String(s.id),
     name: s.name,
-    artist: (s.ar ?? s.artists ?? []).map((a: any) => a.name).join(" / "),
+    artist: joinArtists(s.ar ?? s.artists),
     album: s.al?.name ?? s.album?.name ?? "",
     duration: Math.round((s.dt ?? s.duration ?? 0) / 1000),
     coverUrl: s.al?.picUrl ?? s.album?.picUrl ?? "",
@@ -100,15 +115,23 @@ export function mapNeteaseSongs(raw: any[] | null | undefined): Song[] {
 }
 
 /** 解析网易云 freeTrialInfo → 试听秒数；无片段（VIP/免费）返回 undefined。
- *  真实字段 {start,end} 单位秒；容忍 begin/trialBegin 别名 + 毫秒兜底（end>1000）。 */
+ *  真实字段 {start,end} 单位秒；容忍 begin/trialBegin 别名 + 毫秒兜底。
+ *
+ *  单位判定（P2-33）：旧的 `start >= 1000` 启发式会把“长曲中段的试听”
+ *  （start=1200 秒/end=1230 秒）误判成毫秒 → 时长被压成 0，nearEnd 立即切歌。
+ *  改为与起点无关的“片段长度”量级判断：正常试听片段只有几十秒，span ≥ 1000
+ *  只可能是毫秒；同时用上游给出的整曲时长（秒）作佐证——end 明显超过整曲
+ *  时长时也判定为毫秒。 */
 export function parseNeteaseTrial(item: any): number | undefined {
   const t = item?.freeTrialInfo;
   if (!t || typeof t !== "object") return undefined;
   const start = Number(t.start ?? t.begin ?? t.trialBegin ?? 0);
   const end = Number(t.end ?? t.trialEnd);
   if (!Number.isFinite(end) || end <= start) return undefined;
-  const isMs = end >= 10000 || (t.start !== undefined && t.start >= 1000);
-  const secs = isMs ? (end - start) / 1000 : end - start;
+  const span = end - start;
+  const totalSecs = Number(item?.duration ?? 0);
+  const isMs = span >= 1000 || (Number.isFinite(totalSecs) && totalSecs > 0 && end > totalSecs + 1);
+  const secs = isMs ? span / 1000 : span;
   return Math.round(secs);
 }
 
@@ -133,6 +156,20 @@ export class NeteaseProvider implements MusicProvider {
       baseURL: baseUrl,
       timeout: 10000,
     });
+    // P2-30：登录 cookie 不再作为查询参数明文外发（URL 会进入访问日志、也会被
+    // 绑定同一 127.0.0.1 端口的任意本机进程读取）。改由请求头 `Cookie` 携带；
+    // NeteaseCloudMusicApi 侧车会把请求头 cookie 解析进 req.cookies 并作为默认
+    // cookie 使用。拦截器每次请求读取最新 cookie，登录/刷新后立即生效。
+    // 用可选链是为了兼容单测里替换成不含 interceptors 的假 api 对象。
+    this.api.interceptors?.request?.use?.((config) => {
+      if (this.cookie) {
+        const headers = (config.headers ?? {}) as Record<string, unknown> & { set?: (k: string, v: string) => void };
+        if (typeof headers.set === "function") headers.set("Cookie", this.cookie);
+        else headers.Cookie = this.cookie;
+        config.headers = headers as typeof config.headers;
+      }
+      return config;
+    });
   }
 
   setQuality(quality: string): void {
@@ -143,10 +180,6 @@ export class NeteaseProvider implements MusicProvider {
 
   getQuality(): string {
     return this.quality;
-  }
-
-  private get cookieParams(): Record<string, string> {
-    return this.cookie ? { cookie: this.cookie } : {};
   }
 
   async search(query: string, limit = 20, offset = 0, type: SearchType = "all"): Promise<SearchResult> {
@@ -160,7 +193,7 @@ export class NeteaseProvider implements MusicProvider {
     const [songRes, playlistRes, albumRes] = await Promise.all([
       fetchSongs
         ? this.api.get("/cloudsearch", {
-            params: { keywords: q, type: 1, limit, offset, ...this.cookieParams },
+            params: { keywords: q, type: 1, limit, offset },
           }).catch(() => null)
         : Promise.resolve(null),
       fetchPlaylists
@@ -170,38 +203,50 @@ export class NeteaseProvider implements MusicProvider {
               type: 1000,
               limit,
               offset,
-              ...this.cookieParams,
             },
           }).catch(() => null)
         : Promise.resolve(null),
       fetchAlbums
         ? this.api.get("/cloudsearch", {
-            params: { keywords: q, type: 10, limit, offset, ...this.cookieParams },
+            params: { keywords: q, type: 10, limit, offset },
           }).catch(() => null)
         : Promise.resolve(null),
     ]);
 
-    const songs: Song[] = songRes ? mapNeteaseSongs(songRes.data?.result?.songs) : [];
+    // P2-32：映射阶段单独 try/catch —— 上游把某个字段从数组改成对象时，
+    // 映射器不再把整个搜索变成 500，而是降级为空结果 + error（与其它 provider 一致）。
+    try {
+      const songs: Song[] = songRes ? mapNeteaseSongs(songRes.data?.result?.songs) : [];
 
-    const playlists: Playlist[] = (
-      playlistRes?.data?.result?.playlists ?? []
-    ).map((p: any) => ({
-      id: String(p.id),
-      name: p.name,
-      coverUrl: p.coverImgUrl ?? "",
-      songCount: p.trackCount ?? 0,
-      platform: "netease",
-    }));
+      const playlists: Playlist[] = (
+        Array.isArray(playlistRes?.data?.result?.playlists)
+          ? playlistRes.data.result.playlists
+          : []
+      ).map((p: any) => ({
+        id: String(p.id),
+        name: p.name,
+        coverUrl: p.coverImgUrl ?? "",
+        songCount: p.trackCount ?? 0,
+        platform: "netease",
+      }));
 
-    const albums = albumRes ? mapNeteaseAlbums(albumRes.data?.result?.albums) : [];
+      const albums = albumRes ? mapNeteaseAlbums(albumRes.data?.result?.albums) : [];
 
-    return { songs, playlists, albums };
+      return { songs, playlists, albums };
+    } catch (err) {
+      return {
+        songs: [],
+        playlists: [],
+        albums: [],
+        error: { message: err instanceof Error ? err.message : "NetEase search failed" },
+      };
+    }
   }
 
   async getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null> {
     const level = quality ?? this.quality;
     const res = await this.api.get("/song/url/v1", {
-      params: { id: songId, level, ...this.cookieParams },
+      params: { id: songId, level },
     });
     const item = res.data?.data?.[0];
     const url = item?.url;
@@ -211,21 +256,21 @@ export class NeteaseProvider implements MusicProvider {
 
   async getSongDetail(songId: string): Promise<Song | null> {
     const res = await this.api.get("/song/detail", {
-      params: { ids: songId, ...this.cookieParams },
+      params: { ids: songId },
     });
     return mapNeteaseSongs(res.data?.songs)[0] ?? null;
   }
 
   async getPlaylistSongs(playlistId: string): Promise<Song[]> {
     const res = await this.api.get("/playlist/track/all", {
-      params: { id: playlistId, ...this.cookieParams },
+      params: { id: playlistId },
     });
     return mapNeteaseSongs(res.data?.songs);
   }
 
   async getRecommendPlaylists(): Promise<Playlist[]> {
     const res = await this.api.get("/personalized", {
-      params: { limit: 10, ...this.cookieParams },
+      params: { limit: 10 },
     });
     return (res.data?.result ?? []).map((p: any) => ({
       id: String(p.id),
@@ -238,14 +283,14 @@ export class NeteaseProvider implements MusicProvider {
 
   async getAlbumSongs(albumId: string): Promise<Song[]> {
     const res = await this.api.get("/album", {
-      params: { id: albumId, ...this.cookieParams },
+      params: { id: albumId },
     });
     return mapNeteaseSongs(res.data?.songs);
   }
 
   async getLyrics(songId: string): Promise<LyricLine[]> {
     const res = await this.api.get("/lyric", {
-      params: { id: songId, ...this.cookieParams },
+      params: { id: songId },
     });
     return parseLyrics(
       res.data?.lrc?.lyric ?? "",
@@ -319,7 +364,7 @@ export class NeteaseProvider implements MusicProvider {
     if (!this.cookie) return { loggedIn: false };
     try {
       const res = await this.api.get("/login/status", {
-        params: { ...this.cookieParams },
+        params: {},
       });
       const profile = res.data?.data?.profile;
       if (profile) {
@@ -337,21 +382,21 @@ export class NeteaseProvider implements MusicProvider {
 
   async getPersonalFm(): Promise<Song[]> {
     const res = await this.api.get("/personal_fm", {
-      params: { ...this.cookieParams },
+      params: {},
     });
     return mapNeteaseSongs(res.data?.data);
   }
 
   async getDailyRecommendSongs(): Promise<Song[]> {
     const res = await this.api.get("/recommend/songs", {
-      params: { ...this.cookieParams },
+      params: {},
     });
     return mapNeteaseSongs(res.data?.data?.dailySongs);
   }
 
   async getPlaylistDetail(playlistId: string): Promise<PlaylistDetail | null> {
     const res = await this.api.get("/playlist/detail", {
-      params: { id: playlistId, ...this.cookieParams },
+      params: { id: playlistId },
     });
     const p = res.data?.playlist;
     if (!p) return null;
@@ -367,13 +412,13 @@ export class NeteaseProvider implements MusicProvider {
   async getUserPlaylists(): Promise<Playlist[]> {
     // First get user ID from login status
     const statusRes = await this.api.get("/login/status", {
-      params: { ...this.cookieParams },
+      params: {},
     });
     const uid = statusRes.data?.data?.profile?.userId;
     if (!uid) return [];
 
     const res = await this.api.get("/user/playlist", {
-      params: { uid, ...this.cookieParams },
+      params: { uid },
     });
     return (res.data?.playlist ?? []).map((p: any) => ({
       id: String(p.id),

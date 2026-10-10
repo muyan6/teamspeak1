@@ -222,3 +222,39 @@ describe("KugouProvider.search pagination", () => {
     expect(searchParams(get).page).toBe(1);
   });
 });
+
+describe("KugouProvider.getLyrics contenttype handling (P2-34)", () => {
+  /** Build a provider whose two lyrics requests return the given download body. */
+  function lyricsProvider(dl: Record<string, unknown>) {
+    const p = new KugouProvider();
+    const request = vi.fn(async (opts: any) => {
+      if (opts.url === "/v1/search") return { candidates: [{ id: 1, accesskey: "k" }] };
+      if (opts.url === "/download") return dl;
+      return {};
+    });
+    (p as any).request = request;
+    return { p };
+  }
+
+  const plainLrc = Buffer.from("[00:01.00]hello", "utf8").toString("base64");
+
+  it("treats a MISSING contenttype as KRC (not plain LRC) instead of garbling", async () => {
+    // 字段缺失时旧代码 Number(undefined)=NaN → NaN!==0 → isPlain=true，
+    // 会把 KRC 密文当明文 LRC。修复后按 KRC 处理：对普通 base64 会得到 []。
+    const { p } = lyricsProvider({ content: plainLrc, fmt: "krc" });
+    expect(await p.getLyrics("hash|0|0")).toEqual([]);
+  });
+
+  it("still parses plain LRC when contenttype is non-zero", async () => {
+    const { p } = lyricsProvider({ content: plainLrc, fmt: "lrc", contenttype: 1 });
+    const lines = await p.getLyrics("hash|0|0");
+    expect(lines).toHaveLength(1);
+    expect(lines[0].text).toBe("hello");
+  });
+
+  it("treats contenttype 0 as KRC", async () => {
+    const { p } = lyricsProvider({ content: plainLrc, fmt: "krc", contenttype: 0 });
+    expect(await p.getLyrics("hash|0|0")).toEqual([]);
+  });
+});
+

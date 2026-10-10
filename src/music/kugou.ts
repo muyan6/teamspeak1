@@ -107,11 +107,15 @@ function signatureAndroid(params: Record<string, unknown>, data = ""): string {
   return md5(`${SALT_ANDROID}${s}${data}${SALT_ANDROID}`);
 }
 
-/** Web request signature (QR login): md5(salt + sort("k=v") + salt). */
+/** Web request signature (QR login): md5(salt + sort-by-key("k=v") + salt).
+ *  P2-35: must sort by KEY first (like signatureAndroid), not sort the whole
+ *  "k=v" strings. Whole-string sorting differs whenever one key is a prefix of
+ *  another (e.g. `a` vs `ab`) — today's param sets don't trigger it, but the
+ *  two signers must stay consistent. */
 function signatureWeb(params: Record<string, unknown>): string {
   const s = Object.keys(params)
-    .map((k) => `${k}=${params[k]}`)
     .sort()
+    .map((k) => `${k}=${params[k]}`)
     .join("");
   return md5(`${SALT_WEB}${s}${SALT_WEB}`);
 }
@@ -716,7 +720,11 @@ export class KugouProvider implements MusicProvider {
         params: { ver: 1, client: "android", id: candidate.id, accesskey: candidate.accesskey, fmt: "krc", charset: "utf8" },
       });
       if (!dl?.content) return [];
-      const isPlain = dl.fmt === "lrc" || Number(dl.contenttype) !== 0;
+      // P2-34: contenttype is 0 for KRC (encrypted) and non-zero for plain LRC.
+      // A MISSING field must default to 0 (KRC), otherwise `Number(undefined)`
+      // is NaN and `NaN !== 0` is true → a KRC blob was base64-decoded as plain
+      // text and produced garbled lyrics. `?? 0` fixes the missing-field case.
+      const isPlain = dl.fmt === "lrc" || Number(dl.contenttype ?? 0) !== 0;
       const text = isPlain ? Buffer.from(dl.content, "base64").toString("utf8") : krcToLrc(decodeKrc(dl.content));
       return parseLyrics(text);
     } catch {

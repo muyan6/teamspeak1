@@ -88,8 +88,25 @@ export function buildCoverUrl(baseUrl: string, apiKey: string, item: JellyfinIte
   return "";
 }
 
+/**
+ * Jellyfin item / playlist ids are GUID-ish: `[A-Za-z0-9_-]`, 32 hex chars in
+ * practice.
+ *
+ * Ids reach these methods straight from user input (play-song, lyrics, playlist
+ * lookups) and are interpolated into request PATHS that carry the operator's
+ * admin token, so a `/`, `..` or `?` would let a caller steer the request to a
+ * different Jellyfin endpoint. `getCoverImage` always validated; the rest of the
+ * class now shares this one predicate instead of trusting the caller.
+ */
+const JELLYFIN_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
+
+export function isSafeJellyfinItemId(value: unknown): value is string {
+  return typeof value === "string" && JELLYFIN_ID_PATTERN.test(value);
+}
+
 /** Direct (untranscoded) stream URL — the default playback path. */
 export function buildStreamUrl(baseUrl: string, apiKey: string, itemId: string): string {
+  if (!isSafeJellyfinItemId(itemId)) return "";
   const params = new URLSearchParams({ static: "true", api_key: apiKey });
   return `${baseUrl}/Audio/${itemId}/stream?${params.toString()}`;
 }
@@ -420,6 +437,7 @@ export class JellyfinProvider implements MusicProvider {
   }
 
   async getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null> {
+    if (!isSafeJellyfinItemId(songId)) return null;
     await this.ensureAuth();
     const level = quality ?? this.quality;
     const tier = JELLYFIN_QUALITY_LEVELS.find((l) => l.value === level);
@@ -438,6 +456,7 @@ export class JellyfinProvider implements MusicProvider {
   }
 
   async getSongDetail(songId: string): Promise<Song | null> {
+    if (!isSafeJellyfinItemId(songId)) return null;
     const res = await this.request<{ Items?: JellyfinItem[] }>("get", "/Items", {
       params: { ids: songId, userId: this.userId },
     });
@@ -446,6 +465,7 @@ export class JellyfinProvider implements MusicProvider {
   }
 
   async getPlaylistSongs(playlistId: string): Promise<Song[]> {
+    if (!isSafeJellyfinItemId(playlistId)) return [];
     const res = await this.request<{ Items?: JellyfinItem[] }>(
       "get",
       `/Playlists/${playlistId}/Items`,
@@ -455,6 +475,7 @@ export class JellyfinProvider implements MusicProvider {
   }
 
   async getAlbumSongs(albumId: string): Promise<Song[]> {
+    if (!isSafeJellyfinItemId(albumId)) return [];
     const res = await this.request<{ Items?: JellyfinItem[] }>("get", "/Items", {
       params: {
         parentId: albumId,
@@ -483,6 +504,7 @@ export class JellyfinProvider implements MusicProvider {
   }
 
   async getPlaylistDetail(playlistId: string): Promise<PlaylistDetail | null> {
+    if (!isSafeJellyfinItemId(playlistId)) return null;
     const res = await this.request<{ Items?: JellyfinItem[] }>("get", "/Items", {
       params: { ids: playlistId, Fields: "ChildCount,Overview", userId: this.userId },
     });
@@ -498,6 +520,7 @@ export class JellyfinProvider implements MusicProvider {
   }
 
   async getLyrics(songId: string): Promise<LyricLine[]> {
+    if (!isSafeJellyfinItemId(songId)) return [];
     try {
       const res = await this.request<unknown>("get", `/Audio/${songId}/Lyrics`);
       return mapJellyfinLyrics(res);

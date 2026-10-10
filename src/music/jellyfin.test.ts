@@ -384,3 +384,60 @@ describe("JellyfinProvider", () => {
     expect(state.deviceId).toBe("D");
   });
 });
+
+// Ids flow from user input into request PATHS that carry the operator's admin
+// token. Without validation a caller could steer the request to another
+// Jellyfin endpoint (path traversal / parameter injection).
+describe("Jellyfin item-id validation", () => {
+  const hostile = [
+    "../../Users",
+    "a/b",
+    "a?b=1",
+    "a#frag",
+    "..",
+    "a\u0000b",
+    "a\nb",
+    "x".repeat(200),
+    "",
+  ];
+
+  it("buildStreamUrl refuses an unsafe id instead of interpolating it", () => {
+    expect(buildStreamUrl("https://jf", "K", "i1")).toContain("/Audio/i1/stream");
+    for (const id of hostile) {
+      expect(buildStreamUrl("https://jf", "K", id)).toBe("");
+    }
+  });
+
+  it("getSongUrl returns null for an unsafe id without issuing a request", async () => {
+    const { p, request } = mockProvider();
+    expect(await p.getSongUrl("../../Users")).toBeNull();
+    expect(await p.getSongUrl("a/b")).toBeNull();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("getPlaylistSongs returns [] for an unsafe id without issuing a request", async () => {
+    const { p, request } = mockProvider();
+    expect(await p.getPlaylistSongs("../../Users")).toEqual([]);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("getLyrics returns [] for an unsafe id without issuing a request", async () => {
+    const { p, request } = mockProvider();
+    expect(await p.getLyrics("../Auth/Keys")).toEqual([]);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("getSongDetail / getAlbumSongs / getPlaylistDetail reject unsafe ids", async () => {
+    const { p, request } = mockProvider();
+    expect(await p.getSongDetail("a/b")).toBeNull();
+    expect(await p.getAlbumSongs("a/b")).toEqual([]);
+    expect(await p.getPlaylistDetail("a/b")).toBeNull();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("still accepts a normal GUID id", async () => {
+    const { p, request } = mockProvider(cfg(), () => ({ Items: [{ Id: "i1", Name: "T" }] }));
+    await p.getPlaylistSongs("3fa85f6457174562b3fc2c963f66afa6");
+    expect(request).toHaveBeenCalled();
+  });
+});

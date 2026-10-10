@@ -13,7 +13,13 @@ export function musicContext(config: BotConfig | undefined, providers: MusicProv
 
 export const PLATFORMS: readonly Platform[] = ['netease', 'qq', 'bilibili', 'youtube', 'local', 'kugou', 'spotify', 'jellyfin'];
 
-/** Browser-facing Jellyfin art identifies a resource, never an account token. */
+/** Browser-facing Jellyfin art identifies a resource, never an account token.
+ *
+ *  P2-37: only ABSOLUTE http(s) URLs may pass. A protocol-relative URL
+ *  (`//evil.com/x`) parses with `u.protocol === "http:"` (resolved against the
+ *  dummy base), so the old protocol check let it through — the browser would
+ *  then load `//evil.com/x` for every viewer. Require the RAW string to start
+ *  with `http://` / `https://`, and reject `//host/...`. */
 export function publicCoverUrl(value: string): string {
   if (!value) return '';
   try {
@@ -25,6 +31,7 @@ export function publicCoverUrl(value: string): string {
       return `/api/music/jellyfin/cover/${encodeURIComponent(decodeURIComponent(m[1]))}${tag ? `?tag=${encodeURIComponent(tag)}` : ''}`;
     }
     if (value.startsWith('/api/music/jellyfin/cover/')) return value;
+    if (!/^https?:\/\//i.test(value)) return '';
     return /^https?:$/.test(u.protocol) ? value : '';
   } catch { return ''; }
 }
@@ -41,10 +48,23 @@ export function publicSong(song: QueuedSong | Song): QueuedSong {
 
 export class InvalidMediaInput extends Error { readonly status = 400; }
 
+/**
+ * Characters that must never appear in a provider id.
+ *
+ * Ids are interpolated straight into upstream request PATHS (e.g. Jellyfin's
+ * `/Audio/{id}/stream`, `/Playlists/{id}/Items`), so a `/`, `\`, `?`, `#` or a
+ * `..` segment lets a caller steer the request to another endpoint while the
+ * server's own credential is attached. Every real id in use is alphanumeric
+ * with `-`/`_` (NetEase/QQ numeric, kugou hex, Spotify base62, Jellyfin hex32,
+ * YouTube 11 chars, local uuid), so this rejects nothing legitimate.
+ */
+const UNSAFE_ID_CHARS = /[/\\?#\u0000-\u001f]/;
+
 export function normalizeSong(input: unknown): QueuedSong {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new InvalidMediaInput('song object required');
   const s = input as Record<string, unknown>;
-  if (typeof s.id !== 'string' || !s.id.trim() || s.id.length > 512 || /[\r\n\x00]/.test(s.id)) throw new InvalidMediaInput('invalid song id');
+  if (typeof s.id !== 'string' || !s.id.trim() || s.id.length > 512 ||
+      UNSAFE_ID_CHARS.test(s.id) || s.id.includes('..')) throw new InvalidMediaInput('invalid song id');
   if (typeof s.platform !== 'string' || !PLATFORMS.includes(s.platform as Platform)) throw new InvalidMediaInput('invalid platform');
   const text = (key: string, max: number, fallback = '') => {
     const v = s[key];

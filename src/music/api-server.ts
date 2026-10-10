@@ -9,6 +9,14 @@ export interface ApiServerOptions {
    *  embedded sidecar API server is never started and its port never bound. */
   neteaseEnabled?: boolean;
   qqEnabled?: boolean;
+  /**
+   * P2-30: by default the manager refuses to adopt a sidecar port it did not
+   * bind itself (`getNeteaseBaseUrl()`/`getQQMusicBaseUrl()` point straight at
+   * a loopback port; any local process that bound it first would receive the
+   * account cookie). Set this — or `TSMB_ALLOW_EXTERNAL_MUSIC_API=1` — only
+   * when you deliberately front an external NetEase/QQ API instance.
+   */
+  allowExternalApi?: boolean;
 }
 
 export interface ApiServerManager {
@@ -77,15 +85,30 @@ export function createApiServerManager(
       }
       logger.info("Starting embedded music API servers...");
 
+      // P2-30: we cannot run a real identity handshake against the third-party
+      // sidecars (NeteaseCloudMusicApi / qq-music-api expose no probe endpoint),
+      // so the safe default is to only serve on ports THIS process bound. An
+      // occupied port is treated as "some foreign process owns it" and NOT
+      // adopted, because the client sends the account cookie to that port.
+      const allowExternalApi =
+        options.allowExternalApi ?? process.env.TSMB_ALLOW_EXTERNAL_MUSIC_API === "1";
+
       // Start NetEase Cloud Music API
       if (options.neteaseEnabled !== false) {
         try {
           const portFree = await isPortFree(options.neteasePort);
           if (!portFree) {
-            logger.info(
-              { port: options.neteasePort },
-              "NetEase API port already in use — reusing existing instance"
-            );
+            if (allowExternalApi) {
+              logger.warn(
+                { port: options.neteasePort },
+                "NetEase API port already in use — reusing the external instance (TSMB_ALLOW_EXTERNAL_MUSIC_API enabled). The account cookie will be sent to whatever process owns this port."
+              );
+            } else {
+              logger.error(
+                { port: options.neteasePort },
+                "NetEase API port already in use by a process we did not start — refusing to reuse it (the login cookie would be sent there). Set TSMB_ALLOW_EXTERNAL_MUSIC_API=1 to opt in, or free the port. NetEase features are unavailable."
+              );
+            }
           } else {
             const ncmModule = await import("NeteaseCloudMusicApi") as any;
             const serverObj = ncmModule.server ?? ncmModule.default?.server;
@@ -110,13 +133,27 @@ export function createApiServerManager(
       // the server handle for clean shutdown.
       if (options.qqEnabled === false) return;
       try {
-        const portFree = await isPortFree(options.qqMusicPort);
-        if (!portFree) {
-          logger.info(
-            { port: options.qqMusicPort },
-            "QQ Music API port already in use — reusing existing instance"
-          );
-        } else {
+        // P2-30: probe BEFORE importing the sidecar. If the port is already
+        // occupied here, the owner is a foreign process (we have not imported
+        // anything yet), so refuse to adopt it. The post-import probe below is
+        // the only legitimate "reuse": it means the sidecar auto-listened on
+        // import and is our own.
+        const portFreeBeforeImport = await isPortFree(options.qqMusicPort);
+        if (!portFreeBeforeImport) {
+          if (allowExternalApi) {
+            logger.warn(
+              { port: options.qqMusicPort },
+              "QQ Music API port already in use — reusing the external instance (TSMB_ALLOW_EXTERNAL_MUSIC_API enabled). The account cookie will be sent to whatever process owns this port."
+            );
+          } else {
+            logger.error(
+              { port: options.qqMusicPort },
+              "QQ Music API port already in use by a process we did not start — refusing to reuse it (the login cookie would be sent there). Set TSMB_ALLOW_EXTERNAL_MUSIC_API=1 to opt in, or free the port. QQ features are unavailable."
+            );
+          }
+          return;
+        }
+        {
           // Pin the upstream server to the configured port before importing.
           // The package derives its default port from process.env.PORT (falling
           // back to 3200) and, in some historical versions, auto-started that

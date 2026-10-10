@@ -116,6 +116,20 @@ describe("NetEase adapter", () => {
     // 异常 end<=start
     expect(parseNeteaseTrial({ freeTrialInfo: { start: 0, end: 0 } })).toBeUndefined();
   });
+
+  it("parseNeteaseTrial does not mis-detect a deep clip in a long track as ms (P2-33)", () => {
+    // start=1200s / end=1230s：旧启发式 (start>=1000) 会当成毫秒→0.03→0 秒。
+    expect(parseNeteaseTrial({ freeTrialInfo: { start: 1200, end: 1230 } })).toBe(30);
+    // 整曲时长佐证：end 明显超过整曲（秒）时仍判为毫秒
+    expect(parseNeteaseTrial({ duration: 200, freeTrialInfo: { start: 0, end: 30000 } })).toBe(30);
+  });
+
+  it("mapNeteaseSongs tolerates ar being an object instead of an array (P2-32)", () => {
+    const out = mapNeteaseSongs([
+      { id: 1, name: "x", ar: { name: "Solo" }, al: {}, dt: 0, fee: 0 },
+    ] as any);
+    expect(out[0].artist).toBe("Solo");
+  });
 });
 
 describe("NeteaseProvider.search pagination", () => {
@@ -170,5 +184,18 @@ describe("NeteaseProvider.search pagination", () => {
     expect(p.getQuality()).toBe("lossless");
     p.setQuality("direct"); // foreign value from jellyfin
     expect(p.getQuality()).toBe("lossless"); // unchanged
+  });
+
+  it("degrades to empty + error when the mapping stage throws (P2-32)", async () => {
+    const p = new NeteaseProvider("http://x");
+    const evil = [{ id: 1, name: "x", ar: [{ get name(): string { throw new Error("boom"); } }], al: {}, dt: 0, fee: 0 }];
+    (p as any).api = {
+      get: vi.fn(async (_url: string, opts: any) =>
+        opts.params.type === 1 ? { data: { result: { songs: evil } } } : { data: { result: {} } }
+      ),
+    };
+    const res = await p.search("q");
+    expect(res.songs).toEqual([]);
+    expect(res.error?.message).toBe("boom");
   });
 });

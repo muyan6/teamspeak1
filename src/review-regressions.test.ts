@@ -204,7 +204,7 @@ describe('Review regression: confirmed backend defects', () => {
     expect(qq.search).toHaveBeenCalledTimes(1);
   });
 
-  it('R08: partially failed checks preserve unknown QQ tracks', async () => {
+  it('R08: a single failed chunk no longer forces a whole-batch fallback (P2-26)', async () => {
     const { QQMusicProvider } = await import('./music/qq.js');
     const qq: any = new QQMusicProvider('http://fixture.invalid');
     vi.spyOn(qq.api, 'get').mockImplementation((_url: any, opts: any) => {
@@ -212,7 +212,9 @@ describe('Review regression: confirmed backend defects', () => {
       return Promise.resolve({ data: { data: { playUrl: { first: { url: 'url:first' } } } } });
     });
     const result = await qq.getPlayableSongIds(['first', ...Array.from({ length: 99 }, (_, i) => `m${i}`), 'last']);
-    expect(result).toBeNull();
+    // Only "every chunk failed" yields null (which means: fall back to per-song
+    // probing). A single transient failure must keep the authoritative Set.
+    expect(result).toEqual(new Set(['first']));
   });
 
   it('R09: password change revokes old sockets while retaining current session', async () => {

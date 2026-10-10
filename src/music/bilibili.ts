@@ -27,6 +27,29 @@ const WBI_MIXIN_KEY_ENC_TAB = [
 ];
 
 const WBI_KEY_TTL_MS = 6 * 60 * 60 * 1000; // wbi keys rotate ~daily; refresh every 6h
+// P2-28: 取 wbi key 失败后的退避窗口。反爬/网络故障时不要在每次搜索都重试，
+// 否则既拖慢搜索又持续放大触发风控的概率。
+const WBI_KEY_FAILURE_BACKOFF_MS = 5 * 60 * 1000;
+
+/** Known B站 CDN host suffixes. Used to prefer a browser-playable CDN host and
+ *  to decide the B站 Referer. Suffix matching avoids the old substring heuristic
+ *  (`url.includes("bilivideo")`) that mis-classified non-matching mirrors (e.g.
+ *  `upos-sz-mirrorcos...cos...) and also accepted unrelated hosts that merely
+ *  contained the substring. Exported for unit testing. */
+export const BILIBILI_CDN_SUFFIXES = [
+  "bilivideo.com",
+  "bilivideo.cn",
+  "bilibili.com",
+  "hdslb.com",
+  "acgvideo.com",
+] as const;
+
+export function isBilibiliCdnHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return BILIBILI_CDN_SUFFIXES.some(
+    (suffix) => host === suffix || host.endsWith(`.${suffix}`)
+  );
+}
 
 export class BiliBiliProvider implements MusicProvider {
   readonly platform = "bilibili" as const;
@@ -40,6 +63,7 @@ export class BiliBiliProvider implements MusicProvider {
   private buvidInFlight: Promise<void> | null = null;
   private wbiMixinKey = "";
   private wbiKeyFetchedAt = 0;
+  private wbiKeyFailedAt = 0;
 
   constructor() {
     this.api = axios.create({
@@ -101,16 +125,28 @@ export class BiliBiliProvider implements MusicProvider {
     if (this.wbiMixinKey && Date.now() - this.wbiKeyFetchedAt < WBI_KEY_TTL_MS) {
       return;
     }
-    const res = await this.api.get("/x/web-interface/nav", {
-      headers: this.cookieHeaders,
-      validateStatus: () => true, // nav returns -101 when not logged in but still includes wbi_img
-    });
+    // P2-28: 失败退避。若距离上一次取 key 失败不足 WBI_KEY_FAILURE_BACKOFF_MS，
+    // 直接判定不可用（抛错，由 search() 降级为空结果），避免每次搜索都打 nav。
+    if (this.wbiKeyFailedAt && Date.now() - this.wbiKeyFailedAt < WBI_KEY_FAILURE_BACKOFF_MS) {
+      throw new Error("Bilibili wbi keys unavailable (in failure backoff)");
+    }
+    let res;
+    try {
+      res = await this.api.get("/x/web-interface/nav", {
+        headers: this.cookieHeaders,
+        validateStatus: () => true, // nav returns -101 when not logged in but still includes wbi_img
+      });
+    } catch (err) {
+      this.wbiKeyFailedAt = Date.now();
+      throw err;
+    }
     const wbi = res.data?.data?.wbi_img;
     const imgUrl: string = wbi?.img_url ?? "";
     const subUrl: string = wbi?.sub_url ?? "";
     const imgKey = imgUrl.split("/").pop()?.split(".")[0] ?? "";
     const subKey = subUrl.split("/").pop()?.split(".")[0] ?? "";
     if (!imgKey || !subKey) {
+      this.wbiKeyFailedAt = Date.now();
       throw new Error("Bilibili wbi keys unavailable");
     }
     const raw = imgKey + subKey;
@@ -118,6 +154,7 @@ export class BiliBiliProvider implements MusicProvider {
       .join("")
       .slice(0, 32);
     this.wbiKeyFetchedAt = Date.now();
+    this.wbiKeyFailedAt = 0;
   }
 
   /** Sign params for wbi-protected endpoints. Returns a new params object including wts and w_rid. */
@@ -163,44 +200,61 @@ export class BiliBiliProvider implements MusicProvider {
   }
 
   async search(query: string, limit = 20, offset = 0, _type: SearchType = "all"): Promise<SearchResult> {
-    await this.ensureBuvidCookie();
-    await this.ensureWbiKeys();
-    // /search/type is page-based; the web pages in limit-aligned steps so
-    // offset is a multiple of page_size.
-    const page = Math.floor(offset / limit) + 1;
-    const signed = this.signWbi({
-      search_type: "video",
-      keyword: query,
-      page,
-      page_size: limit,
-    });
-    const res = await this.api.get("/x/web-interface/wbi/search/type", {
-      params: signed,
-      headers: this.cookieHeaders,
-    });
+    // P2-28: 与其它 provider 一致 —— wbi/网络失败时降级为空结果 + error，
+    // 而不是把整个 B站搜索变成 500（反爬/改版时尤其重要）。
+    try {
+      await this.ensureBuvidCookie();
+      await this.ensureWbiKeys();
+      // B站 /search/type 的 page_size 上限是 50；limit 由调用方给出，可能到
+      // 100（P2-29）。这里钳制到 [1, 50]，同时保持 page/offset 语义一致。
+      const pageSize = Math.min(Math.max(Math.trunc(limit) || 1, 1), 50);
+      // /search/type is page-based; the web pages in limit-aligned steps so
+      // offset is a multiple of page_size.
+      const page = Math.floor(offset / Math.max(limit, 1)) + 1;
+      const signed = this.signWbi({
+        search_type: "video",
+        keyword: query,
+        page,
+        page_size: pageSize,
+      });
+      const res = await this.api.get("/x/web-interface/wbi/search/type", {
+        params: signed,
+        headers: this.cookieHeaders,
+      });
 
-    const code = res.data?.code;
-    if (code === -412 || code === -400 || code === -101) {
-      this.wbiMixinKey = "";
-      this.wbiKeyFetchedAt = 0;
+      const code = res.data?.code;
+      if (code === -412 || code === -400 || code === -101) {
+        // 失效的 key 需要重新获取；同时开启失败退避，避免接下来每次搜索都
+        // 立即重打 nav（P2-28）。
+        this.wbiMixinKey = "";
+        this.wbiKeyFetchedAt = 0;
+        this.wbiKeyFailedAt = Date.now();
+      }
+
+      const results = Array.isArray(res.data?.data?.result) ? res.data.data.result : [];
+      const songs: Song[] = results.map((v: any) => ({
+        id: String(v.bvid),
+        name: this.stripHtml(v.title ?? ""),
+        artist: v.author ?? "",
+        album: "",
+        duration: v.duration
+          ? typeof v.duration === "string"
+            ? this.parseDurationString(v.duration)
+            : v.duration
+          : 0,
+        coverUrl: this.normalizeCover(v.pic ?? ""),
+        platform: "bilibili" as const,
+      }));
+
+      return { songs, playlists: [], albums: [] };
+    } catch (err) {
+      return {
+        songs: [],
+        playlists: [],
+        albums: [],
+        error: { message: err instanceof Error ? err.message : "Bilibili search failed" },
+      };
     }
-
-    const results = res.data?.data?.result ?? [];
-    const songs: Song[] = results.map((v: any) => ({
-      id: String(v.bvid),
-      name: this.stripHtml(v.title ?? ""),
-      artist: v.author ?? "",
-      album: "",
-      duration: v.duration
-        ? typeof v.duration === "string"
-          ? this.parseDurationString(v.duration)
-          : v.duration
-        : 0,
-      coverUrl: this.normalizeCover(v.pic ?? ""),
-      platform: "bilibili" as const,
-    }));
-
-    return { songs, playlists: [], albums: [] };
   }
 
   /** Parse "MM:SS" duration string to seconds */
@@ -257,7 +311,13 @@ export class BiliBiliProvider implements MusicProvider {
     return this.cidCache.get(bvid) ?? null;
   }
 
-  async getSongUrl(songId: string, _quality?: string): Promise<SongUrlResult | null> {
+  async getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null> {
+    // P2-29④: `quality` 目前无法映射到 B站音频流。B站 DASH 音频只有数字
+    // quality id（如 30216/30232/30280），没有公开的“名称→id”表，且强行提高
+    // fnval/fourk 反而可能触发 412 反爬。这里始终选择“带宽最高”的可用音流，
+    // 并显式读取该参数（不再静默丢弃），将来若能映射可直接替换。
+    void quality;
+
     const cid = await this.getCid(songId);
     if (!cid) return null;
 
@@ -272,17 +332,41 @@ export class BiliBiliProvider implements MusicProvider {
       });
 
       const audioStreams = res.data?.data?.dash?.audio;
-      if (!audioStreams || audioStreams.length === 0) return null;
+      if (!Array.isArray(audioStreams) || audioStreams.length === 0) return null;
 
       // Pick highest bandwidth audio stream
       const best = audioStreams.reduce((a: any, b: any) =>
         (b.bandwidth ?? 0) > (a.bandwidth ?? 0) ? b : a
       );
 
-      const biliUrl = best.baseUrl ?? best.base_url;
-      return biliUrl ? { url: biliUrl } : null;
+      // P2-29②: 旧代码丢弃 backupUrl —— 部分镜像域名会 403，主 URL 不可用时
+      // 就没有候选。这里把 baseUrl/base_url 与 backupUrl/backup_url 汇总为候选
+      // 列表。注意 SongUrlResult 只承载单个 URL（下游音频层不可改），因此这里
+      // 做“优先选择一个已知 B站 CDN 主机”的候选（后缀匹配，而非子串匹配），
+      // 使音频层现有的 Referer 判定能命中；字段级回退链与 kugou 的写法一致。
+      const candidates: string[] = [
+        best.baseUrl,
+        best.base_url,
+        ...(Array.isArray(best.backupUrl) ? best.backupUrl : []),
+        ...(Array.isArray(best.backup_url) ? best.backup_url : []),
+      ].filter((u: unknown): u is string => typeof u === "string" && u.length > 0);
+
+      if (candidates.length === 0) return null;
+
+      const preferred =
+        candidates.find((u) => this.isKnownCdnUrl(u)) ?? candidates[0];
+      return { url: preferred };
     } catch {
       return null;
+    }
+  }
+
+  /** True when `url`'s hostname is one of the known B站 CDN hosts (suffix match). */
+  private isKnownCdnUrl(url: string): boolean {
+    try {
+      return isBilibiliCdnHost(new URL(url).hostname);
+    } catch {
+      return false;
     }
   }
 

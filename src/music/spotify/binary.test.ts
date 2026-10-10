@@ -16,6 +16,7 @@ import {
   resetLibrespotBinaryCache,
   __setLibrespotVersionProbe,
   resolveExecutable,
+  resolveTrustedExecutable,
   isLibrespotPresent,
   isGoLibrespotPresent,
 } from "./binary.js";
@@ -45,6 +46,9 @@ afterEach(() => {
   process.env.PATH = origPath;
   if (origPathExt === undefined) delete process.env.PATHEXT;
   else process.env.PATHEXT = origPathExt;
+  delete process.env.TSMB_TRUST_PATH_BINARIES;
+  delete process.env.TSMB_LIBRESPOT_PATH;
+  delete process.env.TSMB_GO_LIBRESPOT_PATH;
   for (const dir of tmpDirs.splice(0)) {
     try {
       rmSync(dir, { recursive: true, force: true });
@@ -314,20 +318,22 @@ describe("resolveExecutable", () => {
 });
 
 describe("isLibrespotPresent (PATH-aware, sync)", () => {
-  it("true when the bare librespot name resolves on PATH (posix)", () => {
+  it("true when the bare librespot name resolves on PATH and PATH trust is opted in", () => {
     setPlatform("linux");
     const dir = mkTmpDir("tsmb-librespot-path-");
     writeFileSync(join(dir, "librespot"), "#!/bin/sh\n");
     process.env.PATH = dir;
+    process.env.TSMB_TRUST_PATH_BINARIES = "1"; // P2-36 opt-in
     expect(isLibrespotPresent()).toBe(true);
   });
 
-  it("true when librespot.exe resolves on PATH (win32)", () => {
+  it("true when librespot.exe resolves on PATH (win32) and PATH trust is opted in", () => {
     setPlatform("win32");
     const dir = mkTmpDir("tsmb-librespot-win-");
     writeFileSync(join(dir, "librespot.exe"), "MZ\n");
     process.env.PATH = dir;
     process.env.PATHEXT = ".EXE;.CMD;.BAT;.COM";
+    process.env.TSMB_TRUST_PATH_BINARIES = "1";
     expect(isLibrespotPresent()).toBe(true);
   });
 
@@ -336,15 +342,42 @@ describe("isLibrespotPresent (PATH-aware, sync)", () => {
     process.env.PATH = mkTmpDir("tsmb-librespot-empty-");
     expect(isLibrespotPresent()).toBe(false);
   });
+
+  it("rejects a PATH-only binary by default — polluted PATH must not execute (P2-36)", () => {
+    setPlatform("linux");
+    const dir = mkTmpDir("tsmb-librespot-untrusted-");
+    writeFileSync(join(dir, "librespot"), "#!/bin/sh\n");
+    process.env.PATH = dir;
+    // No TSMB_TRUST_PATH_BINARIES set → PATH is not trusted.
+    expect(isLibrespotPresent()).toBe(false);
+  });
+
+  it("trusts an explicit path via TSMB_LIBRESPOT_PATH (P2-36)", () => {
+    setPlatform("linux");
+    const dir = mkTmpDir("tsmb-librespot-explicit-");
+    const full = join(dir, "librespot");
+    writeFileSync(full, "#!/bin/sh\n");
+    process.env.TSMB_LIBRESPOT_PATH = full;
+    expect(isLibrespotPresent()).toBe(true);
+  });
 });
 
 describe("isGoLibrespotPresent (PATH-aware, sync)", () => {
-  it("true when go-librespot resolves on PATH (linux)", () => {
+  it("true when go-librespot resolves on PATH (linux) and PATH trust is opted in", () => {
     setPlatform("linux");
     const dir = mkTmpDir("tsmb-go-path-");
     writeFileSync(join(dir, "go-librespot"), "#!/bin/sh\n");
     process.env.PATH = dir;
+    process.env.TSMB_TRUST_PATH_BINARIES = "1";
     expect(isGoLibrespotPresent()).toBe(true);
+  });
+
+  it("rejects a PATH-only go-librespot by default (P2-36)", () => {
+    setPlatform("linux");
+    const dir = mkTmpDir("tsmb-go-untrusted-");
+    writeFileSync(join(dir, "go-librespot"), "#!/bin/sh\n");
+    process.env.PATH = dir;
+    expect(isGoLibrespotPresent()).toBe(false);
   });
 
   it("false on non-linux platforms regardless of PATH (unsupported gate)", () => {
@@ -352,6 +385,7 @@ describe("isGoLibrespotPresent (PATH-aware, sync)", () => {
     const dir = mkTmpDir("tsmb-go-win-");
     writeFileSync(join(dir, "go-librespot"), "#!/bin/sh\n");
     process.env.PATH = dir;
+    process.env.TSMB_TRUST_PATH_BINARIES = "1";
     expect(isGoLibrespotPresent()).toBe(false);
   });
 
@@ -359,5 +393,25 @@ describe("isGoLibrespotPresent (PATH-aware, sync)", () => {
     setPlatform("linux");
     process.env.PATH = mkTmpDir("tsmb-go-empty-");
     expect(isGoLibrespotPresent()).toBe(false);
+  });
+});
+
+describe("resolveTrustedExecutable (P2-36)", () => {
+  it("accepts an explicit path with a separator when it exists", () => {
+    const dir = mkTmpDir("tsmb-trust-explicit-");
+    const full = join(dir, "tool");
+    writeFileSync(full, "#!/bin/sh\n");
+    process.env.TSMB_TRUST_PATH_BINARIES = "1"; // still fine; separator path is direct
+    expect(resolveTrustedExecutable(full)).toBe(full);
+  });
+
+  it("rejects a bare PATH name unless PATH trust is opted in", () => {
+    const dir = mkTmpDir("tsmb-trust-path-");
+    const exeName = process.platform === "win32" ? "trusttool.exe" : "trusttool";
+    writeFileSync(join(dir, exeName), "#!/bin/sh\n");
+    process.env.PATH = dir;
+    expect(resolveTrustedExecutable(exeName)).toBeNull();
+    process.env.TSMB_TRUST_PATH_BINARIES = "1";
+    expect(resolveTrustedExecutable(exeName)).toBe(join(dir, exeName));
   });
 });

@@ -41,6 +41,37 @@ export function resolveExecutable(cmd: string): string | null {
 }
 
 /**
+ * P2-36: a binary is only ever EXECUTED when it resolves to a trusted location.
+ * The old code accepted any `$PATH` entry, so a polluted PATH (or a world-
+ * writable directory earlier in PATH) meant arbitrary code execution.
+ *
+ * There is no offline-verifiable checksum for librespot / go-librespot —
+ * `scripts/download-binaries.mjs` does not fetch them and ships no manifest
+ * digest for them — so we deliberately do NOT hardcode hashes. Instead we
+ * require one of:
+ *   1. an explicit path (`TSMB_LIBRESPOT_PATH` / `TSMB_GO_LIBRESPOT_PATH`), or
+ *   2. the project `bin/` directory (a controlled location, i.e. a candidate
+ *      containing a path separator), or
+ *   3. an explicit opt-in `TSMB_TRUST_PATH_BINARIES=1` to accept a bared-name
+ *      PATH lookup.
+ *
+ * Residual risk: a compromised binary that is already inside `bin/` or an
+ * explicit override is still executed — this only closes the "polluted PATH"
+ * vector, it is not a signature/checksum verification.
+ */
+export function isTrustedBinaryConfig(): boolean {
+  return process.env.TSMB_TRUST_PATH_BINARIES === "1";
+}
+
+/** Resolve `cmd` only from a trusted location (see isTrustedBinaryConfig). */
+export function resolveTrustedExecutable(cmd: string): string | null {
+  // Explicit path / project bin path (contains a separator) → checked directly.
+  if (cmd.includes("/") || cmd.includes("\\")) return existsSync(cmd) ? cmd : null;
+  // Bare name: a PATH lookup is only trusted when the operator opted in.
+  return isTrustedBinaryConfig() ? resolveExecutable(cmd) : null;
+}
+
+/**
  * True only on Linux. go-librespot ships Linux-only release binaries and the
  * sidecar relies on a POSIX FIFO (mkfifo), so the Spotify audio backend is
  * gated to Linux/Docker. Everywhere else the caller falls back to the Stage-1
@@ -69,8 +100,12 @@ export function pickGoLibrespotPath(
   return "go-librespot";
 }
 
-/** Resolve the go-librespot binary path: project bin/ dir first, then PATH. */
+/** Resolve the go-librespot binary path: explicit override, then project bin/
+ *  dir, then PATH. */
 export function findGoLibrespot(): string {
+  // P2-36: an explicit operator-configured path always wins.
+  const override = process.env.TSMB_GO_LIBRESPOT_PATH;
+  if (override) return override;
   // src/music/spotify -> ../../../bin (one level deeper than youtube.ts).
   const binPath = join(__dirname, "..", "..", "..", "bin", "go-librespot");
   return pickGoLibrespotPath([binPath, "go-librespot"], existsSync);
@@ -78,12 +113,13 @@ export function findGoLibrespot(): string {
 
 /**
  * SYNCHRONOUS presence gate for go-librespot: supported platform (linux) AND
- * the resolved binary (project bin/ OR a PATH install) actually exists. This is
- * what chooseBackend()/isAvailable() must use — NOT existsSync(findGoLibrespot())
+ * the resolved binary (explicit override OR project bin/ OR a trusted PATH
+ * install — see resolveTrustedExecutable) actually exists. This is what
+ * chooseBackend()/isAvailable() must use — NOT existsSync(findGoLibrespot())
  * which cannot see a bare PATH name (Bug I3/m1).
  */
 export function isGoLibrespotPresent(): boolean {
-  return isGoLibrespotSupported() && resolveExecutable(findGoLibrespot()) !== null;
+  return isGoLibrespotSupported() && resolveTrustedExecutable(findGoLibrespot()) !== null;
 }
 
 // Injectable `--version` probe. Defaults to the real execFile call; tests
@@ -178,6 +214,9 @@ export function pickLibrespotPath(
  * fallback are used so a PATH-installed librespot.exe (scoop/choco) resolves.
  */
 export function findLibrespot(): string {
+  // P2-36: an explicit operator-configured path always wins.
+  const override = process.env.TSMB_LIBRESPOT_PATH;
+  if (override) return override;
   const exe = process.platform === "win32" ? "librespot.exe" : "librespot";
   // src/music/spotify -> ../../../bin (same depth as findGoLibrespot).
   const binExe = join(__dirname, "..", "..", "..", "bin", exe);
@@ -187,12 +226,13 @@ export function findLibrespot(): string {
 
 /**
  * SYNCHRONOUS presence gate for Rust librespot: supported everywhere AND the
- * resolved binary (project bin/ OR a scoop/choco/cargo PATH install) actually
- * exists. This is what chooseBackend()/isAvailable() must use — NOT
- * existsSync(findLibrespot()) which cannot see a bare PATH name (Bug I3/m1).
+ * resolved binary (explicit override OR project bin/ OR a trusted PATH install
+ * — see resolveTrustedExecutable) actually exists. This is what
+ * chooseBackend()/isAvailable() must use — NOT existsSync(findLibrespot())
+ * which cannot see a bare PATH name (Bug I3/m1).
  */
 export function isLibrespotPresent(): boolean {
-  return isRustLibrespotSupported() && resolveExecutable(findLibrespot()) !== null;
+  return isRustLibrespotSupported() && resolveTrustedExecutable(findLibrespot()) !== null;
 }
 
 // Injectable `--version` probe. Defaults to the real execFile call; tests

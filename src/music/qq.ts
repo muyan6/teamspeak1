@@ -41,6 +41,24 @@ const qqFavApi = axios.create({
   headers: { referer: "https://y.qq.com/" },
 });
 
+/** Join QQ singer names into "A / B", tolerating upstream shape changes.
+ *  `singer`/`singers` is normally an array, but a malformed or reshaped payload
+ *  can deliver an object (or a scalar). A bare `.map` on those would throw and —
+ *  because this runs inside the search mapping stage — turn an entire search
+ *  into a 500. Instead we coerce whatever we get into a flat name list. */
+function joinSingerNames(s: any): string {
+  const raw = s?.singer ?? s?.singers;
+  const list: any[] = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object"
+      ? Object.values(raw)
+      : [];
+  return list
+    .map((a: any) => (a && typeof a === "object" ? a.name ?? a.title ?? "" : a == null ? "" : String(a)))
+    .filter(Boolean)
+    .join(" / ");
+}
+
 export function mapQqSongs(raw: any[] | null | undefined): Song[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((s) => {
@@ -48,7 +66,7 @@ export function mapQqSongs(raw: any[] | null | undefined): Song[] {
     return {
       id: String(s.mid ?? s.songmid ?? s.songMID ?? s.id ?? s.songid ?? s.songId ?? ""),
       name: s.title ?? s.name ?? s.songname ?? "",
-      artist: (s.singer ?? s.singers ?? []).map((a: any) => a.name ?? a.title ?? "").filter(Boolean).join(" / "),
+      artist: joinSingerNames(s),
       album: s.album?.name ?? s.album?.title ?? s.albumname ?? "",
       duration: s.interval ?? Math.round((s.duration ?? 0) / 1000),
       coverUrl: albumMid
@@ -61,14 +79,23 @@ export function mapQqSongs(raw: any[] | null | undefined): Song[] {
 }
 
 /** 解析 QQ 试听标记 → 试听秒数；非试听（VIP/免费）返回 undefined。
- *  字段 isTryout===1 / tryout===true + tryBegin/tryEnd；容忍 begin/start 别名 + 毫秒兜底。 */
+ *  字段 isTryout===1 / tryout===true + tryBegin/tryEnd；容忍 begin/start 别名 + 毫秒兜底。
+ *
+ *  单位判定（P2-33）：旧的 `end > 1000` 启发式会把“长曲中段的试听”
+ *  （例如 tryBegin=0/tryEnd=1200 秒）误判成毫秒 → 时长被压成 1.2s，
+ *  播放器 nearEnd 立刻切歌。这里改用与起点无关的“片段长度”量级判断：
+ *  正常试听片段只有几十秒，一旦 span ≥ 1000 就只可能是毫秒；同时把上游
+ *  给出的整曲时长（秒）作为佐证——tryEnd 明显超过整曲时长时也判定为毫秒。 */
 export function parseQqTrial(playUrl: any): number | undefined {
   if (!playUrl || typeof playUrl !== "object") return undefined;
   if (playUrl.isTryout !== 1 && playUrl.tryout !== true) return undefined;
   const begin = Number(playUrl.tryBegin ?? playUrl.begin ?? playUrl.start ?? 0);
   const end = Number(playUrl.tryEnd ?? playUrl.end);
   if (!Number.isFinite(end) || end <= begin) return undefined;
-  const secs = end > 1000 ? (end - begin) / 1000 : end - begin;
+  const span = end - begin;
+  const totalSecs = Number(playUrl.duration ?? playUrl.interval ?? 0);
+  const isMs = span >= 1000 || (Number.isFinite(totalSecs) && totalSecs > 0 && end > totalSecs + 1);
+  const secs = isMs ? span / 1000 : span;
   return Math.round(secs);
 }
 
@@ -177,6 +204,20 @@ export class QQMusicProvider implements MusicProvider {
       baseURL: baseUrl,
       timeout: 10000,
     });
+    // P2-30：登录 cookie 不再作为查询参数明文外发（URL 会进入访问日志、也会被
+    // 绑定同一 127.0.0.1 端口的任意本机进程读取）。改由请求头 `Cookie` 携带；
+    // qq-music-api 侧车在 fallbackMode（默认开启）下会读取 `headers.cookie`。
+    // 拦截器每次请求读取最新 cookie，因此 setCookie / 登录刷新后立即生效。
+    // 用可选链是为了兼容单测里替换成不含 interceptors 的假 api 对象。
+    this.api.interceptors?.request?.use?.((config) => {
+      if (this.cookie) {
+        const headers = (config.headers ?? {}) as Record<string, unknown> & { set?: (k: string, v: string) => void };
+        if (typeof headers.set === "function") headers.set("Cookie", this.cookie);
+        else headers.Cookie = this.cookie;
+        config.headers = headers as typeof config.headers;
+      }
+      return config;
+    });
   }
 
   setQuality(quality: string): void {
@@ -187,10 +228,6 @@ export class QQMusicProvider implements MusicProvider {
 
   getQuality(): string {
     return this.quality;
-  }
-
-  private get cookieParams(): Record<string, string> {
-    return this.cookie ? { cookie: this.cookie } : {};
   }
 
   private get directCookieHeaders(): Record<string, string> {
@@ -221,12 +258,23 @@ export class QQMusicProvider implements MusicProvider {
     // Primary: u.y.qq.com/cgi-bin/musicu.fcg — supports songs + albums +
     // playlists. Fixed per https://github.com/ZHANGTIANYAO1/teamspeak-music-bot/issues/61
     // (removed searchid, num_per_page >= 10, corrected search_type values).
-    const primary = await this.searchViaMusicuFcg(query, limit, offset, type);
-    if (primary) return primary;
+    try {
+      const primary = await this.searchViaMusicuFcg(query, limit, offset, type);
+      if (primary) return primary;
 
-    // Fallback: c.y.qq.com/soso/fcgi-bin/client_search_cp (song + album,
-    // no playlist support). Kept as redundancy.
-    return this.searchViaClientSearchCp(query, limit, offset);
+      // Fallback: c.y.qq.com/soso/fcgi-bin/client_search_cp (song + album,
+      // no playlist support). Kept as redundancy.
+      return await this.searchViaClientSearchCp(query, limit, offset);
+    } catch (err) {
+      // P2-32：上游结构变更（例如 singer 由数组变对象）会让映射阶段抛错。与其它
+      // provider 一致，这里降级为空结果 + error，而不是把整个搜索请求变成 500。
+      return {
+        songs: [],
+        playlists: [],
+        albums: [],
+        error: { message: err instanceof Error ? err.message : "QQ search failed" },
+      };
+    }
   }
 
   /** Primary search via u.y.qq.com/cgi-bin/musicu.fcg.
@@ -349,23 +397,25 @@ export class QQMusicProvider implements MusicProvider {
   }
 
   async getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null> {
+    // P2-27：首次请求无论是“抛异常”还是“HTTP 200 但没有 url”，都要再用 songid
+    // 参数重试一次。旧代码只在抛异常时回退，会漏掉“200 但 url 为空”的可播歌曲。
+    const viaMid = await this.fetchPlayUrl({ songmid: songId, quality: quality ?? this.quality });
+    if (viaMid) return viaMid;
+    return this.fetchPlayUrl({ songid: songId, quality: quality ?? this.quality });
+  }
+
+  /** 单次 /getMusicPlay 探测（cookie 由请求拦截器以请求头携带）。失败或无 url
+   *  时返回 null，不抛异常，交由 getSongUrl 决定是否换参数重试。 */
+  private async fetchPlayUrl(
+    params: Record<string, string | number>
+  ): Promise<SongUrlResult | null> {
     try {
-      const res = await this.api.get("/getMusicPlay", {
-        params: { songmid: songId, quality: quality ?? this.quality, ...this.cookieParams },
-      });
-      const playUrl = res.data?.data?.playUrl?.[songId];
+      const res = await this.api.get("/getMusicPlay", { params });
+      const key = params.songmid ?? params.songid;
+      const playUrl = res.data?.data?.playUrl?.[key];
       if (playUrl?.url) return { url: playUrl.url, trialDuration: parseQqTrial(playUrl) };
     } catch {
-      // try with songid
-      try {
-        const res = await this.api.get("/getMusicPlay", {
-          params: { songid: songId, quality: quality ?? this.quality, ...this.cookieParams },
-        });
-        const playUrl = res.data?.data?.playUrl?.[songId];
-        if (playUrl?.url) return { url: playUrl.url, trialDuration: parseQqTrial(playUrl) };
-      } catch {
-        // ignore
-      }
+      // network / upstream error — caller decides whether to retry
     }
     return null;
   }
@@ -384,8 +434,14 @@ export class QQMusicProvider implements MusicProvider {
    * Returns:
    *   - non-null Set: authoritative result. Empty Set means all songs are
    *     unplayable; non-empty means filter to those mids.
-   *   - null: every chunk failed. Caller should fall back to sequential
+   *   - null: EVERY chunk failed. Caller should fall back to sequential
    *     retry rather than treating as "all unplayable".
+   *
+   * NOTE (P2-26): a single failed chunk does NOT trigger the caller's
+   * sequential retry. The old code returned null on ANY chunk failure
+   * (`someChunkFailed`), which turned a transient error on one of five chunks
+   * into a full per-song probing pass (tens of seconds) for the whole
+   * playlist. The contract is, and now is, "only when every chunk failed".
    */
   async getPlayableSongIds(songIds: string[]): Promise<Set<string> | null> {
     if (songIds.length === 0) return new Set();
@@ -395,8 +451,7 @@ export class QQMusicProvider implements MusicProvider {
     // strictly one after another: a 500-track playlist spent 5 × ~2-3s of dead
     // time (~10-15s) before playback could start. Run a few at a time instead.
     // 3 keeps the burst modest for the sidecar while cutting the wall time to
-    // roughly a third. Chunk-level failures keep their existing semantics
-    // (skip that chunk; only "every chunk failed" reports null).
+    // roughly a third.
     const CONCURRENCY = 3;
     const slices: string[][] = [];
     for (let i = 0; i < songIds.length; i += CHUNK) {
@@ -404,8 +459,10 @@ export class QQMusicProvider implements MusicProvider {
     }
 
     const playable = new Set<string>();
+    // Only flips to false once ANY chunk yields a usable response. Chunks that
+    // throw or return no playUrl map simply don't contribute — they don't
+    // poison the rest of the batch.
     let allChunksFailed = true;
-    let someChunkFailed = false;
     // Shared cursor: JS is single-threaded and there is no await between reading
     // and incrementing `next`, so workers never claim the same slice.
     let next = 0;
@@ -414,17 +471,16 @@ export class QQMusicProvider implements MusicProvider {
         const slice = slices[next++];
         try {
           const res = await this.api.get("/getMusicPlay", {
-            params: { songmid: slice.join(","), quality: this.quality, ...this.cookieParams },
+            params: { songmid: slice.join(","), quality: this.quality },
           });
           const playUrlMap: Record<string, { url?: string }> | undefined =
             res.data?.data?.playUrl;
-          if (!playUrlMap) { someChunkFailed = true; continue; }
+          if (!playUrlMap) continue;
           allChunksFailed = false;
           for (const [mid, info] of Object.entries(playUrlMap)) {
             if (info?.url) playable.add(mid);
           }
         } catch {
-          someChunkFailed = true;
           // chunk-level failure — keep going so a transient error on one
           // chunk doesn't poison the whole batch.
         }
@@ -433,7 +489,7 @@ export class QQMusicProvider implements MusicProvider {
     await Promise.all(
       Array.from({ length: Math.min(CONCURRENCY, slices.length) }, () => worker()),
     );
-    return allChunksFailed || someChunkFailed ? null : playable;
+    return allChunksFailed ? null : playable;
   }
 
   async getSongDetail(songId: string): Promise<Song | null> {
@@ -445,7 +501,7 @@ export class QQMusicProvider implements MusicProvider {
     // stub is sufficient to let /play-by-id and /add-by-id flows succeed.
     try {
       const res = await this.api.get("/getSongInfo", {
-        params: { songmid: songId, ...this.cookieParams },
+        params: { songmid: songId },
       });
       const s = res.data?.response?.data;
       if (s && s.track_info) {
@@ -453,7 +509,7 @@ export class QQMusicProvider implements MusicProvider {
         return {
           id: String(t.mid ?? t.id),
           name: t.name ?? "",
-          artist: (t.singer ?? []).map((a: any) => a.name).join(" / "),
+          artist: joinSingerNames(t),
           album: t.album?.name ?? "",
           duration: t.interval ?? 0,
           coverUrl: t.album?.mid
@@ -512,7 +568,7 @@ export class QQMusicProvider implements MusicProvider {
       return {
         id: String(t.mid ?? t.id ?? songId),
         name: t.name ?? t.title ?? "",
-        artist: (t.singer ?? []).map((a: any) => a.name ?? a.title ?? "").filter(Boolean).join(" / "),
+        artist: joinSingerNames(t),
         album: t.album?.name ?? t.album?.title ?? "",
         duration: t.interval ?? 0,
         coverUrl: albumMid
@@ -527,7 +583,7 @@ export class QQMusicProvider implements MusicProvider {
 
   async getPlaylistSongs(playlistId: string): Promise<Song[]> {
     const res = await this.api.get("/getSongListDetail", {
-      params: { disstid: playlistId, ...this.cookieParams },
+      params: { disstid: playlistId },
     });
     const cdlist = res.data?.response?.cdlist ?? [];
     if (cdlist.length === 0) return [];
@@ -536,7 +592,7 @@ export class QQMusicProvider implements MusicProvider {
 
   async getPlaylistDetail(playlistId: string): Promise<PlaylistDetail | null> {
     const res = await this.api.get("/getSongListDetail", {
-      params: { disstid: playlistId, ...this.cookieParams },
+      params: { disstid: playlistId },
     });
     const cd = res.data?.response?.cdlist?.[0];
     if (!cd) return null;
@@ -551,7 +607,7 @@ export class QQMusicProvider implements MusicProvider {
 
   async getRecommendPlaylists(): Promise<Playlist[]> {
     const res = await this.api.get("/getSongLists", {
-      params: { categoryId: 10000000, pageSize: 10, ...this.cookieParams },
+      params: { categoryId: 10000000, pageSize: 10 },
     });
     return (res.data?.response?.data?.list ?? []).map((p: any) => ({
       id: String(p.dissid),
@@ -564,14 +620,14 @@ export class QQMusicProvider implements MusicProvider {
 
   async getAlbumSongs(albumId: string): Promise<Song[]> {
     const res = await this.api.get("/getAlbumInfo", {
-      params: { albummid: albumId, ...this.cookieParams },
+      params: { albummid: albumId },
     });
     return mapQqSongs(res.data?.response?.data?.list ?? []);
   }
 
   async getLyrics(songId: string): Promise<LyricLine[]> {
     const res = await this.api.get("/getLyric", {
-      params: { songmid: songId, ...this.cookieParams },
+      params: { songmid: songId },
     });
     return parseLyrics(
       res.data?.response?.lyric ?? res.data?.lyric ?? "",
@@ -737,7 +793,7 @@ export class QQMusicProvider implements MusicProvider {
     if (uin) {
       try {
         const res = await this.api.get("/user/getUserPlaylists", {
-          params: { uin, ...this.cookieParams },
+          params: { uin },
         });
         if (res.data?.response?.code === 0) {
           const setCookieHeader = res.headers?.["set-cookie"];
@@ -787,7 +843,7 @@ export class QQMusicProvider implements MusicProvider {
     if (!uin) return { loggedIn: false };
     try {
       const res = await this.api.get("/user/getUserPlaylists", {
-        params: { uin, ...this.cookieParams },
+        params: { uin },
       });
       if (res.data?.response?.code !== 0) return { loggedIn: false };
       return {
@@ -805,13 +861,13 @@ export class QQMusicProvider implements MusicProvider {
     // as the closest analogue. Returns ~20 newly-released songs.
     try {
       const res = await this.api.get("/getNewSongs", {
-        params: { ...this.cookieParams },
+        params: {},
       });
       const list: any[] = res.data?.response?.new_song?.data?.songlist ?? [];
       return list.map((s: any) => ({
         id: String(s.mid ?? s.id),
         name: s.title ?? s.name ?? "",
-        artist: (s.singer ?? []).map((a: any) => a.name).join(" / "),
+        artist: joinSingerNames(s),
         album: s.album?.name ?? s.album?.title ?? "",
         duration: s.interval ?? 0,
         coverUrl: s.album?.mid
@@ -903,7 +959,7 @@ export class QQMusicProvider implements MusicProvider {
   private async fetchCreatedPlaylists(uin: string): Promise<Playlist[]> {
     try {
       const res = await this.api.get("/user/getUserPlaylists", {
-        params: { uin, ...this.cookieParams },
+        params: { uin },
       });
       if (res.data?.response?.code !== 0) return [];
       return (res.data?.response?.data?.playlists ?? []).map((p: any) => {

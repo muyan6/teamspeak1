@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import net from "node:net";
 import { createApiServerManager, describeQqApiStartupError } from "./api-server.js";
 import type { Logger } from "../logger.js";
 
@@ -131,3 +132,61 @@ describe("createApiServerManager — QQ sidecar port binding", () => {
     }
   });
 });
+
+describe("createApiServerManager — foreign port reuse (P2-30)", () => {
+  const makeLogger = () => {
+    const warnings: any[] = [];
+    const errors: any[] = [];
+    const logger = {
+      info() {},
+      warn(_o: any, msg: string) { warnings.push(msg); },
+      error(_o: any, msg: string) { errors.push(msg); },
+      debug() {},
+      trace() {},
+      fatal() {},
+    } as unknown as Logger;
+    return { logger, warnings, errors };
+  };
+
+  async function occupyPort(): Promise<{ port: number; close: () => Promise<void> }> {
+    const server = net.createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address() as net.AddressInfo;
+    return { port: addr.port, close: () => new Promise<void>((r) => server.close(() => r())) };
+  }
+
+  it("refuses to reuse an occupied NetEase port it did not bind", async () => {
+    const { port, close } = await occupyPort();
+    const { logger, errors, warnings } = makeLogger();
+    const manager = createApiServerManager(
+      { neteasePort: port, qqMusicPort: 0, neteaseEnabled: true, qqEnabled: false },
+      logger
+    );
+    try {
+      await manager.start();
+      expect(errors.join("\n")).toMatch(/refusing to reuse/);
+      expect(warnings.join("\n")).not.toMatch(/reusing the external instance/);
+    } finally {
+      await manager.stop();
+      await close();
+    }
+  });
+
+  it("reuses an occupied port only when allowExternalApi is explicitly enabled", async () => {
+    const { port, close } = await occupyPort();
+    const { logger, warnings, errors } = makeLogger();
+    const manager = createApiServerManager(
+      { neteasePort: port, qqMusicPort: 0, neteaseEnabled: true, qqEnabled: false, allowExternalApi: true },
+      logger
+    );
+    try {
+      await manager.start();
+      expect(warnings.join("\n")).toMatch(/reusing the external instance/);
+      expect(errors.join("\n")).not.toMatch(/refusing to reuse/);
+    } finally {
+      await manager.stop();
+      await close();
+    }
+  });
+});
+

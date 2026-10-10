@@ -15,6 +15,7 @@ import type {
   PlaylistDetail,
   QrCodeResult,
   SearchResult,
+  SearchType,
   Song,
   SongUrlResult,
 } from "./provider.js";
@@ -97,12 +98,79 @@ export interface LocalMusicProviderOptions {
   maxTotalBytes?: number;
 }
 
+/**
+ * Who is asking the local library for something.
+ *
+ * Uploads are stamped with the uploader's user id. Before this existed, the
+ * library was a single shared namespace: any authenticated member (or guest
+ * with `addToQueue`) could enumerate, search, resolve and therefore play every
+ * other tenant's upload. Callers on a request path must pass a viewer;
+ * internal callers (the bot resolving a song that is already in its own queue)
+ * may omit it, which means "no filtering".
+ */
+export interface LocalLibraryViewer {
+  /** Requester's user id. Empty string when unknown. */
+  userId: string;
+  /** Admin / unrestricted: skip the ownership filter entirely. */
+  unrestricted: boolean;
+}
+
+/**
+ * Viewer for an authenticated HTTP request.
+ *
+ * Records written before ownership existed have no `ownerId` and remain visible
+ * to everyone, so an upgrade never silently hides an existing library. Only
+ * admins are unrestricted — a member sees their own uploads plus those legacy
+ * public ones.
+ */
+export function localViewerFor(user?: { id?: string; role?: string }): LocalLibraryViewer {
+  return { userId: user?.id ?? "", unrestricted: user?.role === "admin" };
+}
+
+/**
+ * Search a provider on behalf of `viewer`.
+ *
+ * Only the local library is viewer-scoped (every other source is a public
+ * catalogue). The `instanceof` guard keeps injected test doubles — which are
+ * not `LocalMusicProvider` instances — behaving exactly as before.
+ */
+export function scopedSearch(
+  provider: MusicProvider,
+  viewer: LocalLibraryViewer,
+  query: string,
+  limit: number,
+  offset: number,
+  type?: SearchType,
+): Promise<SearchResult> {
+  if (provider instanceof LocalMusicProvider) return provider.search(query, limit, offset, type, viewer);
+  return provider.search(query, limit, offset, type);
+}
+
+/**
+ * Resolve a song id on behalf of `viewer`. A local record the viewer does not
+ * own resolves to null, which the routes already surface as 404 — so an id
+ * harvested from elsewhere cannot be used to queue someone else's upload.
+ */
+export function scopedSongDetail(
+  provider: MusicProvider,
+  viewer: LocalLibraryViewer,
+  songId: string,
+): Promise<Song | null> {
+  if (provider instanceof LocalMusicProvider) return provider.getSongDetail(songId, viewer);
+  return provider.getSongDetail(songId);
+}
+
 interface LocalSongRecord extends Song {
   filePath: string;
   originalName: string;
   uploadedAt: string;
   size: number;
   mimeType: string;
+  /**
+   * userId that uploaded this file. Absent on records indexed before ownership
+   * was introduced — those are treated as public (see isVisibleTo).
+   */
+  ownerId?: string;
 }
 
 function safeFileName(name: string): string {
@@ -424,13 +492,13 @@ export class LocalMusicProvider implements MusicProvider {
     }
   }
 
-  async uploadAudio(input: { buffer: Buffer; originalName: string; mimeType?: string }): Promise<Song> {
+  async uploadAudio(input: { buffer: Buffer; originalName: string; mimeType?: string; ownerId?: string }): Promise<Song> {
     if (!input.buffer?.length) throw new Error('上传文件为空');
     return this.uploadStream({ ...input, stream: Readable.from([input.buffer]) });
   }
 
   /** Bounded, backpressured ingestion; reservations cover all concurrent uploads. */
-  async uploadStream(input: { stream: AsyncIterable<Uint8Array>; originalName: string; mimeType?: string; signal?: AbortSignal }): Promise<Song> {
+  async uploadStream(input: { stream: AsyncIterable<Uint8Array>; originalName: string; mimeType?: string; signal?: AbortSignal; ownerId?: string }): Promise<Song> {
     const originalName = safeFileName(input.originalName || "audio");
     const ext = path.extname(originalName).toLowerCase();
     // Validate by the (sanitised) file extension only — never trust the
@@ -537,6 +605,7 @@ export class LocalMusicProvider implements MusicProvider {
         uploadedAt: new Date().toISOString(),
         size,
         mimeType: input.mimeType || "application/octet-stream",
+        ownerId: input.ownerId,
       };
 
       await this.withIndexLock(() => {
@@ -577,32 +646,52 @@ export class LocalMusicProvider implements MusicProvider {
   }
 
   private toSong(record: LocalSongRecord): Song {
-    const { filePath: _filePath, originalName: _originalName, uploadedAt: _uploadedAt, size: _size, mimeType: _mimeType, ...song } = record;
+    const { filePath: _filePath, originalName: _originalName, uploadedAt: _uploadedAt, size: _size, mimeType: _mimeType, ownerId: _ownerId, ...song } = record;
     return song;
   }
 
-  async search(query: string, limit = 20, offset = 0): Promise<SearchResult> {
+  /**
+   * Ownership gate. No viewer means an internal caller (playback resolving a
+   * song already sitting in a queue) and is trusted. A viewer sees their own
+   * uploads plus any record predating ownership, whose owner is unknown and
+   * which is therefore kept public rather than hidden.
+   */
+  private isVisibleTo(record: LocalSongRecord, viewer?: LocalLibraryViewer): boolean {
+    if (!viewer || viewer.unrestricted) return true;
+    if (!record.ownerId) return true;
+    return record.ownerId === viewer.userId;
+  }
+
+  /**
+   * `viewer` (5th arg, after the MusicProvider signature) restricts the result
+   * to what the requester may see. HTTP routes MUST pass it; omitting it means
+   * "unfiltered" and is only correct for internal callers.
+   */
+  async search(query: string, limit = 20, offset = 0, _type?: SearchType, viewer?: LocalLibraryViewer): Promise<SearchResult> {
     const q = query.trim().toLowerCase();
     const songs = this.records
+      .filter((r) => this.isVisibleTo(r, viewer))
       .filter((r) => this.fileExists(r))
       .filter((r) => !q || this.searchTextById.get(r.id)?.includes(q))
-      .slice(offset, offset + limit)
+      .slice(Math.max(0, offset), Math.max(0, offset) + limit)
       .map((r) => this.toSong(r));
     return { songs, playlists: [], albums: [] };
   }
 
-  async getSongUrl(songId: string): Promise<SongUrlResult | null> {
+  async getSongUrl(songId: string, _quality?: string, viewer?: LocalLibraryViewer): Promise<SongUrlResult | null> {
     const record = this.records.find((r) => r.id === songId);
-    if (!record || !this.fileExists(record)) return null;
+    if (!record || !this.isVisibleTo(record, viewer) || !this.fileExists(record)) return null;
     // A song that is actually resolved for playback becomes eligible for
     // cleanup once it is no longer referenced by any queue.
     this.playedIds.add(songId);
     return { url: record.filePath };
   }
 
-  async getSongDetail(songId: string): Promise<Song | null> {
+  async getSongDetail(songId: string, viewer?: LocalLibraryViewer): Promise<Song | null> {
     const record = this.records.find((r) => r.id === songId);
-    return record && this.fileExists(record) ? this.toSong(record) : null;
+    return record && this.isVisibleTo(record, viewer) && this.fileExists(record)
+      ? this.toSong(record)
+      : null;
   }
 
   /**

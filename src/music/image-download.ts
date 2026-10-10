@@ -14,10 +14,22 @@ export function isPublicAddress(address: string): boolean {
       (x === 203 && y === 0 && z === 113));
   }
   if (isIP(a) === 6) {
-    // Only global unicast 2000::/3. This also excludes all IPv4-mapped,
-    // loopback, unspecified, link-local, ULA and multicast representations.
-    const first = parseInt(a.split(':')[0], 16);
-    return first >= 0x2000 && first <= 0x3fff && !a.startsWith('2001:db8:') && !a.startsWith('2002:');
+    // Global unicast is 2000::/3 (first 16-bit group 0x2000–0x3fff), but that
+    // range also contains several special-purpose / reserved blocks. The old
+    // check only excluded 2001:db8::/32 and 2002::/16; add Teredo and the
+    // 3fff::/20 documentation block (P2-31). Everything that is NOT 2000::/3
+    // (::, ::1, ::ffff:IPv4-mapped, fc00::/7 ULA, fe80::/10 link-local,
+    // ff00::/8 multicast) is already rejected by the range test.
+    const [firstHex, secondHex = "0"] = a.split(":");
+    const first = parseInt(firstHex, 16);
+    const second = parseInt(secondHex, 16);
+    if (!Number.isFinite(first) || !Number.isFinite(second)) return false;
+    if (first < 0x2000 || first > 0x3fff) return false;              // must be in 2000::/3
+    if (first === 0x2001 && second === 0x0db8) return false;         // 2001:db8::/32 documentation
+    if (first === 0x2001 && second === 0x0000) return false;         // 2001::/32 Teredo
+    if (first === 0x2002) return false;                              // 2002::/16 6to4
+    if (first === 0x3fff && second <= 0x0fff) return false;          // 3fff::/20 documentation
+    return true;
   }
   return false;
 }

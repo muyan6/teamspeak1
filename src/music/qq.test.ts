@@ -71,6 +71,20 @@ describe("QQ adapter", () => {
     expect(parseQqTrial({ isTryout: 1, tryEnd: 0 })).toBeUndefined();
   });
 
+  it("parseQqTrial does not mis-detect a deep clip in a long track as ms (P2-33)", () => {
+    // start=1200s / end=1230s: 旧启发式 (end>1000) 会当成毫秒→0.03→0 秒。
+    expect(parseQqTrial({ isTryout: 1, tryBegin: 1200, tryEnd: 1230 })).toBe(30);
+    // 单位仍为秒的普通片段
+    expect(parseQqTrial({ isTryout: 1, tryBegin: 0, tryEnd: 60 })).toBe(60);
+  });
+
+  it("mapQqSongs tolerates singer being an object instead of an array (P2-32)", () => {
+    const out = mapQqSongs([
+      { mid: "m1", name: "n", singer: { name: "Solo" } },
+    ] as any);
+    expect(out[0].artist).toBe("Solo");
+  });
+
   it("mapQqAlbums maps albumMID-style raw entries", () => {
     const raw = [
       {
@@ -327,6 +341,92 @@ describe("QQMusicProvider.refreshSession & keepAlive", () => {
     p.stopKeepAlive();
     // Verify calling stopKeepAlive repeatedly is safe
     expect(() => p.stopKeepAlive()).not.toThrow();
+  });
+});
+
+describe("QQMusicProvider.getSongUrl fallback (P2-27)", () => {
+  beforeEach(() => {
+    mockGet.mockReset();
+    mockPost.mockReset();
+  });
+
+  it("retries with songid when the songmid call is 200 but has no url", async () => {
+    mockGet.mockImplementation(async (_url: string, opts: any) => {
+      if (opts.params.songmid) return { data: { data: { playUrl: { s1: {} } } } };
+      if (opts.params.songid) return { data: { data: { playUrl: { s1: { url: "u:via-songid" } } } } };
+      return { data: {} };
+    });
+    const p = new QQMusicProvider("http://x");
+    expect(await p.getSongUrl("s1")).toEqual({ url: "u:via-songid", trialDuration: undefined });
+  });
+
+  it("uses the songmid result directly when a url is present", async () => {
+    mockGet.mockImplementation(async (_url: string, opts: any) => {
+      if (opts.params.songmid) return { data: { data: { playUrl: { s1: { url: "u:via-songmid" } } } } };
+      return { data: {} };
+    });
+    const p = new QQMusicProvider("http://x");
+    expect(await p.getSongUrl("s1")).toEqual({ url: "u:via-songmid", trialDuration: undefined });
+  });
+});
+
+describe("QQMusicProvider.getPlayableSongIds chunk semantics (P2-26)", () => {
+  beforeEach(() => {
+    mockGet.mockReset();
+    mockPost.mockReset();
+  });
+
+  const ids = (n: number, prefix = "m") => Array.from({ length: n }, (_, i) => `${prefix}${i}`);
+
+  it("returns a Set (not null) when only SOME chunks fail", async () => {
+    // 101 ids → 两个 chunk：[m0..m99] 与 [last]。第二个 chunk 失败。
+    mockGet.mockImplementation(async (_url: string, opts: any) => {
+      if (opts.params.songmid === "last") throw new Error("transient");
+      return { data: { data: { playUrl: { first: { url: "u:first" } } } } };
+    });
+    const p = new QQMusicProvider("http://x");
+    const res = await p.getPlayableSongIds(["first", ...ids(99), "last"]);
+    // 只有“所有 chunk 都失败”才回退为 null（旧行为：任一失败即 null）。
+    expect(res).toEqual(new Set(["first"]));
+  });
+
+  it("returns null only when EVERY chunk fails", async () => {
+    mockGet.mockRejectedValue(new Error("down"));
+    const p = new QQMusicProvider("http://x");
+    expect(await p.getPlayableSongIds(ids(101))).toBeNull();
+  });
+
+  it("treats a chunk with no playUrl map as a failure without poisoning others", async () => {
+    mockGet.mockImplementation(async (_url: string, opts: any) => {
+      if (opts.params.songmid.includes("m0")) return { data: { data: {} } }; // no playUrl map
+      return { data: { data: { playUrl: { later: { url: "u:later" } } } } };
+    });
+    const p = new QQMusicProvider("http://x");
+    const res = await p.getPlayableSongIds([...ids(100), "later"]);
+    expect(res).toEqual(new Set(["later"]));
+  });
+});
+
+describe("QQMusicProvider.search degradation (P2-32)", () => {
+  beforeEach(() => {
+    mockGet.mockReset();
+    mockPost.mockReset();
+  });
+
+  it("returns empty + error when the mapping stage throws", async () => {
+    const evil = [{ mid: "m", name: "n", singer: [{ get name(): string { throw new Error("boom"); } }] }];
+    mockGet.mockImplementation(async (url: string) => {
+      if (url === "/cgi-bin/musicu.fcg") {
+        // primary returns nothing → search() falls back to client_search_cp
+        return { data: { req_0: { data: { body: { song: { list: [] } } } } } };
+      }
+      // fallback path maps this song list → throws in the mapping stage
+      return { data: { data: { song: { list: evil }, album: { list: [] } } } };
+    });
+    const p = new QQMusicProvider("http://x");
+    const res = await p.search("q");
+    expect(res.songs).toEqual([]);
+    expect(res.error?.message).toBe("boom");
   });
 });
 
