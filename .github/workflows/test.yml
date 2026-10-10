@@ -1,7 +1,18 @@
 name: Test and build
 on:
   workflow_call:
+  # Pushes to main/master and tag pushes are ALREADY covered: docker.yml runs on
+  # them and pulls this workflow in through `workflow_call` for its `verify` job.
+  # Without the branches-ignore below, every push to main matched this trigger
+  # AND docker.yml's workflow_call, so the whole 6-cell matrix (and its
+  # `npm run build`) ran twice per push.
+  #
+  # Note: because only `branches-ignore` is declared, tag pushes no longer
+  # trigger this workflow directly — intentional, they go through docker.yml.
   push:
+    branches-ignore:
+      - main
+      - master
   pull_request:
 jobs:
   test:
