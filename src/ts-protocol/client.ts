@@ -645,7 +645,9 @@ export class TS3Client extends EventEmitter {
           this.currentChannelId = channel.id;
           return;
         }
-        this.logger.error({ err, channelName }, "Failed to join channel");
+        // Do NOT log here: the outer catch below is the single place that
+        // reports a failed join. Logging in both places emitted the exact same
+        // error twice, which read like two independent failures.
         throw err;
       }
     } catch (err) {

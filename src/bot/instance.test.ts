@@ -1563,12 +1563,21 @@ describe("BotInstance auto-return to default channel", () => {
   const handleOccupancy = (BotInstance.prototype as any).handleOccupancy;
   const cmdHome = (BotInstance.prototype as any).cmdHome;
 
-  function makeReturnCtx(opts: { inDefault: boolean; userCount?: number } = { inDefault: true }) {
+  function makeReturnCtx(
+    opts: { inDefault: boolean; userCount?: number; transportFails?: boolean } = { inDefault: true },
+  ) {
     let inDefault = opts.inDefault;
     const tsClient = {
       isInDefaultChannel: vi.fn(() => inDefault),
       getDefaultChannelIdentifier: vi.fn(() => "Music"),
       returnToDefaultChannel: vi.fn(async () => {
+        if (opts.transportFails) {
+          // Mirrors the real transport: joinChannel rethrows on a clientmove
+          // timeout / permission error (5e34c7f).
+          throw Object.assign(new Error("command timeout: clientmove clid=1 cid=1"), {
+            name: "CommandTimeoutError",
+          });
+        }
         inDefault = true;
         return true;
       }),
@@ -1589,6 +1598,8 @@ describe("BotInstance auto-return to default channel", () => {
       config: { autoPauseOnEmpty: true },
       logger: { info: vi.fn(), warn: vi.fn() },
       autoReturnTimer: null,
+      autoReturnFailures: 0,
+      autoReturnNotBefore: 0,
       autoPaused: false,
       _scheduleIdleCheck: vi.fn(),
       _cancelIdleTimer: vi.fn(),
@@ -1660,6 +1671,64 @@ describe("BotInstance auto-return to default channel", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Regression for the crash pattern reported for 5e34c7f: joinChannel started
+  // rethrowing on a clientmove timeout, and the auto-return path was a bare
+  // `void this.returnToDefaultChannel()`, so the rejection escaped as a
+  // process-level "Unhandled promise rejection" (logged at level 50).
+  it("resolves to false instead of rejecting when the transport fails", async () => {
+    const { ctx } = makeReturnCtx({ inDefault: false, transportFails: true });
+    // A rejection here would surface as an unhandled rejection and fail the run.
+    await expect(ctx.returnToDefaultChannel.call(ctx)).resolves.toBe(false);
+    expect(ctx.autoReturnFailures).toBe(1);
+    expect(ctx.autoReturnNotBefore).toBeGreaterThan(Date.now());
+    expect(ctx.logger.warn).toHaveBeenCalled();
+    expect(ctx.logger.info).not.toHaveBeenCalled();
+  });
+
+  it("auto-return via handleOccupancy never rejects when the transport fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx } = makeReturnCtx({ inDefault: false, transportFails: true });
+      handleOccupancy.call(ctx, 0);
+      // advanceTimersByTimeAsync also flushes the microtasks in which the
+      // rejected transport promise settles — an escaped rejection would be
+      // reported here as an unhandled error.
+      await vi.advanceTimersByTimeAsync(2500);
+      expect(ctx.autoReturnFailures).toBe(1);
+      expect(ctx.autoReturnNotBefore).toBeGreaterThan(Date.now());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips auto-return while a previous failure is backing off", () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx, tsClient } = makeReturnCtx({ inDefault: false });
+      ctx.autoReturnNotBefore = Date.now() + 10_000;
+      handleOccupancy.call(ctx, 0);
+      expect(ctx.autoReturnTimer).toBeNull();
+      vi.advanceTimersByTime(3000);
+      expect(tsClient.returnToDefaultChannel).not.toHaveBeenCalled();
+
+      // Once the cooldown expires a fresh attempt is scheduled again.
+      vi.advanceTimersByTime(8000);
+      handleOccupancy.call(ctx, 0);
+      expect(ctx.autoReturnTimer).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the backoff after a successful return", async () => {
+    const { ctx } = makeReturnCtx({ inDefault: false });
+    ctx.autoReturnFailures = 3;
+    ctx.autoReturnNotBefore = Date.now() + 30_000;
+    await expect(ctx.returnToDefaultChannel.call(ctx)).resolves.toBe(true);
+    expect(ctx.autoReturnFailures).toBe(0);
+    expect(ctx.autoReturnNotBefore).toBe(0);
   });
 });
 

@@ -235,6 +235,18 @@ export class BotInstance extends EventEmitter {
   /** Debounce handle for the live-queue snapshot writer (Feature 2, #119). */
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private autoReturnTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Consecutive failed auto-returns to the default channel, plus the epoch ms
+   * before which no NEW auto-return may be scheduled.
+   *
+   * A server that rejects `clientmove` (timeout, permissions, anti-flood)
+   * previously had the retry driven purely by the occupancy/push cadence, so a
+   * persistently failing move was re-issued every few seconds forever — each
+   * one an extra command against an already-angry server. Cooldown backs off
+   * 10s → 20s → 40s → 60s (cap) and any success resets it.
+   */
+  private autoReturnFailures = 0;
+  private autoReturnNotBefore = 0;
   private urlCache = new LRUCache<string, { url: string; trialDuration?: number }>({
     maxSize: 500,
     defaultTtlMs: 15 * 60 * 1000,
@@ -725,6 +737,10 @@ export class BotInstance extends EventEmitter {
     this.manualDisconnect = false;
     this._cancelReconnect();
     this.disconnectEmitted = false;
+    // A fresh handshake deserves a clean auto-return budget: the cooldown only
+    // exists to stop hammering a server that is actively rejecting clientmove.
+    this.autoReturnFailures = 0;
+    this.autoReturnNotBefore = 0;
     await this.tsClient.connect();
     if (this.canRun?.() === false) {
       this.disconnect();
@@ -778,6 +794,8 @@ export class BotInstance extends EventEmitter {
       clearTimeout(this.autoReturnTimer);
       this.autoReturnTimer = null;
     }
+    this.autoReturnFailures = 0;
+    this.autoReturnNotBefore = 0;
     this.voiceDucking.reset(true);
     // Cancel any pending live-queue snapshot before clearing so it can't fire
     // afterwards and persist an empty queue over the state we keep for restore
@@ -887,26 +905,76 @@ export class BotInstance extends EventEmitter {
       this.autoReturnTimer = null;
     }
     if (!this.tsClient || this.tsClient.isInDefaultChannel()) return false;
-    const ok = await this.tsClient.returnToDefaultChannel();
+    // This method is called fire-and-forget from the occupancy path, so it
+    // must never reject: the transport already logs the underlying failure
+    // (e.g. a clientmove timeout), and letting it escape here is what turned
+    // a failed auto-return into a process-level "Unhandled promise rejection".
+    let ok = false;
+    let failure: unknown = null;
+    try {
+      ok = await this.tsClient.returnToDefaultChannel();
+    } catch (err) {
+      failure = err;
+    }
     if (ok) {
+      this.autoReturnFailures = 0;
+      this.autoReturnNotBefore = 0;
       this.logger.info({ botId: this.id }, "Returned to default channel");
       void this.refreshOccupancy();
+    } else {
+      this.autoReturnFailures = (this.autoReturnFailures ?? 0) + 1;
+      const cooldownMs = Math.min(
+        60_000,
+        10_000 * Math.pow(2, Math.min(3, this.autoReturnFailures - 1)),
+      );
+      this.autoReturnNotBefore = Date.now() + cooldownMs;
+      this.logger.warn(
+        {
+          ...(failure ? { err: failure } : {}),
+          botId: this.id,
+          consecutiveFailures: this.autoReturnFailures,
+          cooldownMs,
+        },
+        "Auto-return to default channel failed (backing off)",
+      );
     }
     return ok;
   }
 
+  /**
+   * Occupancy fan-out: idle-disconnect, auto-return to the default channel,
+   * and auto-pause/resume. The auto-return is fire-and-forget by design, so it
+   * carries its own `.catch` on top of returnToDefaultChannel's try/catch — a
+   * failed move must never surface as a process-level unhandled rejection.
+   */
   private handleOccupancy(userCount: number): void {
     // idle-disconnect (unchanged behavior)
     if (userCount <= 0) this._scheduleIdleCheck();
     else this._cancelIdleTimer();
 
-    // Auto-return to default channel if room is empty and bot is in a temporary room
-    if (userCount <= 0 && this.tsClient && !this.tsClient.isInDefaultChannel()) {
+    // Auto-return to default channel if room is empty and bot is in a temporary room.
+    // Skipped while a previous failure is backing off, so a server that keeps
+    // rejecting clientmove is not hammered at the occupancy cadence.
+    const autoReturnAllowed = Date.now() >= (this.autoReturnNotBefore ?? 0);
+    if (
+      userCount <= 0 &&
+      autoReturnAllowed &&
+      this.tsClient &&
+      !this.tsClient.isInDefaultChannel()
+    ) {
       if (!this.autoReturnTimer) {
         this.autoReturnTimer = setTimeout(() => {
           this.autoReturnTimer = null;
-          if (this.tsClient && !this.tsClient.isInDefaultChannel()) {
-            void this.returnToDefaultChannel();
+          // Re-check both the channel and the cooldown: the debounce window is
+          // long enough for the bot to have been moved (or to have backed off).
+          if (
+            this.tsClient &&
+            !this.tsClient.isInDefaultChannel() &&
+            Date.now() >= (this.autoReturnNotBefore ?? 0)
+          ) {
+            void this.returnToDefaultChannel().catch((err) => {
+              this.logger.warn({ err, botId: this.id }, "Auto-return to default channel failed");
+            });
           }
         }, 2000);
       }
