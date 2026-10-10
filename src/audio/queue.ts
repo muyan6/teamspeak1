@@ -312,6 +312,13 @@ export class PlayQueue {
         this.playedIndices.add(nextIndex);
         return this.songs[nextIndex];
       }
+      default: {
+        // Only reachable if `mode` holds a value outside the enum (restore()
+        // now validates it, but the field is not otherwise protected). Returning
+        // null keeps the declared `QueuedSong | null` contract; returning
+        // `undefined` made callers treat it as "end of queue".
+        return null;
+      }
     }
   }
 
@@ -471,7 +478,11 @@ export class PlayQueue {
    */
   restore(s: QueueSnapshot): void {
     this.songs = s.songs.slice(0, MAX_QUEUE_SONGS).map((song) => ({ ...song }));
-    this.mode = s.mode;
+    // Validate rather than trust: a snapshot written by an older build (or a
+    // hand-edited config) can carry an unknown mode, and `next()`'s switch has
+    // no branch for it — the old code silently returned `undefined`, which the
+    // caller reads as "end of queue" and stops playback for no visible reason.
+    this.mode = parsePlayMode(s.mode) ?? PlayMode.Sequential;
     this.currentIndex =
       s.currentIndex >= 0 && s.currentIndex < this.songs.length ? s.currentIndex : -1;
     this.playedIndices = new Set(this.currentIndex >= 0 ? [this.currentIndex] : []);

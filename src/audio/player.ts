@@ -92,6 +92,13 @@ export function buildFfmpegArgs(
   const args: string[] = [];
   const isHttp = /^https?:\/\//i.test(url);
 
+  // Keep ffmpeg quiet and, crucially, STOP it from streaming per-second progress
+  // stats to stderr. stderr is a pipe; when the reader is slow or absent the OS
+  // pipe buffer (~64KB) fills and ffmpeg blocks forever mid-track. The URL path
+  // drains stderr, but the from-file path historically did not — so silencing
+  // the output here removes the failure mode at the source.
+  args.push("-hide_banner", "-loglevel", "error", "-nostats");
+
   if (isHttp && (url.includes("bilivideo") || url.includes("bilibili"))) {
     args.push(
       "-headers",
@@ -235,6 +242,12 @@ export class AudioPlayer extends EventEmitter {
   // as dead and advance instead of staying silent forever. Set high so a normal
   // transient underrun never trips it.
   private static readonly MAX_STALL_ATTEMPTS = 3000;
+  // External (Spotify sidecar) mode has no per-track EOF, so the two drain
+  // branches above are suppressed. If the sidecar wedges without closing or
+  // erroring the pipe, the player would sit in "playing" emitting silence
+  // forever. This bounds that: ~90s without a single PCM chunk trips it.
+  private externalStallAttempts = 0;
+  private static readonly MAX_EXTERNAL_STALL_ATTEMPTS = 4500;
   private static readonly SILENCE_FRAME = Buffer.alloc(PCM_FRAME_BYTES);
   private volumeBuffer = Buffer.alloc(PCM_FRAME_BYTES);
   private currentSongDuration = 0; // 当前歌曲总时长（秒）
@@ -258,8 +271,10 @@ export class AudioPlayer extends EventEmitter {
 
   constructor(logger: Logger) {
     super();
-    this.encoder = createOpusEncoder();
     this.logger = logger;
+    // Pass the logger so a rejected encoder ctl is surfaced instead of silently
+    // leaving every track encoded in the default VOIP mode.
+    this.encoder = createOpusEncoder(logger);
   }
 
   private appendPcmChunk(chunk: Buffer): void {
@@ -337,46 +352,66 @@ export class AudioPlayer extends EventEmitter {
       return false;
     }
 
-    this.triggerFadeIn(400);
-
     if (shouldUsePowerShellDownload(url)) {
+      // The fade-in is (re)triggered inside spawnFfmpegFromFile once audio
+      // actually starts. Starting the 400ms window here would waste it during
+      // the (possibly multi-second) PowerShell download, so jdymusic tracks
+      // would come in with no fade at all while every other source fades in.
       this.playViaPowerShellDownload(url, seekSeconds, currentSessionId, startPaused);
       return true;
     }
+
+    this.triggerFadeIn(400);
 
     const args = buildFfmpegArgs(url, seekSeconds, {
       loudnessNormalization: this.loudnessNormalization,
     });
 
     const ffmpegBin = getFfmpegCommand();
-    this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
-    
-    const currentPid = this.ffmpeg.pid;
+    const proc = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    this.ffmpeg = proc;
+
+    const currentPid = proc.pid;
     if (currentPid) {
       globalActivePids.add(currentPid);
       this.logger.debug({ pid: currentPid, sessionId: currentSessionId }, "FFmpeg spawned");
     }
 
-    this.ffmpeg.stdout!.on("data", (chunk: Buffer) => {
+    // A spawn failure emits 'error' + 'close' and never 'exit'; make sure
+    // this.ffmpeg is still cleared so the frame loop does not sit in the
+    // "ffmpeg alive but silent" stall branch for the full watchdog window.
+    let cleared = false;
+    const clearIfCurrent = () => {
+      if (cleared) return;
+      cleared = true;
+      if (currentPid) globalActivePids.delete(currentPid);
+      if (this.sessionId === currentSessionId && this.ffmpeg === proc) this.ffmpeg = null;
+    };
+
+    proc.stdout!.on("data", (chunk: Buffer) => {
       // 2. 严格校验 sessionId，防止老进程的数据混入新播放请求 （
       if (this.sessionId !== currentSessionId) {
         return;
       }
-      
+
       this.appendPcmChunk(chunk);
-      if (this.pcmBufferedBytes > AudioPlayer.BUFFER_HIGH_WATER && !this.ffmpegPaused && this.ffmpeg?.stdout) {
-        this.ffmpeg.stdout.pause();
+      if (this.pcmBufferedBytes > AudioPlayer.BUFFER_HIGH_WATER && !this.ffmpegPaused && proc.stdout) {
+        proc.stdout.pause();
         this.ffmpegPaused = true;
       }
     });
 
     let stderrTail = "";
-    this.ffmpeg.stderr?.on("data", (chunk: Buffer) => {
+    proc.stderr?.on("data", (chunk: Buffer) => {
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-1000);
     });
+    // EventEmitter throws on an unhandled 'error'; stream errors (EIO/EPIPE) are
+    // rare but would otherwise take the whole process down.
+    proc.stdout?.on("error", () => {});
+    proc.stderr?.on("error", () => {});
 
-    this.ffmpeg.on("exit", (code, signal) => {
-      if (currentPid) globalActivePids.delete(currentPid);
+    proc.on("exit", (code, signal) => {
+      clearIfCurrent();
       if ((code !== null && code !== 0) || signal) {
         this.logger.warn({ pid: currentPid, code, signal, stderr: stderrTail }, "FFmpeg exited with error/signal");
         if (this.sessionId === currentSessionId && this.framesPlayed === 0 && this.pcmBufferedBytes === 0) {
@@ -387,14 +422,12 @@ export class AudioPlayer extends EventEmitter {
       } else {
         this.logger.info({ pid: currentPid, code, signal }, "FFmpeg exited");
       }
-      
-      // 只有当前会话的进程结束才置空变量
-      if (this.sessionId === currentSessionId) {
-        this.ffmpeg = null;
-      }
     });
 
-    this.ffmpeg.on("error", (err) => {
+    proc.on("close", () => clearIfCurrent());
+
+    proc.on("error", (err) => {
+      clearIfCurrent();
       if (this.sessionId === currentSessionId) {
         this.spawnFailed = true;
         this.consecutiveFailures++;
@@ -457,6 +490,11 @@ export class AudioPlayer extends EventEmitter {
     ps.stderr!.on("data", (chunk: Buffer) => {
       stderrTail = (stderrTail + chunk.toString()).slice(-500);
     });
+    // Drain stdout too: it is piped, and an unread pipe would block the download
+    // if PowerShell ever writes progress/verbose output to it.
+    ps.stdout?.on("data", () => {});
+    ps.stdout?.on("error", () => {});
+    ps.stderr?.on("error", () => {});
 
     ps.on("exit", (code, signal) => {
       clearTimeout(downloadTimeout);
@@ -512,43 +550,73 @@ export class AudioPlayer extends EventEmitter {
       loudnessNormalization: this.loudnessNormalization,
     });
     const ffmpegBin = getFfmpegCommand();
-    this.ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    this.ffmpeg = proc;
 
-    const currentPid = this.ffmpeg.pid;
+    const currentPid = proc.pid;
     if (currentPid) {
       globalActivePids.add(currentPid);
       this.logger.debug({ pid: currentPid, sessionId }, "FFmpeg spawned (from temp file)");
     }
     const tempDirToCleanup = this.currentTempDir;
 
-    this.ffmpeg.stdout!.on("data", (chunk: Buffer) => {
-      if (this.sessionId !== sessionId) return;
-      this.appendPcmChunk(chunk);
-      if (this.pcmBufferedBytes > AudioPlayer.BUFFER_HIGH_WATER && !this.ffmpegPaused && this.ffmpeg?.stdout) {
-        this.ffmpeg.stdout.pause();
-        this.ffmpegPaused = true;
-      }
-    });
-
-    this.ffmpeg.on("exit", (code, signal) => {
+    // Whichever of exit/close/error fires first performs teardown exactly once.
+    // A spawn failure (ENOENT/EACCES) emits 'error' + 'close' and NEVER 'exit',
+    // so without the 'error'/'close' handlers this.ffmpeg stayed pointing at the
+    // dead process and the temp dir was never released.
+    let settled = false;
+    const settle = (
+      reason: "exit" | "error",
+      detail: { code?: number | null; signal?: NodeJS.Signals | null; err?: Error; stderr?: string },
+    ) => {
+      if (settled) return;
+      settled = true;
       if (currentPid) globalActivePids.delete(currentPid);
-      this.logger.info({ pid: currentPid, code, signal }, "FFmpeg exited");
-      if (this.sessionId === sessionId) {
+      if (this.sessionId === sessionId && this.ffmpeg === proc) {
         this.ffmpeg = null;
         if (this.currentTempDir === tempDirToCleanup) this.currentTempDir = null;
       }
       if (tempDirToCleanup) cleanupTempDir(tempDirToCleanup);
-    });
 
-    this.ffmpeg.on("error", (err) => {
+      if (reason === "exit") {
+        this.logger.info({ pid: currentPid, code: detail.code, signal: detail.signal }, "FFmpeg exited");
+        return;
+      }
+      this.logger.warn({ pid: currentPid, err: detail.err, stderr: detail.stderr }, "FFmpeg spawn failed (from temp file)");
       if (this.sessionId === sessionId) {
         this.spawnFailed = true;
         this.consecutiveFailures++;
-        this.emit("error", err);
+        if (detail.err) this.emit("error", detail.err);
+      }
+    };
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      if (this.sessionId !== sessionId) return;
+      this.appendPcmChunk(chunk);
+      if (this.pcmBufferedBytes > AudioPlayer.BUFFER_HIGH_WATER && !this.ffmpegPaused && proc.stdout) {
+        proc.stdout.pause();
+        this.ffmpegPaused = true;
       }
     });
 
-    // Now that ffmpeg is producing PCM, run the frame loop.
+    // Drain stderr. `buildFfmpegArgs` now silences progress output, but a read is
+    // still mandatory: an unread pipe fills up and blocks ffmpeg mid-track.
+    let stderrTail = "";
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderrTail = (stderrTail + chunk.toString("utf8")).slice(-1000);
+    });
+    // EventEmitter throws on an 'error' with no listener; streams can emit EIO/EPIPE.
+    proc.stdout?.on("error", () => {});
+    proc.stderr?.on("error", () => {});
+
+    proc.on("exit", (code, signal) => settle("exit", { code, signal }));
+    proc.on("close", () => settle("exit", {}));
+    proc.on("error", (err) => settle("error", { err, stderr: stderrTail }));
+
+    // Now that ffmpeg is producing PCM, run the frame loop. Start the fade-in
+    // here (not in play()) so the window covers audible audio, after the
+    // download delay.
+    this.triggerFadeIn(400);
     this.state = startPaused ? "paused" : "playing";
     this.startFrameLoop();
   }
@@ -588,6 +656,7 @@ export class AudioPlayer extends EventEmitter {
     this.ffmpegPaused = false;
     this.spawnFailed = false;
     this.emptyFrameAttempts = 0;
+    this.externalStallAttempts = 0;
     this.currentSongDuration = 0;
 
     // Same ingestion + high-water backpressure as the ffmpeg.stdout handler,
@@ -596,6 +665,7 @@ export class AudioPlayer extends EventEmitter {
     // refs are stored so detach can remove exactly these listeners (C2).
     const onData = (chunk: Buffer): void => {
       if (this.sessionId !== currentSessionId) return;
+      this.externalStallAttempts = 0;
       this.appendPcmChunk(chunk);
       if (
         this.pcmBufferedBytes > AudioPlayer.BUFFER_HIGH_WATER &&
@@ -713,6 +783,7 @@ export class AudioPlayer extends EventEmitter {
     this.seekOffset = 0;
     this.framesPlayed = 0;
     this.healthyFrames = 0;
+    this.externalStallAttempts = 0;
   }
 
   private forceCleanup(proc: ChildProcess, pid: number): void {
@@ -861,7 +932,25 @@ export class AudioPlayer extends EventEmitter {
       // External mode: the sidecar PCM stream is long-lived and must NOT end on
       // a transient underrun. Emit an encoded silence frame so the 20ms voice
       // timeline stays continuous instead of returning (which would desync TS).
-      if (this.externalMode) this.emitSilenceFrame();
+      // If the sidecar wedges (no data, no EOF, no error) this bounded counter
+      // ends the track so the controller can recover instead of hanging silent.
+      if (this.externalMode) {
+        this.emitSilenceFrame();
+        if (this.state !== "playing") return;
+        this.externalStallAttempts++;
+        if (this.externalStallAttempts >= AudioPlayer.MAX_EXTERNAL_STALL_ATTEMPTS) {
+          this.externalStallAttempts = 0;
+          this.logger.error(
+            { sessionId: this.sessionId, attempts: AudioPlayer.MAX_EXTERNAL_STALL_ATTEMPTS },
+            "External PCM stream stalled; ending track to recover",
+          );
+          this.frameLoopRunning = false;
+          this.state = "idle";
+          if (this.listenerCount("error") > 0) {
+            this.emit("error", new Error("External PCM stream stalled"));
+          }
+        }
+      }
       return;
     }
     if (this.ffmpegPaused && this.pcmBufferedBytes < AudioPlayer.BUFFER_LOW_WATER) {
@@ -885,8 +974,22 @@ export class AudioPlayer extends EventEmitter {
         this.healthyFrames = 0;
       }
     } catch (err) {
-      this.emit("error", err as Error);
+      this.handleEncodeFailure(err as Error);
     }
+  }
+
+  /**
+   * An encoder throw is not a per-frame hiccup: the frame loop would re-throw
+   * every 20 ms and BotInstance's error handler advances the queue on each one
+   * (~50 advances/second). Stop the loop, go idle and report exactly once so
+   * playback recovers the same way any other track error does.
+   */
+  private handleEncodeFailure(err: Error): void {
+    this.logger.error({ err, sessionId: this.sessionId }, "Audio encoding failed, stopping playback");
+    this.frameLoopRunning = false;
+    this.clearPcmBuffer();
+    this.state = "idle";
+    if (this.listenerCount("error") > 0) this.emit("error", err);
   }
 
   private emitSilenceFrame(): void {
@@ -897,7 +1000,7 @@ export class AudioPlayer extends EventEmitter {
       this.emit("frame", this.cachedSilenceOpusFrame);
       this.framesPlayed++;
     } catch (err) {
-      this.emit("error", err as Error);
+      this.handleEncodeFailure(err as Error);
     }
   }
 
@@ -1019,13 +1122,21 @@ export class AudioPlayer extends EventEmitter {
     // transport is delegated to the SpotifyController by the caller (Task 7).
     if (this.externalMode) return;
     if (this.currentUrl && Number.isFinite(seconds) && seconds >= 0) {
+      // Clamp to the track length. A seek past EOF makes ffmpeg produce no
+      // audio at all, and the frame loop then spends the full "near end"
+      // watchdog (~5s of silence) before advancing — the user just hears a
+      // dead pause. Leave one second of audio so the normal EOF path runs.
+      const clamped =
+        this.currentSongDuration > 0
+          ? Math.min(seconds, Math.max(0, this.currentSongDuration - 1))
+          : seconds;
       // play() bails out with an "ffmpeg unavailable" error once the failure
       // counter hits MAX_CONSECUTIVE_FAILURES, so without this reset a user who
       // hit three bad tracks could never seek again — the slider would silently
       // do nothing for the rest of the session.
       this.consecutiveFailures = 0;
       const wasPaused = this.state === "paused";
-      this.play(this.currentUrl, seconds, this.currentSongDuration, wasPaused);
+      this.play(this.currentUrl, clamped, this.currentSongDuration, wasPaused);
     }
   }
   pause(): void { if (this.state === "playing") this.state = "paused"; }

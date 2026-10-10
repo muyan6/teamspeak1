@@ -4,23 +4,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 
-vi.mock("@discordjs/opus", () => {
-  class OpusEncoder {
-    encode(pcm: Buffer) {
-      return Buffer.alloc(100);
-    }
-    decode(opus: Buffer) {
-      return Buffer.alloc(3840);
-    }
-  }
-  return {
-    default: { OpusEncoder },
-    OpusEncoder,
-  };
-});
-
 import { buildFfmpegArgs, shouldUsePowerShellDownload, cleanupTempDir, shouldEndOnStall, volumeToFactor, AudioPlayer } from "./player.js";
+import { setOpusEncoderClassForTests } from "./encoder.js";
 import type { Logger } from "../logger.js";
+
+// `vi.mock("@discordjs/opus")` cannot intercept the addon: encoder.ts loads it
+// through a real `require(createRequire(...))`, outside Vite's module graph. The
+// stub therefore goes through the encoder's explicit test seam, which keeps this
+// suite runnable on machines whose native addon targets a different Node ABI.
+setOpusEncoderClassForTests(
+  class {
+    encode(_pcm: Buffer): Buffer { return Buffer.alloc(100); }
+    decode(_opus: Buffer): Buffer { return Buffer.alloc(3840); }
+    applyEncoderCTL(): void {}
+    setBitrate(): void {}
+  },
+);
 
 function getHeadersArg(args: string[]): string {
   const idx = args.indexOf("-headers");

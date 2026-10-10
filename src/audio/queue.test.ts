@@ -604,6 +604,39 @@ describe("PlayQueue", () => {
       expect(q.current()).toBeNull();
       expect(q.list().map((s) => s.id)).toEqual(["A"]);
     });
+
+    // Regression: restore() used to assign the persisted mode verbatim. An
+    // unknown/legacy value then fell through next()'s switch (no default) and
+    // returned `undefined`, which playNext() read as "end of queue" — playback
+    // stopped for no visible reason.
+    it("falls back to Sequential when the persisted mode is unknown", () => {
+      const q = new PlayQueue();
+      const { url: _url, ...noUrl } = makeSong("A");
+      q.restore({
+        songs: [noUrl, { ...noUrl, id: "B" }],
+        currentIndex: 0,
+        mode: "legacy-value" as unknown as PlayMode,
+      });
+      expect(q.getMode()).toBe(PlayMode.Sequential);
+      expect(q.next()?.id).toBe("B");
+    });
+
+    it("falls back to Sequential when the persisted mode is missing", () => {
+      const q = new PlayQueue();
+      const { url: _url, ...noUrl } = makeSong("A");
+      q.restore({ songs: [noUrl], currentIndex: 0, mode: undefined as unknown as PlayMode });
+      expect(q.getMode()).toBe(PlayMode.Sequential);
+    });
+
+    it("accepts the long alias 'randomloop' from a hand-edited snapshot", () => {
+      const q = new PlayQueue();
+      q.restore({
+        songs: [makeSong("A")],
+        currentIndex: 0,
+        mode: "randomloop" as unknown as PlayMode,
+      });
+      expect(q.getMode()).toBe(PlayMode.RandomLoop);
+    });
   });
 
   // Issue #141: in Random/RandomLoop, next() picks from the shuffle bag and
