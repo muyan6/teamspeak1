@@ -52,7 +52,41 @@ export function setupWebSocket(
     disconnected: () => void;
   }>();
 
+  /**
+   * P2-24: concurrent-socket caps.
+   *
+   * The upgrade limiter only bounds HANDSHAKES (30/min per address), so a single
+   * authenticated account could keep an unbounded number of sockets open — each
+   * one receiving every broadcast for its bot scope, multiplying fan-out work
+   * and memory. A real browser needs one socket per tab; eight leaves room for a
+   * few tabs plus a stale one while still bounding the damage.
+   */
+  const MAX_WS_SOCKETS_PER_USER = 8;
+  const MAX_WS_SOCKETS_TOTAL = 256;
+
+  function countSocketsForUser(userId: string): number {
+    if (!userId) return 0;
+    let count = 0;
+    for (const client of clients) {
+      if ((client as unknown as { userId?: string }).userId === userId) count++;
+    }
+    return count;
+  }
+
   wss.on("connection", (ws) => {
+    const connectionUserId = (ws as unknown as { userId?: string }).userId ?? "";
+    if (
+      clients.size >= MAX_WS_SOCKETS_TOTAL ||
+      countSocketsForUser(connectionUserId) >= MAX_WS_SOCKETS_PER_USER
+    ) {
+      logger.warn(
+        { userId: connectionUserId, total: clients.size },
+        "WebSocket connection refused: socket limit reached",
+      );
+      try { ws.close(1013, "too many connections"); } catch { /* already closed */ }
+      try { ws.terminate(); } catch { /* already closed */ }
+      return;
+    }
     clients.add(ws);
     const socket = ws as WebSocket & { isAlive?: boolean };
     socket.isAlive = true;

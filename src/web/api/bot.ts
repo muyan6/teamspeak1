@@ -100,6 +100,12 @@ export function createBotRouter(
   // credential-relevant fields actually changed). Structural type =
   // JellyfinProvider.configure.
   jellyfinProvider?: { configure(cfg: JellyfinConfig): void },
+  // P1-②: a member holding only `bot.create` gets the new bot added to their
+  // access list, but their OPEN WebSocket still carries the scope stamped at
+  // upgrade time, so the fresh bot's live state would not stream until they
+  // happened to reconnect. This bridge re-scopes / drops those sockets so the
+  // next connection resolves the widened permission set. Defaults to a no-op.
+  onBotAccessGranted?: (userId: string) => void,
 ): Router {
   const router = Router();
 
@@ -567,6 +573,12 @@ export function createBotRouter(
       const autoStart = botBoolean(body.autoStart, "autoStart", true)!;
       const normalizedProtocol = botProtocol(body.serverProtocol);
       const ts6ApiKey = optionalBotText(body.ts6ApiKey, "ts6ApiKey", 4096);
+      // `bot.create` is a standalone capability: a member may be allowed to
+      // create instances without holding `bots:all`. Record the creator so the
+      // manager can grant them access to the bot they just made — otherwise the
+      // instance is unmanageable by its own creator while autoStart (default
+      // true) has it dialing out on its own.
+      const creator = req.user;
       const bot = await botManager.createBot({
         name,
         serverAddress,
@@ -580,7 +592,17 @@ export function createBotRouter(
         autoStart,
         serverProtocol: normalizedProtocol,
         ts6ApiKey: ts6ApiKey || undefined,
+        ownerUserId: creator?.id,
       });
+      // Only a narrowly-scoped creator needs their live socket re-evaluated;
+      // admins / `bots:all` holders already see every bot.
+      if (creator && creator.bots !== "all") {
+        try {
+          onBotAccessGranted?.(creator.id);
+        } catch (err) {
+          logger.warn({ err, userId: creator.id }, "Failed to refresh bot scope after create");
+        }
+      }
       res.status(201).json(bot.getStatus());
     } catch (err) {
       if (err instanceof InvalidBotInputError) {

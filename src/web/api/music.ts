@@ -6,8 +6,10 @@ import { isProviderEnabled, defaultPlatform, saveConfig, type BotConfig } from "
 import { LRUCache } from "../../data/cache.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
+import { requireAdmin } from "../middleware/requireAdmin.js";
 import { authorize } from "../middleware/authorize.js";
 import { musicContext } from '../../music/media-dto.js';
+import { localViewerFor, scopedSearch, scopedSongDetail } from '../../music/local.js';
 
 /**
  * Per-upload cap. Production uploads stream to disk with backpressure and
@@ -228,8 +230,8 @@ export function createMusicRouter(
           return;
         }
         const uploadCapable = localProvider as MusicProvider & {
-          uploadStream?: (input: { stream: AsyncIterable<Uint8Array>; originalName: string; mimeType?: string; signal?: AbortSignal }) => Promise<unknown>;
-          uploadAudio?: (input: { buffer: Buffer; originalName: string; mimeType?: string }) => Promise<unknown>;
+          uploadStream?: (input: { stream: AsyncIterable<Uint8Array>; originalName: string; mimeType?: string; signal?: AbortSignal; ownerId?: string }) => Promise<unknown>;
+          uploadAudio?: (input: { buffer: Buffer; originalName: string; mimeType?: string; ownerId?: string }) => Promise<unknown>;
         };
         if (!uploadCapable.uploadStream && typeof uploadCapable.uploadAudio !== "function") {
           res.status(501).json({ error: "Local upload is not supported" });
@@ -251,7 +253,9 @@ export function createMusicRouter(
         res.once('close', onClose);
         let song: unknown;
         try {
-          const metadata = { originalName, mimeType: req.header('content-type') || undefined };
+          // Stamp the upload with its owner so the library can be filtered per
+          // viewer. Without this every member could list/play/queue any upload.
+          const metadata = { originalName, mimeType: req.header('content-type') || undefined, ownerId: req.user?.id };
           song = uploadCapable.uploadStream
             ? await uploadCapable.uploadStream({ ...metadata, stream: req.iterator({ destroyOnReturn: false }), signal: abort.signal })
             : await uploadCapable.uploadAudio!({ ...metadata, buffer: req.body });
@@ -288,24 +292,34 @@ export function createMusicRouter(
       const parsedType = (typeof type === "string" && ["song", "playlist", "album", "all"].includes(type))
         ? (type as SearchType)
         : "all";
-      const cacheKey = `${res.locals.musicContext}:${provider.platform}:${String(q).trim().toLowerCase()}:${parsedLimit}:${parsedOffset}:${parsedType}`;
+      // The local library is viewer-scoped, while the search cache is shared
+      // across users (keyed on config + provider credentials). Fold the viewer
+      // into the key for local results, or one member's upload list would be
+      // served to the next requester from cache.
+      const localScope = provider.platform === "local"
+        ? `:u=${req.user?.role === "admin" ? "*" : req.user?.id ?? "-"}`
+        : "";
+      const cacheKey = `${res.locals.musicContext}:${provider.platform}:${String(q).trim().toLowerCase()}:${parsedLimit}:${parsedOffset}:${parsedType}${localScope}`;
       const cached = searchCache.get(cacheKey);
       if (cached) {
         res.json(cached);
         return;
       }
-      const result = parsedType && parsedType !== "all"
-        ? await provider.search(
-            q as string,
-            parsedLimit,
-            parsedOffset,
-            parsedType
-          )
-        : await provider.search(
-            q as string,
-            parsedLimit,
-            parsedOffset
-          );
+      const viewer = provider.platform === "local" ? localViewerFor(req.user) : undefined;
+      const result = viewer
+        ? await scopedSearch(provider, viewer, q as string, parsedLimit, parsedOffset, parsedType)
+        : parsedType && parsedType !== "all"
+          ? await provider.search(
+              q as string,
+              parsedLimit,
+              parsedOffset,
+              parsedType
+            )
+          : await provider.search(
+              q as string,
+              parsedLimit,
+              parsedOffset
+            );
       searchCache.set(cacheKey, result);
       res.json(result);
     } catch (err) {
@@ -322,7 +336,10 @@ export function createMusicRouter(
         return;
       }
       const parsedLimit = Math.min(100, Math.max(1, parseInt(limit as string) || 20));
-      const cacheKey = `${res.locals.musicContext}:all:${String(q).trim().toLowerCase()}:${parsedLimit}`;
+      // The merged result embeds the (per-viewer) local library, so the shared
+      // cache must be segmented by viewer or one member's uploads leak to the next.
+      const viewerScope = `:u=${req.user?.role === "admin" ? "*" : req.user?.id ?? "-"}`;
+      const cacheKey = `${res.locals.musicContext}:all:${String(q).trim().toLowerCase()}:${parsedLimit}${viewerScope}`;
       const cached = searchCache.get(cacheKey);
       if (cached) {
         res.json(cached);
@@ -338,12 +355,15 @@ export function createMusicRouter(
       // enabled — a self-hosted library match is almost always the wanted one.
       const enabled = (p: string) => !config || isProviderEnabled(config, p);
       const none = { songs: [], albums: [], playlists: [] };
+      const localViewer = localViewerFor(req.user);
       const [jellyfinResult, neteaseResult, qqResult, bilibiliResult, localResult, kugouResult] = await Promise.allSettled([
         jellyfinProvider && enabled("jellyfin") ? jellyfinProvider.search(q as string, parsedLimit) : Promise.resolve(none),
         enabled("netease") ? neteaseProvider.search(q as string, parsedLimit) : Promise.resolve(none),
         enabled("qq") ? qqProvider.search(q as string, parsedLimit) : Promise.resolve(none),
         enabled("bilibili") ? bilibiliProvider.search(q as string, parsedLimit) : Promise.resolve(none),
-        localProvider && isLocalAudioEnabled() ? localProvider.search(q as string, parsedLimit) : Promise.resolve(none),
+        localProvider && isLocalAudioEnabled()
+          ? scopedSearch(localProvider, localViewer, q as string, parsedLimit, 0)
+          : Promise.resolve(none),
         kugouProvider && enabled("kugou") ? kugouProvider.search(q as string, parsedLimit) : Promise.resolve(none),
       ]);
 
@@ -404,13 +424,18 @@ export function createMusicRouter(
       const provider = resolveProvider(req.query.platform, res);
       if (!provider) return;
       const platKey = String(req.query.platform ?? "default");
-      const cacheKey = `${res.locals.musicContext}:${platKey}:${req.params.id}`;
+      // Local detail is ownership-gated, so it must not share a cache entry
+      // across viewers (same reasoning as the search cache above).
+      const detailScope = provider.platform === "local"
+        ? `:u=${req.user?.role === "admin" ? "*" : req.user?.id ?? "-"}`
+        : "";
+      const cacheKey = `${res.locals.musicContext}:${platKey}:${req.params.id}${detailScope}`;
       const cached = songDetailCache.get(cacheKey);
       if (cached) {
         res.json(cached);
         return;
       }
-      const song = await provider.getSongDetail(req.params.id);
+      const song = await scopedSongDetail(provider, localViewerFor(req.user), req.params.id);
       if (!song) {
         res.status(404).json({ error: "Song not found" });
         return;
@@ -698,7 +723,13 @@ export function createMusicRouter(
   });
 
   // Set quality
-  router.post("/quality", requirePermission("quality"), (req, res) => {
+  //
+  // P2-21: `requirePermission("quality")` is a GRANTABLE capability, but the
+  // provider instances are process-wide — one member holding it silently changed
+  // the audio quality for every bot and every other user. That is platform
+  // administration (same reasoning as `/api/bot/settings`, which is admin-only),
+  // so it requires admin now.
+  router.post("/quality", requireAdmin, (req, res) => {
     const { quality, platform } = req.body;
     if (!quality) {
       res.status(400).json({ error: "quality is required" });
@@ -715,6 +746,18 @@ export function createMusicRouter(
       res.status(400).json({ error: "invalid quality" });
       return;
     }
+    // Snapshot the LIVE per-provider values before applying, so a failed
+    // persist can be rolled back — the in-memory change would otherwise outlive
+    // the request while the on-disk config still held the old tier, leaving the
+    // two disagreeing until the next successful save.
+    const previous = {
+      netease: neteaseProvider.getQuality(),
+      qq: qqProvider.getQuality(),
+      bilibili: bilibiliProvider.getQuality(),
+      kugou: kugouProvider?.getQuality(),
+      spotify: spotifyProvider?.getQuality(),
+      jellyfin: jellyfinProvider?.getQuality(),
+    };
     if (!platform || platform === "netease") {
       neteaseProvider.setQuality(quality);
     }
@@ -741,7 +784,7 @@ export function createMusicRouter(
     // exactly what each one accepted (jellyfin ignores foreign tiers, kugou maps
     // aliases), so replaying these on startup reproduces this state faithfully.
     if (config && configPath) {
-      config.audioQuality = {
+      const next = {
         netease: neteaseProvider.getQuality(),
         qq: qqProvider.getQuality(),
         bilibili: bilibiliProvider.getQuality(),
@@ -749,10 +792,21 @@ export function createMusicRouter(
         jellyfin: jellyfinProvider?.getQuality() ?? config.audioQuality.jellyfin,
         spotify: spotifyProvider?.getQuality() ?? config.audioQuality.spotify,
       };
+      const savedQuality = config.audioQuality;
+      config.audioQuality = next;
       try {
         saveConfig(configPath, config);
       } catch (err) {
-        logger.warn({ err }, "Failed to persist audio quality");
+        logger.error({ err }, "Failed to persist audio quality — rolling back");
+        config.audioQuality = savedQuality;
+        if (previous.netease !== undefined) neteaseProvider.setQuality(previous.netease);
+        if (previous.qq !== undefined) qqProvider.setQuality(previous.qq);
+        if (previous.bilibili !== undefined) bilibiliProvider.setQuality(previous.bilibili);
+        if (previous.kugou !== undefined && kugouProvider) kugouProvider.setQuality(previous.kugou);
+        if (previous.spotify !== undefined && spotifyProvider) spotifyProvider.setQuality(previous.spotify);
+        if (previous.jellyfin !== undefined && jellyfinProvider) jellyfinProvider.setQuality(previous.jellyfin);
+        res.status(500).json({ error: "failed to persist audio quality" });
+        return;
       }
     }
 

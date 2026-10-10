@@ -199,10 +199,14 @@ describe("permission enforcement on action routes", () => {
       expect(res.status).toBe(403);
     });
 
-    it("NOT 403 for member WITH quality on POST /api/music/quality", async () => {
+    // P2-21: quality is applied to the PROCESS-WIDE provider instances, so even
+    // a member holding the grantable `quality` capability was able to retune
+    // audio for every bot and every other user. It is platform administration
+    // now (same as POST /api/bot/settings) and therefore admin-only.
+    it("403 for member WITH quality on POST /api/music/quality (admin-only write)", async () => {
       const app = makeApp(member(["quality"], "all"));
       const res = await request(app).post("/api/music/quality").send({ quality: "high" });
-      expect(res.status).not.toBe(403);
+      expect(res.status).toBe(403);
     });
 
     it("GET /api/music/quality is 403 for guests, allowed for members", async () => {

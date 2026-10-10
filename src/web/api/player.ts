@@ -6,8 +6,9 @@ import type { MusicProvider, Platform, Song } from "../../music/provider.js";
 import type { Logger } from "../../logger.js";
 import type { BotInstance } from "../../bot/instance.js";
 import { parseCommand, type ParsedCommand } from "../../bot/commands.js";
-import { MAX_QUEUE_SONGS } from "../../audio/queue.js";
+import { MAX_QUEUE_SONGS, type QueuedSong } from "../../audio/queue.js";
 import { normalizeSong, publicCoverUrl } from '../../music/media-dto.js';
+import { localViewerFor, scopedSongDetail } from '../../music/local.js';
 import { requireBotAccess } from "../middleware/requirePermission.js";
 import { authorize } from "../middleware/authorize.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
@@ -17,6 +18,21 @@ declare module "express-serve-static-core" {
     bot?: BotInstance;
     playbackCurrent?: () => boolean;
   }
+}
+
+/**
+ * Map a thrown playback error onto an HTTP status.
+ *
+ * 400 invalid input, 409 cancelled by a concurrent stop/skip, 504 a queued
+ * operation that exceeded the playback coordinator's budget. Anything else is
+ * an unexpected server error.
+ */
+const PLAYBACK_ERROR_STATUSES = new Set([400, 409, 504]);
+function respondPlaybackError(res: Response, err: unknown): void {
+  const status = (err as { status?: number }).status;
+  res
+    .status(typeof status === "number" && PLAYBACK_ERROR_STATUSES.has(status) ? status : 500)
+    .json({ error: (err as Error).message });
 }
 
 export function createPlayerRouter(
@@ -180,7 +196,7 @@ export function createPlayerRouter(
       const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)), timeoutMs);
       res.json({ message: response });
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -203,7 +219,7 @@ export function createPlayerRouter(
       const response = await executeWithTimeout(bot.executeCommand(cmd, undefined, requesterName(req)), timeoutMs);
       res.json({ message: response });
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -214,7 +230,7 @@ export function createPlayerRouter(
       const response = await executeWithTimeout(bot.executeCommand(cmd));
       res.json({ message: response });
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   };
 
@@ -245,7 +261,7 @@ export function createPlayerRouter(
         message,
       });
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -271,7 +287,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -291,7 +307,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -317,7 +333,7 @@ export function createPlayerRouter(
       bot.seek(position);
       res.json({ message: `Seeked to ${Math.floor(position)}s`, seekOffset: position });
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -339,7 +355,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd);
       res.json({ message: response });
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -381,7 +397,7 @@ export function createPlayerRouter(
       }
       res.json(result.body);
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -399,7 +415,7 @@ export function createPlayerRouter(
       const response = await bot.executeCommand(cmd, undefined, requesterName(req));
       res.json({ message: response });
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -483,23 +499,44 @@ export function createPlayerRouter(
       }
     } catch (err) {
       logger.error({ err }, "Play playlist failed");
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
   router.post('/:botId/play-songs', authorize({ capability: 'player.control', guestFlag: 'playCollection' }), async (req, res) => {
-    const bot = requestBot(req);
-    if (!Array.isArray(req.body?.songs) || !req.body.songs.length || req.body.songs.length > MAX_QUEUE_SONGS) {
-      res.status(400).json({ error: `songs must contain 1-${MAX_QUEUE_SONGS} entries` }); return;
+    try {
+      const bot = requestBot(req);
+      if (!Array.isArray(req.body?.songs) || !req.body.songs.length || req.body.songs.length > MAX_QUEUE_SONGS) {
+        res.status(400).json({ error: `songs must contain 1-${MAX_QUEUE_SONGS} entries` }); return;
+      }
+      const songs: QueuedSong[] = (req.body.songs as unknown[]).map((s) => normalizeSong(s));
+      const selected = songs.map((song) => selectPlatform(bot, song.platform, res));
+      if (selected.some((p) => p === null)) return;
+      // Local uploads arriving as raw song objects are subject to the same
+      // ownership gate as add-by-id; anything invisible is rejected outright
+      // rather than silently queued.
+      const viewer = localViewerFor(req.user);
+      const localProvider = bot.getProviderFor('local');
+      const visible = await Promise.all(
+        songs.map((song, i) =>
+          selected[i] === 'local'
+            ? scopedSongDetail(localProvider, viewer, song.id).then((s) => s !== null)
+            : Promise.resolve(true),
+        ),
+      );
+      if (visible.some((ok) => !ok)) {
+        res.status(404).json({ error: 'Song not found' }); return;
+      }
+      const body = await runPlayback(req, async () => {
+        if (!bot.isConnected()) throw Object.assign(new Error('Bot is not connected'), { status: 409 });
+        await bot.loadSavedQueue(songs, 'replace', requesterName(req));
+        const playing = bot.getPlayer().getState() === 'playing';
+        return { ok: playing, loaded: songs.length, message: playing ? `已加载 ${songs.length} 首` : '已加载队列，但未能开始播放' };
+      });
+      res.json(body);
+    } catch (err) {
+      respondPlaybackError(res, err);
     }
-    const songs = req.body.songs.map(normalizeSong);
-    for (const song of songs) if (selectPlatform(bot, song.platform, res) === null) return;
-    await runPlayback(req, async () => {
-      if (!bot.isConnected()) throw Object.assign(new Error('Bot is not connected'), { status: 409 });
-      await bot.loadSavedQueue(songs, 'replace', requesterName(req));
-    });
-    const playing = bot.getPlayer().getState() === 'playing';
-    res.json({ ok: playing, loaded: songs.length, message: playing ? `已加载 ${songs.length} 首` : '已加载队列，但未能开始播放' });
   });
 
   // Play an album by ID — mirrors play-playlist but calls getAlbumSongs
@@ -507,7 +544,9 @@ export function createPlayerRouter(
     try {
       const bot = requestBot(req);
       const { albumId, platform } = req.body;
-      if (!albumId || typeof albumId !== "string") {
+      // Same guard as playlistId: a blank/oversized id or one carrying CR/LF
+      // must be rejected before it reaches the provider.
+      if (invalidCommandText(albumId)) {
         res.status(400).json({ error: "albumId is required" });
         return;
       }
@@ -574,7 +613,7 @@ export function createPlayerRouter(
       }
     } catch (err) {
       logger.error({ err }, "play-album failed");
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -598,7 +637,9 @@ export function createPlayerRouter(
         return;
       }
       const provider = bot.getProviderFor(selectedPlatform);
-      const song = await provider.getSongDetail(songId);
+      // Ownership-gated for local uploads: an id the requester cannot see
+      // resolves to null, so it cannot be played.
+      const song = await scopedSongDetail(provider, localViewerFor(req.user), songId);
       if (!song) {
         res.status(404).json({ error: "Song not found" });
         return;
@@ -611,7 +652,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -636,7 +677,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -681,7 +722,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -717,7 +758,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -751,7 +792,7 @@ export function createPlayerRouter(
       });
       res.json(body);
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -772,7 +813,9 @@ export function createPlayerRouter(
       }
       const provider = bot.getProviderFor(selectedPlatform);
 
-      const song = await provider.getSongDetail(songId);
+      // Same ownership gate as play-by-id: a member cannot queue an upload
+      // belonging to another tenant, even with a valid (leaked) id.
+      const song = await scopedSongDetail(provider, localViewerFor(req.user), songId);
       if (!song) {
         res.json({ message: "Song not found" });
         return;
@@ -797,7 +840,7 @@ export function createPlayerRouter(
 
       res.json(body);
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 
@@ -818,7 +861,7 @@ export function createPlayerRouter(
       }
       res.json(pm.getConfig());
     } catch (err) {
-      res.status([400, 409].includes((err as { status?: number }).status ?? 0) ? (err as { status: number }).status : 500).json({ error: (err as Error).message });
+      respondPlaybackError(res, err);
     }
   });
 

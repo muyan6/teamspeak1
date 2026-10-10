@@ -3,6 +3,46 @@ import type { Request, Response, NextFunction } from "express";
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 /**
+ * The host that Origin/Referer must match, plus whether the request can be
+ * judged at all.
+ *
+ * `reject` means "undeterminable, fail closed": a trusted proxy is in front but
+ * it APPENDED to X-Forwarded-Host, so the first entry is client-supplied and the
+ * last is not demonstrably ours either. Without a canonical `publicUrl` there is
+ * no server-side value to compare against, so the safest answer is to refuse —
+ * otherwise `Origin: evil.com` + `X-Forwarded-Host: evil.com,…` would pass.
+ */
+export interface HostResolution {
+  host: string | null;
+  reject: boolean;
+  reason?: string;
+}
+
+export function resolveExpectedHost(input: {
+  canonicalHost?: string;
+  isProxyTrusted: boolean;
+  xForwardedHost?: string;
+  hostHeader?: string;
+}): HostResolution {
+  const canonical = (input.canonicalHost ?? "").trim();
+  if (canonical) return { host: canonical, reject: false };
+
+  if (input.isProxyTrusted) {
+    const entries = (input.xForwardedHost ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    if (entries.length > 1) {
+      return { host: null, reject: true, reason: "ambiguous X-Forwarded-Host chain" };
+    }
+    if (entries.length === 1) return { host: entries[0], reject: false };
+  }
+
+  const host = (input.hostHeader ?? "").trim();
+  return { host: host || null, reject: false };
+}
+
+/**
  * Same-origin CSRF protection. For mutating requests, the Origin or Referer
  * header must indicate a host equal to the request's own host.
  *
@@ -18,37 +58,27 @@ export function csrfOriginCheck(req: Request, res: Response, next: NextFunction)
   const refererHeader = req.get("referer");
   const headerHost = hostOf(originHeader) ?? hostOf(refererHeader);
 
-  // Preferred: compare against the OPERATOR-CONFIGURED canonical host. When
-  // publicUrl is set, one side of the comparison is a server-side value instead
-  // of a client-supplied header — which is what made `Origin: evil.com` +
-  // `X-Forwarded-Host: evil.com` pass whenever trustProxy was enabled.
-  const canonicalHost = req.app?.get("canonicalHost") as string | undefined;
-  if (canonicalHost) {
-    if (!headerHost || headerHost !== canonicalHost) {
-      res.status(403).json({ error: "bad origin" });
-      return;
-    }
-    next();
+  const trust = req.app?.get("trust proxy fn") as ((ip: string, hop: number) => boolean) | undefined;
+  const isProxyTrusted = trust?.(req.socket?.remoteAddress ?? "", 0) ?? false;
+  const resolved = resolveExpectedHost({
+    canonicalHost: req.app?.get("canonicalHost") as string | undefined,
+    isProxyTrusted,
+    xForwardedHost: req.get("x-forwarded-host"),
+    hostHeader: req.get("host"),
+  });
+
+  // No `publicUrl` + a proxy that appends to X-Forwarded-Host: we cannot tell
+  // which host is really ours, so we fail closed. The operator fixes this once
+  // by configuring `publicUrl`.
+  if (resolved.reject) {
+    res.status(403).json({
+      error: "bad origin",
+      hint: "trusted proxy supplied an ambiguous X-Forwarded-Host chain; set publicUrl",
+    });
     return;
   }
 
-  // Fallback (no publicUrl configured): compare Origin/Referer against the
-  // request's own host, taking the FIRST X-Forwarded-Host entry — the same
-  // convention Express itself uses for req.hostname, and what a multi-hop
-  // deployment (outer proxy sets the public host, inner appends) relies on.
-  //
-  // Residual risk, called out rather than hidden: this fallback compares two
-  // client-supplied headers against each other, so a proxy that APPENDS to
-  // (instead of setting) X-Forwarded-Host lets a spoofed first entry pass.
-  // Configuring `publicUrl` enables the canonical-host path above, which is
-  // immune; that is the recommended setup for proxied deployments.
-  const trust = req.app?.get('trust proxy fn') as ((ip: string, hop: number) => boolean) | undefined;
-  const isProxyTrusted = trust?.(req.socket?.remoteAddress ?? '', 0) ?? false;
-  const forwardedHost = isProxyTrusted
-    ? req.get("x-forwarded-host")?.split(",")[0].trim()
-    : undefined;
-  const expectedHost = forwardedHost || req.get("host");
-  if (!headerHost || !expectedHost || headerHost !== expectedHost) {
+  if (!headerHost || !resolved.host || headerHost !== resolved.host) {
     res.status(403).json({ error: "bad origin" });
     return;
   }

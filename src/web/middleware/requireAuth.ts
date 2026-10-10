@@ -62,12 +62,18 @@ export function createRequireAuth(
       // must not have their browser cookie silently promoted to the 7-day
       // member/admin window — sessions.ts already enforces this in the DB, and
       // the cookie has to match or the two disagree.
+      //
+      // P2-25: when the store reports the authoritative server-side deadline
+      // (which is itself capped by the absolute lifetime), use it verbatim
+      // instead of minting a fresh full-length cookie on every request.
+      const roleTtl = result.role === "guest" ? GUEST_SESSION_TTL_MS : SESSION_TTL_MS;
+      const remaining = typeof result.expiresAt === "number" ? result.expiresAt - Date.now() : roleTtl;
       res.cookie(SESSION_COOKIE_NAME, token, {
         httpOnly: true,
         sameSite: "lax",
         secure: req.secure,
         path: "/",
-        maxAge: result.role === "guest" ? GUEST_SESSION_TTL_MS : SESSION_TTL_MS,
+        maxAge: Math.max(0, Math.min(roleTtl, remaining)),
       });
     }
     next();

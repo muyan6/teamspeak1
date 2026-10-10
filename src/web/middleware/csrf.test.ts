@@ -81,8 +81,37 @@ describe("csrfOriginCheck middleware", () => {
     expect(res.status).toBe(200);
   });
 
-  it("supports comma-separated multi-hop X-Forwarded-Host", async () => {
+  // A proxy that APPENDS to X-Forwarded-Host puts client-supplied data FIRST, so
+  // the first entry cannot be trusted as "our" host. Without a canonical
+  // publicUrl there is nothing server-side to compare against, so the guard now
+  // fails closed instead of accepting the spoofable first entry. (This test used
+  // to assert 200 for exactly that spoofable shape — see P2-15.)
+  it("fails closed on a comma-separated (appended) X-Forwarded-Host without publicUrl", async () => {
     app.set("trust proxy", true);
+    const res = await request(app)
+      .post("/")
+      .set("Host", "127.0.0.1:3000")
+      .set("X-Forwarded-Host", "music.example.com, internal-proxy.local")
+      .set("Origin", "https://music.example.com");
+    expect(res.status).toBe(403);
+    expect(res.body.hint).toContain("publicUrl");
+  });
+
+  it("rejects a spoofed first X-Forwarded-Host entry (appending proxy)", async () => {
+    app.set("trust proxy", true);
+    const res = await request(app)
+      .post("/")
+      .set("Host", "127.0.0.1:3000")
+      .set("X-Forwarded-Host", "evil.com, internal-proxy.local")
+      .set("Origin", "https://evil.com");
+    expect(res.status).toBe(403);
+  });
+
+  it("still serves a multi-hop chain once publicUrl pins the canonical host", async () => {
+    app.set("trust proxy", true);
+    // server.ts sets this from config.publicUrl — with it present the comparison
+    // no longer involves any client-supplied header.
+    app.set("canonicalHost", "music.example.com");
     const res = await request(app)
       .post("/")
       .set("Host", "127.0.0.1:3000")

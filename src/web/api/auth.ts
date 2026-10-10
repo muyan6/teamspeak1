@@ -9,6 +9,7 @@ import type { BotConfig, JellyfinConfig } from "../../data/config.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireNotGuest } from "../middleware/requireNotGuest.js";
 import { requireAdmin } from "../middleware/requireAdmin.js";
+import { createRateLimit } from "../middleware/rateLimit.js";
 
 /**
  * True only for an http(s) URL. The "test connection" probe issues an
@@ -43,6 +44,28 @@ export function createAuthRouter(
   config?: BotConfig
 ): Router {
   const router = Router();
+  // P2-17: the SMS endpoints drive real SMS traffic to an arbitrary number and
+  // verify a 4-6 digit code, yet had no throttle at all — an admin session (or
+  // a stolen one) could bomb numbers and brute-force codes. Keyed on the
+  // authenticated user, not the IP, since these are admin-only routes.
+  const smsSendLimit = createRateLimit({
+    capacity: 3,
+    refillPerSec: 3 / 600, // 3 per 10 minutes
+    keyFn: (req) => `sms-send:${req.user?.id ?? req.ip ?? "unknown"}`,
+  });
+  const smsVerifyLimit = createRateLimit({
+    capacity: 5,
+    refillPerSec: 5 / 600, // 5 per 10 minutes
+    keyFn: (req) => `sms-verify:${req.user?.id ?? req.ip ?? "unknown"}`,
+  });
+  // P2-18: the probe round-trips credentials to a FIXED host, so the upstream
+  // error text turns it into a username/password oracle. Throttle it as well as
+  // coarsening the answer for non-admins (see the route).
+  const jellyfinTestLimit = createRateLimit({
+    capacity: 10,
+    refillPerSec: 10 / 60,
+    keyFn: (req) => `jellyfin-test:${req.user?.id ?? req.ip ?? "unknown"}`,
+  });
   const pendingQr = new Map<string, { owner: string; expiresAt: number; busy: boolean }>();
   const owner = (req: import('express').Request) => createHash('sha256')
     .update(`${req.user?.id ?? ''}:${extractSessionToken(req.headers.cookie) ?? ''}`).digest('hex');
@@ -141,7 +164,7 @@ export function createAuthRouter(
   // round-trips /System/Info so Settings can verify form values BEFORE saving.
   // Empty/missing credential fields fall back to the stored config, so a
   // masked (not re-entered) password still tests the live setup.
-  router.post("/jellyfin/test", requirePermission("platform.auth"), async (req, res) => {
+  router.post("/jellyfin/test", requirePermission("platform.auth"), jellyfinTestLimit, async (req, res) => {
     const testable = jellyfinProvider as
       | (MusicProvider & {
           testConnection?: (
@@ -197,14 +220,24 @@ export function createAuthRouter(
         apiKey: str(body.apiKey, stored?.apiKey ?? ""),
         userId: str(body.userId, stored?.userId ?? ""),
       };
-      res.json(await testable.testConnection(candidate));
+      const result = await testable.testConnection(candidate);
+      // P2-18: even though the host is fixed, the USERNAME and PASSWORD come
+      // from the request and the upstream error message distinguishes "unknown
+      // user" from "wrong password" from "unreachable". That makes this a
+      // credential oracle against the operator's Jellyfin for anyone holding the
+      // grantable `platform.auth` capability. Non-admins get a coarse verdict.
+      if (!isAdmin && result && !result.ok) {
+        res.json({ ok: false, error: "connection failed" });
+        return;
+      }
+      res.json(result);
     } catch (err) {
       logger.error({ err }, "Jellyfin test connection failed");
       res.status(500).json({ error: (err as Error).message });
     }
   });
 
-  router.post("/sms/send", requireAdmin, async (req, res) => {
+  router.post("/sms/send", requireAdmin, smsSendLimit, async (req, res) => {
     try {
       const { phone } = req.body;
       if (!phone) {
@@ -224,7 +257,7 @@ export function createAuthRouter(
     }
   });
 
-  router.post("/sms/verify", requireAdmin, async (req, res) => {
+  router.post("/sms/verify", requireAdmin, smsVerifyLimit, async (req, res) => {
     try {
       const { phone, code } = req.body;
       if (!phone || !code) {

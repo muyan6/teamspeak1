@@ -37,7 +37,7 @@ import { createPermissionStore } from "../data/permissions.js";
 import { createRequireAuth } from "./middleware/requireAuth.js";
 import { requireAdmin } from "./middleware/requireAdmin.js";
 import { requireNotGuest } from "./middleware/requireNotGuest.js";
-import { csrfOriginCheck } from "./middleware/csrf.js";
+import { csrfOriginCheck, resolveExpectedHost } from "./middleware/csrf.js";
 import { createRateLimit, createRateLimitBucket } from "./middleware/rateLimit.js";
 import { validateSessionFromHeaders, extractSessionToken } from "./auth/validateSession.js";
 
@@ -165,14 +165,39 @@ export function createWebServer(options: WebServerOptions): WebServer {
   // neighbour's failures.
   // 3 req per minute per IP for /setup (more limited; first-run is rare).
   // 10 req per minute per IP for /guest.
+  //
+  // P2-16: with `trustProxy` OFF we cannot attribute a request to a client
+  // address at all — behind a reverse proxy every request carries the PROXY's
+  // address, so a per-IP bucket is one bucket shared by every user. An attacker
+  // who alone exhausts it locks the whole instance out of /login. So when the
+  // address is not attributable we deliberately key these limiters on a single
+  // GLOBAL bucket and raise the ceiling ~10x: the point is only to stop a flood,
+  // while per-account throttling (the (IP+username) loginLimit below, which is
+  // still unique per username) continues to cap password guessing.
+  const addressAttributed = options.config.trustProxy === true;
+  const keyByClient = (req: { ip?: string }): string =>
+    addressAttributed ? req.ip ?? "unknown" : "global";
+  const ceiling = (n: number) => (addressAttributed ? n : n * 10);
   const loginLimit = createRateLimit({
     capacity: 5,
     refillPerSec: 5 / 60,
-    keyFn: (req) => `${req.ip}:${String(req.body?.username ?? "").trim().toLowerCase()}`,
+    keyFn: (req) => `${keyByClient(req)}:${String(req.body?.username ?? "").trim().toLowerCase()}`,
   });
-  const loginIpLimit = createRateLimit({ capacity: 20, refillPerSec: 20 / 60 });
-  const setupLimit = createRateLimit({ capacity: 3, refillPerSec: 3 / 60 });
-  const guestLimit = createRateLimit({ capacity: 10, refillPerSec: 10 / 60 });
+  const loginIpLimit = createRateLimit({
+    capacity: ceiling(20),
+    refillPerSec: ceiling(20) / 60,
+    keyFn: keyByClient,
+  });
+  const setupLimit = createRateLimit({
+    capacity: ceiling(3),
+    refillPerSec: ceiling(3) / 60,
+    keyFn: keyByClient,
+  });
+  const guestLimit = createRateLimit({
+    capacity: ceiling(10),
+    refillPerSec: ceiling(10) / 60,
+    keyFn: keyByClient,
+  });
   app.use("/api/session/login", loginIpLimit, loginLimit);
   app.use("/api/session/setup", setupLimit);
   app.use("/api/session/guest", guestLimit);
@@ -233,6 +258,11 @@ export function createWebServer(options: WebServerOptions): WebServer {
       // the connection without a restart. Runtime object is a JellyfinProvider
       // (see index.ts); WebServerOptions types it as the wider MusicProvider.
       options.jellyfinProvider as JellyfinProvider,
+      // P1-②: a member who creates a bot gets it added to their access list, but
+      // their already-open WS still holds the upgrade-time scope. Reuse the
+      // revocation sweep: the client auto-reconnects and picks up the widened
+      // scope. Wired below once the WS controller exists.
+      (userId) => onUserAccessRevoked(userId),
     )
   );
   app.use(
@@ -364,20 +394,24 @@ export function createWebServer(options: WebServerOptions): WebServer {
     }
     const canonicalHost = app.get("canonicalHost") as string | undefined;
     const isProxyTrusted = (app.get('trust proxy fn') as (ip: string, hop: number) => boolean)(req.socket.remoteAddress ?? '', 0);
-    const forwardedHost = isProxyTrusted
-      ? (req.headers["x-forwarded-host"] as string | undefined)?.split(",")[0].trim()
-      : undefined;
-    const expectedHost = canonicalHost ?? (forwardedHost || req.headers.host);
+    // Same rule as the HTTP CSRF middleware (single source of truth) so a
+    // WebSocket upgrade can never be laxer than a plain request.
+    const resolved = resolveExpectedHost({
+      canonicalHost,
+      isProxyTrusted,
+      xForwardedHost: req.headers["x-forwarded-host"] as string | undefined,
+      hostHeader: req.headers.host,
+    });
 
     const originHeader = req.headers.origin;
-    if (originHeader) {
+    if (originHeader || resolved.reject) {
       let originHost: string | null = null;
       try {
-        originHost = new URL(originHeader).host;
+        originHost = originHeader ? new URL(originHeader).host : null;
       } catch {
         // fall through; treat as missing/invalid origin
       }
-      if (!originHost || originHost !== expectedHost) {
+      if (resolved.reject || !originHost || originHost !== resolved.host) {
         socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
         socket.destroy();
         return;
