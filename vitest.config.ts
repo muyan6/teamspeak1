@@ -11,5 +11,9 @@ export default defineConfig({
   test: {
     include: ["src/**/*.test.ts", "web/src/**/*.test.ts"],
     exclude: ["**/node_modules/**", "dist/**", "web/dist/**"],
+    // Installs a stub Opus encoder ONLY when the native addon cannot be loaded
+    // (Node-ABI mismatch), so the suite stays runnable locally without weakening
+    // CI, where the real addon is present.
+    setupFiles: ["src/vitest.setup.ts"],
   },
 });
