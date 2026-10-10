@@ -1,4 +1,5 @@
-import { mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, existsSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join, resolve, sep } from "node:path";
 
 const MIME_TO_EXT: Record<string, string> = {
@@ -39,13 +40,28 @@ export function createAvatarStore(dir: string): AvatarStore {
       const rel = `${botId}.${ext}`;
       const target = contained(rel);
       if (!target) throw new Error("invalid avatar path");
-      for (const name of readdirSync(root)) {
-        if (name.startsWith(`${botId}.`)) {
-          const stale = contained(name);
-          if (stale) rmSync(stale, { force: true });
-        }
+      // P2-8: write to a sibling temp file and rename into place. A crash or a
+      // full disk mid-write used to leave a TRUNCATED file at the final path —
+      // served to browsers, which cache it by name, with no way to roll back.
+      // rename(2) is atomic within a directory, so the final path is either the
+      // old image or the new one, never a partial one.
+      const tmp = contained(`${rel}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+      if (!tmp) throw new Error("invalid avatar path");
+      writeFileSync(tmp, buffer);
+      try {
+        renameSync(tmp, target);
+      } catch (err) {
+        try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+        throw err;
       }
-      writeFileSync(target, buffer);
+      // Remove any avatar this bot left under a DIFFERENT extension (the MIME can
+      // change between uploads). Probing the three known extensions is O(1);
+      // the previous readdirSync listed the ENTIRE directory on every write.
+      for (const otherExt of Object.values(MIME_TO_EXT)) {
+        if (otherExt === ext) continue;
+        const stale = contained(`${botId}.${otherExt}`);
+        if (stale) rmSync(stale, { force: true });
+      }
       return rel;
     },
     read(relPath) {

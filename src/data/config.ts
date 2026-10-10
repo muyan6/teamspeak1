@@ -494,7 +494,8 @@ export function loadConfig(path: string): BotConfig {
         ? partial.autoSourceFallback
         : defaults.autoSourceFallback;
 
-    return {
+    const known = new Set<string>(Object.keys(defaults));
+    const built: BotConfig = {
       webPort:
         typeof partial.webPort === "number" &&
         Number.isInteger(partial.webPort) &&
@@ -557,6 +558,20 @@ export function loadConfig(path: string): BotConfig {
       autoSourceFallback,
       defaultPlatform: defaultPlatformPref,
     };
+
+    // P2-13: carry through keys this build does not recognise.
+    //
+    // index.ts does `loadConfig()` and immediately `saveConfig()`s the result, so
+    // any field the running version did not know about (added by a NEWER build, a
+    // rollback target, or a hand edit) used to be silently DELETED on the next
+    // boot. Known keys always win — they were sanitised above — and the three
+    // prototype-poisoning names are never copied from parsed JSON.
+    const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (known.has(key) || UNSAFE_KEYS.has(key)) continue;
+      (built as unknown as Record<string, unknown>)[key] = value;
+    }
+    return built;
   }
 }
 

@@ -9,7 +9,7 @@ import {
 } from "./data/config.js";
 import { createDatabase, backupDatabase } from "./data/database.js";
 import { assertDataDirUsable } from "./data/data-dir.js";
-import { createLogger } from "./logger.js";
+import { createLogger, flushLoggerSync } from "./logger.js";
 import { createApiServerManager } from "./music/api-server.js";
 import { NeteaseProvider } from "./music/netease.js";
 import { QQMusicProvider } from "./music/qq.js";
@@ -71,8 +71,35 @@ async function main() {
   process.on("uncaughtException", (err) => {
     scheduleFatalExit("Uncaught exception", { err });
   });
+  // P2-11: a handler registered here OVERRIDES Node's own default (since Node 15
+  // an unhandled rejection terminates the process), so swallowing it entirely —
+  // which is what this used to do — is strictly laxer than doing nothing. It was
+  // also inconsistent with uncaughtException right above.
+  //
+  // It is deliberately NOT fatal on the FIRST occurrence, though: this process is
+  // a long-lived music bot behind `restart: unless-stopped`, so a single stray
+  // rejection would turn into a container restart loop and take music down
+  // completely. A STORM (several within a short window) is the signature of a
+  // genuinely wedged state and does escalate to the fatal path.
+  const REJECTION_STORM_WINDOW_MS = 10_000;
+  const REJECTION_STORM_THRESHOLD = 5;
+  let rejectionTimes: number[] = [];
   process.on("unhandledRejection", (reason) => {
-    logger.error({ reason }, "Unhandled promise rejection");
+    const now = Date.now();
+    rejectionTimes = rejectionTimes.filter((t) => now - t < REJECTION_STORM_WINDOW_MS);
+    rejectionTimes.push(now);
+    if (rejectionTimes.length >= REJECTION_STORM_THRESHOLD) {
+      scheduleFatalExit("Unhandled promise rejection storm", {
+        reason,
+        count: rejectionTimes.length,
+        windowMs: REJECTION_STORM_WINDOW_MS,
+      });
+      return;
+    }
+    logger.error(
+      { reason, countInWindow: rejectionTimes.length },
+      "Unhandled promise rejection (fix the producer; repeated occurrences will terminate the process)",
+    );
   });
   const db = createDatabase(DB_PATH);
 
@@ -228,6 +255,7 @@ async function main() {
     const forceExit = setTimeout(() => {
       logger.warn('Shutdown timed out — forcing exit');
       try { db.close(); } catch {}
+      try { flushLoggerSync(); } catch {}
       process.exit(1);
     }, 5000);
     forceExit.unref();
@@ -240,13 +268,13 @@ async function main() {
     }
 
     // Give pending async teardown (sidecar kills, WAL checkpoint) a moment to
-    // finish, then close the DB and exit.
+    // finish, then close the DB and flush the log transport and exit.
     try {
       db.close();
-      try {
-        (logger as any).flush?.();
-      } catch {}
-      await new Promise<void>(resolve => setTimeout(resolve, 100));
+      // P2-12: `logger.flush?.()` does not exist on this pino version (logging
+      // runs on a transport worker thread), so the old call was a no-op followed
+      // by a hopeful 100 ms sleep. flushSync() is the real thing.
+      flushLoggerSync();
     } catch (err) {
       logger.warn({ err }, "Error while closing database");
     }

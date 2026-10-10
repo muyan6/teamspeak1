@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
-import { CAPABILITIES, BOTS_ALL } from "./permissions.js";
+import { BOTS_ALL } from "./permissions.js";
 import { GUEST_USER_ID, GUEST_USERNAME } from "./users.js";
 import type { QueuedSong } from "../audio/queue.js";
 import { MAX_QUEUE_SONGS } from "../audio/queue.js";
@@ -93,6 +93,20 @@ export interface ProfileConfig {
   channelDescEnabled: boolean;
   nowPlayingMsgEnabled: boolean;
 }
+
+/**
+ * The exact set of keys `ProfileConfig` may contain. Used to whitelist incoming
+ * partial updates so a client cannot inject `__proto__` or invent new fields
+ * that would then be persisted.
+ */
+export const PROFILE_FLAG_KEYS: readonly (keyof ProfileConfig)[] = [
+  "avatarEnabled",
+  "descriptionEnabled",
+  "nicknameEnabled",
+  "awayStatusEnabled",
+  "channelDescEnabled",
+  "nowPlayingMsgEnabled",
+];
 
 export const DEFAULT_PROFILE_CONFIG: ProfileConfig = {
   avatarEnabled: true,
@@ -218,7 +232,12 @@ function migrateSchema(db: Database.Database): void {
   const userColumns = db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
   const userColNames = userColumns.map((c) => c.name);
   if (!userColNames.includes("role")) {
-    db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'");
+    // P2-5: this column is added to databases that predate the role feature.
+    // The old default was 'admin', which silently PROMOTED every pre-existing
+    // account to platform administrator on upgrade — the dangerous direction.
+    // 'member' is the safe default, and the backfill below then restores the
+    // access those accounts actually had (see backfillMemberPermissions).
+    db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'");
   }
 
   const historyColumns = db.prepare("PRAGMA table_info(play_history)").all() as Array<{ name: string }>;
@@ -282,7 +301,10 @@ function initTables(db: Database.Database): void {
       passwordHash TEXT NOT NULL,
       createdAt INTEGER NOT NULL,
       updatedAt INTEGER NOT NULL,
-      role TEXT NOT NULL DEFAULT 'admin'
+      -- P2-5: 'member' is the safe default. Every insert path passes the role
+      -- explicitly (createFirstUser uses 'admin'), so this only matters as a
+      -- last-resort guard against accidentally minting an administrator.
+      role TEXT NOT NULL DEFAULT 'member'
     );
 
     CREATE TABLE IF NOT EXISTS sessions (
@@ -362,12 +384,26 @@ function initTables(db: Database.Database): void {
 }
 
 /**
+ * Capabilities granted to `member` rows that predate the account-permissions
+ * feature.
+ *
+ * P2-6: deliberately NOT `[...CAPABILITIES]`. The three security-sensitive
+ * grants that were split out later — `bot.create` (spin up instances that
+ * auto-connect to attacker-chosen addresses), `platform.auth` (replace the
+ * process-wide music account cookie every tenant plays through) and `quality`
+ * (retune audio for everyone) — were never explicitly given to anyone. Granting
+ * them wholesale to every legacy member on upgrade is a silent privilege
+ * escalation; an operator who wants them can grant them from the users UI.
+ */
+export const LEGACY_MEMBER_CAPABILITIES = ["player.control", "player.queue", "bot.manage"] as const;
+
+/**
  * One-time backfill: existing `member` users created before the
- * account-permissions feature are granted full access (all 5 capabilities +
- * the `bots.all` marker), exactly once per database. Admins are skipped (they
- * bypass permission checks). New members created after this runs are not
- * affected — they get the basic tier via POST /api/users. A marker row in
- * `schema_meta` makes this idempotent.
+ * account-permissions feature are granted the access they effectively had
+ * (the legacy capability tier + the `bots.all` marker), exactly once per
+ * database. Admins are skipped (they bypass permission checks). New members
+ * created after this runs are not affected — they get the basic tier via
+ * POST /api/users. A marker row in `schema_meta` makes this idempotent.
  */
 export function backfillMemberPermissions(db: Database.Database): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT)`);
@@ -375,7 +411,7 @@ export function backfillMemberPermissions(db: Database.Database): void {
   if (done) return;
   const members = db.prepare("SELECT id FROM users WHERE role = 'member'").all() as { id: string }[];
   const insCap = db.prepare("INSERT OR IGNORE INTO user_permissions (userId, permission) VALUES (?, ?)");
-  const tokens = [...CAPABILITIES, BOTS_ALL];
+  const tokens: string[] = [...LEGACY_MEMBER_CAPABILITIES, BOTS_ALL];
   const tx = db.transaction(() => {
     for (const m of members) {
       for (const t of tokens) insCap.run(m.id, t);
@@ -752,24 +788,30 @@ export function createDatabase(dbPath: string): BotDatabase {
       }
       // Strip any lazily-resolved url before persisting.
       const stripped: StoredSong[] = songs.map((s) => publicSong(normalizeSong(s)));
-      // Enforce the per-owner cap only for a NEW name (an overwrite of an
-      // existing saved queue must always be allowed).
-      const existing = selectSavedQueueIdByOwnerName.get(ownerId, name) as
-        | { id: number }
-        | undefined;
-      if (!existing) {
-        const { c } = countSavedQueues.get(ownerId) as { c: number };
-        if (c >= MAX_SAVED_QUEUES) {
-          throw new Error(`保存失败：已保存队列数量超过上限 ${MAX_SAVED_QUEUES}`);
+      // P2-7: the cap check and the write must be one atomic unit. Read first and
+      // write later and two concurrent saves (or a future async caller) could both
+      // observe c < MAX_SAVED_QUEUES and both insert, exceeding the per-owner cap.
+      const write = db.transaction(() => {
+        // Enforce the per-owner cap only for a NEW name (an overwrite of an
+        // existing saved queue must always be allowed).
+        const existing = selectSavedQueueIdByOwnerName.get(ownerId, name) as
+          | { id: number }
+          | undefined;
+        if (!existing) {
+          const { c } = countSavedQueues.get(ownerId) as { c: number };
+          if (c >= MAX_SAVED_QUEUES) {
+            throw new Error(`保存失败：已保存队列数量超过上限 ${MAX_SAVED_QUEUES}`);
+          }
         }
-      }
-      upsertSavedQueue.run({
-        ownerId,
-        creatorId: creatorId || (ownerId !== SHARED_QUEUE_OWNER ? ownerId : ""),
-        name,
-        songs: JSON.stringify(stripped),
-        songCount: stripped.length,
+        upsertSavedQueue.run({
+          ownerId,
+          creatorId: creatorId || (ownerId !== SHARED_QUEUE_OWNER ? ownerId : ""),
+          name,
+          songs: JSON.stringify(stripped),
+          songCount: stripped.length,
+        });
       });
+      write();
       const row = selectSavedQueueByOwnerName.get(ownerId, name) as SavedQueueMeta;
       return { ...rowToSavedMeta(row), songs: stripped };
     },

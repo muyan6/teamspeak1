@@ -50,6 +50,13 @@ export interface PermissionStore {
   getCapabilities(userId: string): Capability[];
   getBotAccess(userId: string): BotAccess;
   setPermissions(userId: string, input: { capabilities: string[]; bots: BotAccess }): void;
+  /**
+   * Add a single bot to a user's access list without touching their
+   * capabilities. Used when a member holding only `bot.create` creates an
+   * instance; `setPermissions` would be wrong here because it REPLACES the
+   * whole capability set (a concurrent edit would be clobbered).
+   */
+  grantBotAccess(userId: string, botId: string): void;
   pruneBot(botId: string): void;
 }
 
@@ -86,6 +93,9 @@ export function createPermissionStore(db: Database.Database): PermissionStore {
         }
       });
       tx();
+    },
+    grantBotAccess(userId, botId) {
+      insBot.run(userId, botId);
     },
     pruneBot(botId) {
       pruneBotStmt.run(botId);

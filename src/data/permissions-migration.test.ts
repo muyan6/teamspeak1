@@ -2,8 +2,8 @@ import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { createDatabase, backfillMemberPermissions, type BotDatabase } from "./database.js";
-import { createPermissionStore, CAPABILITIES } from "./permissions.js";
+import { createDatabase, backfillMemberPermissions, LEGACY_MEMBER_CAPABILITIES, type BotDatabase } from "./database.js";
+import { createPermissionStore } from "./permissions.js";
 
 describe("backfillMemberPermissions", () => {
   let dbFile: string;
@@ -35,7 +35,14 @@ describe("backfillMemberPermissions", () => {
     backfillMemberPermissions(db.db);
 
     const store = createPermissionStore(db.db);
-    expect(store.getCapabilities("m1").sort()).toEqual([...CAPABILITIES].sort());
+    // P2-6: the backfill grants the LEGACY tier plus bots.all — NOT every entry
+    // in CAPABILITIES. bot.create / platform.auth / quality were split out after
+    // this backfill was written, and handing them to every existing member on
+    // upgrade would be a silent privilege escalation.
+    expect(store.getCapabilities("m1").sort()).toEqual([...LEGACY_MEMBER_CAPABILITIES].sort());
+    expect(store.getCapabilities("m1")).not.toContain("bot.create");
+    expect(store.getCapabilities("m1")).not.toContain("platform.auth");
+    expect(store.getCapabilities("m1")).not.toContain("quality");
     expect(store.getBotAccess("m1")).toBe("all");
     expect(store.getCapabilities("a1")).toEqual([]);
     expect(store.getBotAccess("a1")).toEqual([]);

@@ -32,6 +32,9 @@ export interface AuditStore {
   list(limit: number, offset: number): AuditEntry[];
 }
 
+/** Hard ceiling on one page of audit history. */
+export const AUDIT_MAX_LIMIT = 200;
+
 export function createAuditStore(db: Database.Database): AuditStore {
   const insertStmt = db.prepare(
     "INSERT INTO user_audit (timestamp, actorId, actorUsername, targetUserId, targetUsername, action) VALUES (?, ?, ?, ?, ?, ?)"
@@ -52,7 +55,15 @@ export function createAuditStore(db: Database.Database): AuditStore {
       );
     },
     list(limit, offset) {
-      return listStmt.all(limit, offset) as AuditEntry[];
+      // P2-9: clamp HERE, not only in the route. SQLite treats a negative LIMIT
+      // as "no limit", so a future caller passing -1 would dump the entire audit
+      // table; a negative OFFSET is silently ignored. Normalise both so the
+      // store's contract holds regardless of who calls it.
+      const safeLimit = Number.isFinite(limit)
+        ? Math.min(AUDIT_MAX_LIMIT, Math.max(1, Math.trunc(limit)))
+        : AUDIT_MAX_LIMIT;
+      const safeOffset = Number.isFinite(offset) ? Math.max(0, Math.trunc(offset)) : 0;
+      return listStmt.all(safeLimit, safeOffset) as AuditEntry[];
     },
   };
 }

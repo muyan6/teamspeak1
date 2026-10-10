@@ -7,6 +7,17 @@ export const GUEST_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 1 day — guests are
 export const SESSION_TOUCH_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 export const MAX_SESSIONS_PER_USER = 10;
 /**
+ * P2-25: absolute session lifetime, independent of activity.
+ *
+ * Every expiry above is SLIDING — `validateAndTouch` pushes `expiresAt` forward
+ * on each touch — so a stolen cookie that is used (or simply refreshed) more
+ * often than once an hour stays valid forever. An absolute cap makes the session
+ * die after a fixed window no matter what, forcing a real re-authentication.
+ * Sized deliberately long so it is invisible to normal users.
+ */
+export const SESSION_ABSOLUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+export const GUEST_SESSION_ABSOLUTE_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+/**
  * Cap for the SHARED guest principal. Guests are login-less and all share one
  * synthetic userId, so the per-user cap cannot apply (it would evict other
  * people's sessions). Without any cap, though, a guest-login loop grew the
@@ -18,6 +29,13 @@ export interface SessionValidation {
   userId: string;
   username: string;
   role: "admin" | "member" | "guest";
+  /**
+   * Server-side expiry for this session (epoch ms). Lets the HTTP layer set the
+   * cookie's own maxAge to the SAME deadline instead of blindly re-issuing a
+   * fresh 7-day cookie on every request — which decoupled the browser cookie's
+   * lifetime from the server session and from the absolute cap.
+   */
+  expiresAt?: number;
 }
 
 export interface SessionStore {
@@ -39,7 +57,7 @@ export function createSessionStore(db: Database.Database): SessionStore {
     "INSERT INTO sessions (id, userId, createdAt, expiresAt, lastSeenAt) VALUES (?, ?, ?, ?, ?)"
   );
   const selectStmt = db.prepare(`
-    SELECT s.id, s.userId, s.expiresAt, s.lastSeenAt, u.username, u.role
+    SELECT s.id, s.userId, s.createdAt, s.expiresAt, s.lastSeenAt, u.username, u.role
     FROM sessions s INNER JOIN users u ON u.id = s.userId
     WHERE s.id = ?
   `);
@@ -60,9 +78,13 @@ export function createSessionStore(db: Database.Database): SessionStore {
   return {
     validate(rawToken) {
       if (!rawToken) return null;
-      const row = selectStmt.get(hashToken(rawToken)) as (SessionValidation & { userId: string; username: string; role: SessionValidation['role']; expiresAt: number }) | undefined;
+      const row = selectStmt.get(hashToken(rawToken)) as (SessionValidation & { userId: string; username: string; role: SessionValidation['role']; createdAt: number; expiresAt: number }) | undefined;
       if (!row || row.expiresAt <= Date.now()) return null;
-      return { userId: row.userId, username: row.username, role: row.role };
+      // Absolute lifetime applies to the read-only path too: a long-lived
+      // WebSocket must not outlive the session it was opened with.
+      const absoluteTtl = row.role === "guest" ? GUEST_SESSION_ABSOLUTE_TTL_MS : SESSION_ABSOLUTE_TTL_MS;
+      if (Date.now() - row.createdAt > absoluteTtl) return null;
+      return { userId: row.userId, username: row.username, role: row.role, expiresAt: row.expiresAt };
     },
     createSession(userId, opts) {
       // Cap concurrent sessions per user — oldest gets evicted on overflow.
@@ -98,7 +120,7 @@ export function createSessionStore(db: Database.Database): SessionStore {
       if (!rawToken) return null;
       const id = hashToken(rawToken);
       const row = selectStmt.get(id) as
-        | { id: string; userId: string; expiresAt: number; lastSeenAt: number; username: string; role: string }
+        | { id: string; userId: string; createdAt: number; expiresAt: number; lastSeenAt: number; username: string; role: string }
         | undefined;
       if (!row) return null;
       const now = Date.now();
@@ -106,13 +128,35 @@ export function createSessionStore(db: Database.Database): SessionStore {
         deleteByIdStmt.run(id);
         return null;
       }
+      // P2-25: absolute cap. Sliding renewal below would otherwise keep a stolen
+      // token alive indefinitely; past this window the session is destroyed
+      // rather than renewed, so the holder has to authenticate again.
+      const absoluteTtl = row.role === "guest" ? GUEST_SESSION_ABSOLUTE_TTL_MS : SESSION_ABSOLUTE_TTL_MS;
+      if (now - row.createdAt > absoluteTtl) {
+        deleteByIdStmt.run(id);
+        return null;
+      }
       if (now - row.lastSeenAt > SESSION_TOUCH_INTERVAL_MS) {
         // Refresh against the role's own TTL — guests are short-lived (1d) and
-        // must NOT be bumped to the member/admin 7d window on touch.
+        // must NOT be bumped to the member/admin 7d window on touch. Capped at
+        // the absolute deadline so a touch can never extend past it.
         const ttl = row.role === "guest" ? GUEST_SESSION_TTL_MS : SESSION_TTL_MS;
-        touchStmt.run(now, now + ttl, id);
+        const deadline = row.createdAt + absoluteTtl;
+        const nextExpiry = Math.min(now + ttl, deadline);
+        touchStmt.run(now, nextExpiry, id);
+        return {
+          userId: row.userId,
+          username: row.username,
+          role: row.role as "admin" | "member" | "guest",
+          expiresAt: nextExpiry,
+        };
       }
-      return { userId: row.userId, username: row.username, role: row.role as "admin" | "member" | "guest" };
+      return {
+        userId: row.userId,
+        username: row.username,
+        role: row.role as "admin" | "member" | "guest",
+        expiresAt: row.expiresAt,
+      };
     },
 
     deleteSession(rawToken) {
