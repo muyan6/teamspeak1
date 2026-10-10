@@ -1101,6 +1101,39 @@ export class BotInstance extends EventEmitter {
     this.autoReconnectTimer.unref?.();
   }
 
+  /**
+   * Reconnect handshake with a hard timeout, matching the startup path
+   * (`connectWithTimeout` in manager.ts uses 25s for the same reason).
+   *
+   * A server that accepts the TCP connection and then stays silent makes
+   * `tsClient.connect()` wait for the library's own 60s idle timeout, so a
+   * single wedged attempt stretched recovery far beyond the backoff schedule.
+   *
+   * Teardown on timeout deliberately uses the LOW-LEVEL client: calling
+   * `this.disconnect()` would set `manualDisconnect`, permanently disabling
+   * auto-reconnect — the opposite of the intent.
+   */
+  private async connectWithHandshakeTimeout(ms: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`connect handshake timeout after ${ms}ms`)), ms);
+    });
+    try {
+      await Promise.race([this.connect(), timeout]);
+    } catch (err) {
+      if (!this.connected) {
+        try {
+          this.tsClient.disconnect();
+        } catch {
+          // best-effort transport teardown
+        }
+      }
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private async _attemptAutoReconnect(): Promise<void> {
     if (this.canRun?.() === false) { this._cancelReconnect(); return; }
     if (this.manualDisconnect || this.connected) return;
@@ -1109,7 +1142,7 @@ export class BotInstance extends EventEmitter {
       "Attempting auto-reconnect...",
     );
     try {
-      await this.connect();
+      await this.connectWithHandshakeTimeout(BotInstance.RECONNECT_HANDSHAKE_TIMEOUT_MS);
       this.reconnectAttempts = 0;
       this.logger.info({ botId: this.id }, "Auto-reconnect succeeded");
 
@@ -1317,6 +1350,9 @@ export class BotInstance extends EventEmitter {
     this.fmProvider = null;
     this.fmRequesterName = undefined;
   }
+
+  /** Hard cap on a single reconnect handshake (matches the 25s used at startup). */
+  private static readonly RECONNECT_HANDSHAKE_TIMEOUT_MS = 25_000;
 
   /** Chat-command source flags. No flag → the configured default platform
    *  (netease in the default config; otherwise the first enabled source by

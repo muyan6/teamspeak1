@@ -110,6 +110,16 @@ export interface CreateBotParams {
   ts6ApiKey?: string;
   /** Password required to join the TS server. */
   serverPassword?: string;
+  /**
+   * The user creating the bot, when creation came from the Web API.
+   *
+   * `bot.create` is a standalone capability (a member can be allowed to create
+   * bots without holding `bot.manage` or `bots:all`). Without recording this the
+   * creator could not see, stop or configure the instance they had just made —
+   * while `autoStart` (default true) had it connecting on its own, leaving an
+   * unmanageable bot behind. Omitting it (integration/managed path) skips the grant.
+   */
+  ownerUserId?: string;
 }
 
 export class BotManager extends EventEmitter {
@@ -212,13 +222,20 @@ export class BotManager extends EventEmitter {
       this.database.saveBotInstance(savedRecord);
       if (managed) this.integration.insert({ ...managed.lease, serviceId: managed.serviceId,
         payloadHash: managed.payloadHash, botId: id, deleted: false });
+      // Grant the creator access to the bot they just made, in the SAME
+      // transaction so a crash can never leave an instance nobody can manage.
+      // Holders of `bots:all` (and admins) already match every id, so skip them
+      // to avoid pointless rows.
+      if (params.ownerUserId && this.permissions.getBotAccess(params.ownerUserId) !== "all") {
+        this.permissions.grantBotAccess(params.ownerUserId, id);
+      }
     })();
 
     const bot = this.buildBotInstance(savedRecord);
     this.bots.set(id, bot);
     this.emit("botInstance", bot);
 
-    this.logger.info({ botId: id, name: params.name }, "Bot instance created");
+    this.logger.info({ botId: id, name: params.name, ownerUserId: params.ownerUserId }, "Bot instance created");
     if (managed) this.startLeaseMonitor();
     return bot;
   }

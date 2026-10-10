@@ -4,7 +4,7 @@ import { downloadCoverImage } from '../music/image-download.js';
 export { isSafeCoverUrl } from '../music/image-download.js';
 import { TS3Client, escapeTS3 } from "../ts-protocol/client.js";
 import { HttpQueryError } from "../ts-protocol/http-query.js";
-import type { ProfileConfig } from "../data/database.js";
+import { PROFILE_FLAG_KEYS, type ProfileConfig } from "../data/database.js";
 import type { QueuedSong } from "../audio/queue.js";
 import type { Logger } from "../logger.js";
 
@@ -166,8 +166,22 @@ export class BotProfileManager {
     return { ...this.config };
   }
 
+  /**
+   * Apply a partial profile config.
+   *
+   * P2-19: this used to be a bare `Object.assign(this.config, partial)` fed
+   * straight from `req.body`. Two problems: a `__proto__` key in the JSON body
+   * walks the prototype chain (and `Object.assign` would happily copy it), and
+   * any undeclared field the client invented got stored and later persisted by
+   * `saveProfileConfig`. Only the six known boolean flags are accepted, and each
+   * must actually be a boolean — anything else is ignored rather than coerced.
+   */
   updateConfig(partial: Partial<ProfileConfig>): void {
-    Object.assign(this.config, partial);
+    if (!partial || typeof partial !== "object") return;
+    for (const key of PROFILE_FLAG_KEYS) {
+      const value = partial[key];
+      if (typeof value === "boolean") this.config[key] = value;
+    }
   }
 
   // --- Internal update methods ---
