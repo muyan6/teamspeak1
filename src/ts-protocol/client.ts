@@ -22,6 +22,7 @@ import {
   type FileUploadInfo,
 } from "@honeybbq/teamspeak-client";
 import type { Logger } from "../logger.js";
+import { splitTextIntoChunks } from "../bot/text-chunk.js";
 import {
   detectServerProtocol,
   type ServerProtocol,
@@ -592,6 +593,17 @@ export class TS3Client extends EventEmitter {
   }
 
   async joinChannel(channelName: string, password?: string): Promise<void> {
+    // Run one move at a time so concurrent callers cannot interleave their
+    // clientMove round-trips and overwrite `currentChannelId` out of order.
+    const next = this.channelMoveTail.then(
+      () => this.performChannelMove(channelName, password),
+      () => this.performChannelMove(channelName, password),
+    );
+    this.channelMoveTail = next.then(() => {}, () => {});
+    return next;
+  }
+
+  private async performChannelMove(channelName: string, password?: string): Promise<void> {
     if (!this.client) return;
 
     const isNumeric = /^\d+$/.test(channelName);
@@ -663,7 +675,13 @@ export class TS3Client extends EventEmitter {
     if (!this.client) return;
     // targetMode 2 = channel, target 0 = current channel
     const target = targetMode === 2 ? BigInt(0) : BigInt(this.clientId);
-    await sendTextMessage(this.client, targetMode, target, message);
+    // TeamSpeak caps a message at roughly 1024 bytes (and less after escaping),
+    // so a long error text or track description used to arrive truncated. Chunk
+    // through the same helper the chat replies already use — it is a pure
+    // newline-aware splitter with no dependencies, so the import adds no cycle.
+    for (const chunk of splitTextIntoChunks(message)) {
+      await sendTextMessage(this.client, targetMode, target, chunk);
+    }
   }
 
   async getClientsInChannel(): Promise<ClientInfo[]> {
@@ -838,6 +856,18 @@ export class TS3Client extends EventEmitter {
 
   private voiceFramesSent = 0;
   private voiceSendErrors = 0;
+  /**
+   * Serializes channel moves.
+   *
+   * joinChannel() is reachable from several independent paths — the occupancy
+   * fan-out's automatic return to the default channel, `!move` / `!follow`, and
+   * the reconnect recovery — and each one wrote `currentChannelId` unconditionally
+   * after its own `clientMove` resolved. Two overlapping moves therefore raced,
+   * and the LAST RESOLVER won even if its move had been issued first, leaving
+   * `currentChannelId` pointing at a channel the client was not actually in
+   * (which then corrupted the occupancy/subscription decisions).
+   */
+  private channelMoveTail: Promise<unknown> = Promise.resolve();
 
   sendVoiceData(opusFrame: Buffer): void {
     if (!this.client || this.disconnecting) return;

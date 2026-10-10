@@ -12,9 +12,10 @@ const ESCAPE_MAP: [string, string][] = [
   ["\x0B", "\\v"],
 ];
 
-const UNESCAPE_MAP: [string, string][] = ESCAPE_MAP.map(
-  ([plain, escaped]) => [escaped, plain] as [string, string]
-).reverse();
+/** escape-code character -> the value it stands for. */
+const UNESCAPE_TABLE: Record<string, string> = Object.fromEntries(
+  ESCAPE_MAP.map(([plain, escaped]) => [escaped.slice(1), plain]),
+);
 
 export function escapeValue(value: string): string {
   let result = value;
@@ -24,10 +25,29 @@ export function escapeValue(value: string): string {
   return result;
 }
 
+/**
+ * Reverse `escapeValue` with a SINGLE left-to-right pass.
+ *
+ * A sequence of `replaceAll` calls cannot invert the escaping: the replacement
+ * for `\s` also matches the second character of the escape sequence `\\`, so
+ * `unescapeValue(escapeValue("back\\slash"))` yielded `back\ lash`. Scanning
+ * once and consuming the character after a backslash keeps `\\` opaque, which is
+ * exactly how the TeamSpeak query protocol is defined.
+ */
 export function unescapeValue(value: string): string {
-  let result = value;
-  for (const [escaped, plain] of UNESCAPE_MAP) {
-    result = result.replaceAll(escaped, plain);
+  if (!value.includes("\\")) return value;
+  let result = "";
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch === "\\" && i + 1 < value.length) {
+      const replacement = UNESCAPE_TABLE[value[i + 1]];
+      if (replacement !== undefined) {
+        result += replacement;
+        i++; // consume the escape code
+        continue;
+      }
+    }
+    result += ch;
   }
   return result;
 }

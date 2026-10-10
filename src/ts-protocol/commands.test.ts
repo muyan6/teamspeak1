@@ -53,3 +53,52 @@ describe("TS3 Commands", () => {
     expect(encoded).toBe("quit\n");
   });
 });
+
+describe("escape/unescape round-trip", () => {
+  // Regression: sequential replaceAll could not invert the escaping. `\s` also
+  // matched the second character of the escape sequence `\\`, so a value with a
+  // backslash was corrupted ("back\slash" -> "back\ lash").
+  it("is an exact inverse for backslash-bearing values", () => {
+    for (const value of [
+      "back\\slash",
+      "C:\\new folder",
+      "a\\sb",
+      "\\\\",
+      "\\",
+      "\\\\s",
+      "prefix\\nbranch",
+      "x\\ty",
+      "pipe|and space and/slash",
+      "trailing\\",
+    ]) {
+      expect(unescapeValue(escapeValue(value))).toBe(value);
+    }
+  });
+
+  it("keeps an escaped backslash opaque instead of letting it start a code", () => {
+    // "\\\\s" in TS source is the 3-char sequence \ \ s: an escaped backslash
+    // followed by a literal "s", i.e. the value `\s`. It must NOT become " ".
+    expect(unescapeValue("\\\\s")).toBe("\\s");
+    expect(unescapeValue("\\\\n")).toBe("\\n");
+    expect(unescapeValue("\\\\p")).toBe("\\p");
+  });
+
+  it("still decodes every real escape code", () => {
+    expect(unescapeValue("a\\sb")).toBe("a b");
+    expect(unescapeValue("a\\pb")).toBe("a|b");
+    expect(unescapeValue("a\\/b")).toBe("a/b");
+    expect(unescapeValue("a\\nb")).toBe("a\nb");
+    expect(unescapeValue("a\\rb")).toBe("a\rb");
+    expect(unescapeValue("a\\tb")).toBe("a\tb");
+    expect(unescapeValue("\\\\")).toBe("\\");
+  });
+
+  it("passes values through unchanged when there is no escape character", () => {
+    expect(unescapeValue("plain value")).toBe("plain value");
+    expect(unescapeValue("")).toBe("");
+  });
+
+  it("leaves a trailing lone backslash alone", () => {
+    expect(unescapeValue("abc\\")).toBe("abc\\");
+  });
+});

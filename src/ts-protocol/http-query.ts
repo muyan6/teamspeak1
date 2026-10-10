@@ -160,19 +160,36 @@ export class TS6HttpQuery {
     }
   }
 
+  /**
+   * Fail fast on a non-2xx response.
+   *
+   * The class contract is that a rejected command must never look like success:
+   * a 400 (bad parameter) or 403 (insufficient permission) silently dropped
+   * makes callers log a false success and leaves the client state wrong.
+   */
+  private requireOk(path: string, result: HttpQueryResult): HttpQueryResult {
+    if (result.status < 200 || result.status >= 300) {
+      throw new HttpQueryError(path, result.status, result.body);
+    }
+    return result;
+  }
+
   /** List virtual servers */
   async serverList(): Promise<HttpQueryResult> {
-    return this.request("GET", "/1/serverlist");
+    const path = "/1/serverlist";
+    return this.requireOk(path, await this.request("GET", path));
   }
 
   /** List clients on a virtual server */
   async clientList(sid = 1): Promise<HttpQueryResult> {
-    return this.request("GET", `/1/clientlist?sid=${sid}`);
+    const path = `/1/clientlist?sid=${sid}`;
+    return this.requireOk(path, await this.request("GET", path));
   }
 
   /** List channels on a virtual server */
   async channelList(sid = 1): Promise<HttpQueryResult> {
-    return this.request("GET", `/1/channellist?sid=${sid}`);
+    const path = `/1/channellist?sid=${sid}`;
+    return this.requireOk(path, await this.request("GET", path));
   }
 
   /** Send a text message */
@@ -182,11 +199,12 @@ export class TS6HttpQuery {
     msg: string,
     sid = 1,
   ): Promise<HttpQueryResult> {
-    return this.request("POST", `/1/sendtextmessage?sid=${sid}`, {
+    const path = `/1/sendtextmessage?sid=${sid}`;
+    return this.requireOk(path, await this.request("POST", path, {
       targetmode: targetMode,
       target,
       msg,
-    });
+    }));
   }
 
   /**
@@ -202,11 +220,7 @@ export class TS6HttpQuery {
     sid = 1,
   ): Promise<HttpQueryResult> {
     const path = `/1/clientupdate?sid=${sid}`;
-    const result = await this.request("POST", path, properties);
-    if (result.status < 200 || result.status >= 300) {
-      throw new HttpQueryError(path, result.status, result.body);
-    }
-    return result;
+    return this.requireOk(path, await this.request("POST", path, properties));
   }
 
   /** Move a client to a channel */
@@ -218,6 +232,7 @@ export class TS6HttpQuery {
   ): Promise<HttpQueryResult> {
     const body: Record<string, unknown> = { clid, cid };
     if (cpw) body.cpw = cpw;
-    return this.request("POST", `/1/clientmove?sid=${sid}`, body);
+    const path = `/1/clientmove?sid=${sid}`;
+    return this.requireOk(path, await this.request("POST", path, body));
   }
 }
