@@ -1564,6 +1564,9 @@ async function checkAuthStatus() {
   }
 }
 
+// P2-43: 组件卸载后就不要再触碰它的响应式状态，也不要让在飞的请求/轮询回写。
+let qrUnmounted = false;
+
 async function startQrLogin(platform: string) {
   const qr = getQrState(platform);
   if (platform === 'netease') neteaseLoginMode.value = 'qr';
@@ -1573,12 +1576,21 @@ async function startQrLogin(platform: string) {
 
   // Stop existing poll
   if (qr.pollTimer) clearInterval(qr.pollTimer);
+  qr.pollTimer = null;
   qr.loading = true;
   qr.dataUrl = '';
+  qr.key = '';
   qr.status = 'waiting';
+
+  // P2-43: 定时器必须在 await 之前就创建好——pollQrStatus() 在拿到 key 之前会
+  // 直接 no-op，所以提前开启是安全的。若仍像原来那样在 await 之后才 setInterval，
+  // 组件在二维码请求飞行途中卸载时 pollTimer 还是 null，onUnmounted 清不到它，
+  // 结果每 2s 永久轮询并写入已卸载的响应式对象。
+  qr.pollTimer = setInterval(() => pollQrStatus(platform), 2000);
 
   try {
     const res = await axios.post('/api/auth/qrcode', { platform });
+    if (qrUnmounted) return; // 组件已卸载：不要再写状态/开轮询
     const { qrUrl, qrImg, key } = res.data;
     qr.key = key;
 
@@ -1598,11 +1610,13 @@ async function startQrLogin(platform: string) {
       });
     }
 
+    if (qrUnmounted) return;
     qr.loading = false;
-
-    // Start polling
-    qr.pollTimer = setInterval(() => pollQrStatus(platform), 2000);
   } catch (err) {
+    // 生成失败：清掉提前开启的轮询，避免空 key 后续无意义地打服务器。
+    if (qr.pollTimer) clearInterval(qr.pollTimer);
+    qr.pollTimer = null;
+    if (qrUnmounted) return;
     qr.loading = false;
     console.error('QR generation failed:', err);
   }
@@ -1610,10 +1624,12 @@ async function startQrLogin(platform: string) {
 
 async function pollQrStatus(platform: string) {
   const qr = getQrState(platform);
+  if (qrUnmounted) return;
   if (!qr.key) return;
 
   try {
     const res = await axios.post('/api/auth/qrcode/status', { key: qr.key, platform });
+    if (qrUnmounted) return; // 请求期间被卸载，丢弃响应
     qr.status = res.data.status;
 
     if (qr.status === 'confirmed') {
@@ -2506,10 +2522,12 @@ onMounted(() => {
 onUnmounted(() => {
   botEditor.close();
   permissionEditor.close();
-  if (neteaseQr.pollTimer) clearInterval(neteaseQr.pollTimer);
-  if (qqQr.pollTimer) clearInterval(qqQr.pollTimer);
-  if (bilibiliQr.pollTimer) clearInterval(bilibiliQr.pollTimer);
-  if (kugouQr.pollTimer) clearInterval(kugouQr.pollTimer);
+  // P2-43: 先在飞的请求/轮询会检查该标志并丢弃回写；再彻底清掉四个定时器。
+  qrUnmounted = true;
+  for (const qr of [neteaseQr, qqQr, bilibiliQr, kugouQr]) {
+    if (qr.pollTimer) clearInterval(qr.pollTimer);
+    qr.pollTimer = null;
+  }
 });
 </script>
 

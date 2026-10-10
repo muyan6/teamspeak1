@@ -82,8 +82,11 @@ const lyricRequests = createLatestRequest();
 
 const bgStyle = computed(() => {
   if (currentSong.value?.coverUrl) {
+    // P2-52: coverUrl 直接拼进 CSS url() 时，值里的引号/括号会破坏整条声明。
+    // 用 encodeURI 转义（它会编码 `"` 为 %22；再用双引号包住，`(`/`)` 也只
+    // 是普通字符，无法提前闭合 url()）。
     return {
-      backgroundImage: `url(${currentSong.value.coverUrl})`,
+      backgroundImage: `url("${encodeURI(currentSong.value.coverUrl)}")`,
       backgroundSize: 'cover',
       backgroundPosition: 'center',
     };
@@ -99,7 +102,7 @@ async function fetchLyrics() {
   activeLine.value = -1;
 
   try {
-    const res = await axios.get(`/api/music/lyrics/${currentSong.value.id}`, {
+    const res = await axios.get(`/api/music/lyrics/${encodeURIComponent(currentSong.value.id)}`, {
       params: { platform: currentSong.value.platform },
       signal: ticket.signal,
     });

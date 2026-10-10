@@ -102,12 +102,15 @@ onMounted(async () => {
   const id = route.params.id as string;
   const platform = (route.query.platform as string) || 'netease';
 
+  // P2-52: id 来自路由参数，直接拼进请求路径可能被 `/`、`?`、中文等破坏。
+  // encodeURIComponent 保证它只作为一个路径段发出（服务端仍会做自己的校验）。
+  const pathId = encodeURIComponent(id);
   const detailUrl = kind === 'album'
-    ? `/api/music/album/${id}/detail`
-    : `/api/music/playlist/${id}/detail`;
+    ? `/api/music/album/${pathId}/detail`
+    : `/api/music/playlist/${pathId}/detail`;
   const songsUrl = kind === 'album'
-    ? `/api/music/album/${id}`
-    : `/api/music/playlist/${id}`;
+    ? `/api/music/album/${pathId}`
+    : `/api/music/playlist/${pathId}`;
 
   // allSettled, not Promise.all — if detail 404s but songs is fine
   // (e.g., a QQ playlist whose detail endpoint flaked but the song
@@ -160,7 +163,6 @@ async function toggleFavorite() {
     const fav = store.favoritedPlaylists.find((f) => f.playlistId === id && f.platform === platform);
     if (fav) {
       await store.removeFavorite(fav.id);
-      favorited.value = false;
     }
   } else {
     await store.addFavorite({
@@ -170,8 +172,11 @@ async function toggleFavorite() {
       coverUrl: playlist.value?.coverUrl ?? '',
       songCount: songs.value.length,
     });
-    favorited.value = true;
   }
+  // P2-48: addFavorite/removeFavorite 内部已 catch 且失败只弹提示、不改 store，
+  // 因此这里用 store 作为唯一事实来源回写本地 favorited，失败时红心自动回滚，
+  // 不会出现「请求失败却仍点亮」的状态。
+  favorited.value = store.isFavorited(id, platform);
 }
 </script>
 

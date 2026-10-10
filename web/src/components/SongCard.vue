@@ -87,8 +87,12 @@ function onRowClick(e: MouseEvent) {
 }
 
 function formatDuration(seconds: number): string {
+  // P2-47: duration 可能为 undefined（部分源/本地曲目缺时长）。没有守卫时
+  // undefined/60=NaN、undefined%60=NaN，页面会渲染成 "NaN:NaN"。
+  // 与 Player.vue 的 formatTime 保持一致：非法值回退 "0:00"。
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
   const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
+  const s = Math.floor(seconds % 60);
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 </script>

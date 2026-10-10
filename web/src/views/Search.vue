@@ -205,7 +205,9 @@ import { mergeDedup, hasMore, nextOffset } from './searchPagination.js';
 const PAGE_SIZE = 20;
 const searches = createLatestRequest();
 let searchGeneration = 0;
-onUnmounted(() => { searchGeneration++; searches.cancel(); });
+// 防抖定时器（P2-46 的 route.query.q watcher 用），在卸载时一并清理。
+let routeQueryTimer: ReturnType<typeof setTimeout> | null = null;
+onUnmounted(() => { searchGeneration++; searches.cancel(); if (routeQueryTimer) clearTimeout(routeQueryTimer); });
 
 const store = usePlayerStore();
 const route = useRoute();
@@ -411,6 +413,30 @@ async function doSearch() {
     if (ticket.isCurrent()) loading.value = false;
   }
 }
+
+// P2-46: 原来只在初始化时读一次 route.query.q，浏览器后退/前进或从外链进入
+// /search?q=x 都不会刷新结果。监听 q 变化：同步搜索框，并在值确实变化时做一次
+// 防抖搜索（复用 createLatestRequest 保证同一批请求只保留最新响应）。doSearch 自己
+// 会 router.replace 相同的 q，这里用不等判断避免自触发回环。
+watch(() => route.query.q, (raw) => {
+  const q = typeof raw === 'string' ? raw : '';
+  if (q === query.value) return;
+  query.value = q;
+  if (routeQueryTimer) { clearTimeout(routeQueryTimer); routeQueryTimer = null; }
+  if (!q.trim()) {
+    // 清空查询（例如后退到无 q 的 /search）：直接清空结果，不发请求。
+    searches.cancel(); searchGeneration++;
+    if (loading.value) loading.value = false;
+    searched.value = false;
+    allSongs.value = []; allAlbums.value = []; allPlaylists.value = [];
+    resetPagination();
+    return;
+  }
+  routeQueryTimer = setTimeout(() => {
+    routeQueryTimer = null;
+    doSearch();
+  }, 250);
+});
 
 
 /** Must match LOCAL_UPLOAD_LIMIT in src/web/api/music.ts. */

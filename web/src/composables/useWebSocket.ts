@@ -1,5 +1,6 @@
 import { ref, onUnmounted } from 'vue';
 import { usePlayerStore } from '../stores/player.js';
+import { redirectToLogin } from '../utils/authRedirect.js';
 import { devLog, devWarn } from '../utils/log.js';
 import { useSession } from './useSession.js';
 
@@ -139,30 +140,36 @@ export function useWebSocket() {
       if (event.code === 4009) {
         const session = useSession();
         session.refresh().then(() => {
-          if (!disposed && version === lifecycle && session.isAuthenticated.value) connect();
+          if (disposed || version !== lifecycle) return;
+          if (session.isAuthenticated.value) connect();
+          else redirectToLogin(); // 权限被撤销/会话失效：别再静默死等到下次 API 401
         }).catch(() => { if (!disposed && version === lifecycle) scheduleReconnect(); });
         return;
       }
       // A rejected handshake (expired/revoked session, guest mode turned off) is
-      // not transient: stop retrying and let the next API call's 401 handler
-      // send the user to /login. Everything else backs off exponentially so a
-      // server restart or a flaky network cannot turn every open tab into a
-      // fixed-rate reconnect loop.
+      // not transient: stop retrying AND send the user to /login with a ?next.
+      // Previously this only stopped reconnecting, so an expired cookie left the
+      // tab in a "connected but dead" state until the next manual API call 401'd.
+      // Everything else backs off exponentially so a server restart or a flaky
+      // network cannot turn every open tab into a fixed-rate reconnect loop.
       if (NO_RETRY_CODES.has(event?.code)) {
         devWarn('WebSocket closed by policy; not reconnecting', event?.code);
+        redirectToLogin();
         return;
       }
       // Repeated handshake rejections mean the session is no longer valid (the
       // server answers an unauthenticated upgrade with a plain HTTP error, so
       // there is no meaningful close code). Stop retrying, refresh the session,
-      // and let the shared 401 handler route the user to /login instead of
-      // hammering the upgrade endpoint forever from a stale tab.
+      // and route to /login if it turned out to be invalid instead of hammering
+      // the upgrade endpoint forever from a stale tab.
       if (!openedThisAttempt) {
         consecutiveFailedHandshakes += 1;
         if (consecutiveFailedHandshakes >= MAX_FAILED_HANDSHAKES) {
           const session = useSession();
           session.refresh().then(() => {
-            if (!disposed && version === lifecycle && session.isAuthenticated.value) scheduleReconnect();
+            if (disposed || version !== lifecycle) return;
+            if (session.isAuthenticated.value) scheduleReconnect();
+            else redirectToLogin();
           }).catch(() => { if (!disposed && version === lifecycle) scheduleReconnect(); });
           return;
         }

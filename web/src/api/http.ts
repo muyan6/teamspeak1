@@ -1,5 +1,6 @@
 import router from '../router/index.js';
 import { useSession } from '../composables/useSession.js';
+import { redirectToLogin } from '../utils/authRedirect.js';
 import axios from 'axios';
 
 let installed = false;
@@ -10,12 +11,12 @@ const nativeFetch: typeof window.fetch = window.fetch.bind(window);
  * Exported so both the fetch wrapper and the axios interceptor use one path.
  */
 async function handleUnauthorized(): Promise<void> {
+  // Capture the page before refresh() can navigate away from it, so ?next points
+  // at the protected route the user was actually on.
+  const from = router.currentRoute.value.fullPath;
   const session = useSession();
   await session.refresh();
-  const current = router.currentRoute.value;
-  if (current.name !== 'login' && current.name !== 'first-run') {
-    await router.replace({ name: 'login', query: { next: current.fullPath } });
-  }
+  redirectToLogin(from);
 }
 
 /**

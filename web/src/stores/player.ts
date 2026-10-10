@@ -166,9 +166,12 @@ export const usePlayerStore = defineStore('player', {
     },
     /** Queue for the currently active bot */
     queue(): Song[] {
-      const botId = this.activeBotId ?? this.bots[0]?.id;
-      if (!botId) return [];
-      return this.queues[botId] ?? [];
+      // P2-51: 原来用 `activeBotId ?? bots[0].id`，没有参考 scopedBotId，与 activeBot
+      // getter 的作用域判定不一致——专属链接下可能出现「当前歌曲为空、队列却是别人的」。
+      // 直接复用 activeBot 的解析逻辑，保证两者永远指向同一个 bot。
+      const bot = this.activeBot;
+      if (!bot) return [];
+      return this.queues[bot.id] ?? [];
     },
     /**
      * Interpolated elapsed for the active bot. NOTE: as a Pinia getter this is
@@ -178,10 +181,10 @@ export const usePlayerStore = defineStore('player', {
      * must call the `liveElapsed` action so the clock advances smoothly (#107).
      */
     elapsed(): number {
-      const botId = this.activeBotId ?? this.bots[0]?.id;
-      if (!botId || !this.activeBot?.currentSong) return 0;
-      const timing = this.timings[botId] ?? defaultTiming();
-      const maxDuration = this.activeBot.currentSong.duration || Infinity;
+      const bot = this.activeBot;
+      if (!bot?.currentSong) return 0;
+      const timing = this.timings[bot.id] ?? defaultTiming();
+      const maxDuration = bot.currentSong.duration || Infinity;
       return interpolateElapsed(timing, this.isPaused, maxDuration);
     },
     /** Sources that are currently logged in. Jellyfin (when enabled) leads. */
@@ -209,10 +212,11 @@ export const usePlayerStore = defineStore('player', {
      * server push (#107).
      */
     liveElapsed(): number {
-      const botId = this.activeBotId ?? this.bots[0]?.id;
-      if (!botId || !this.activeBot?.currentSong) return 0;
-      const timing = this.timings[botId] ?? defaultTiming();
-      const maxDuration = this.activeBot.currentSong.duration || Infinity;
+      // P2-51: 与 activeBot 保持同一套 bot 解析逻辑（见 queue getter）。
+      const bot = this.activeBot;
+      if (!bot?.currentSong) return 0;
+      const timing = this.timings[bot.id] ?? defaultTiming();
+      const maxDuration = bot.currentSong.duration || Infinity;
       return interpolateElapsed(timing, this.isPaused, maxDuration);
     },
 
@@ -421,110 +425,143 @@ export const usePlayerStore = defineStore('player', {
     },
 
     async playAtIndex(index: number) {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/play-at`, { index });
-      if (generation !== this.sessionGeneration) return;
-      this._setTiming(botId, {
-        serverElapsed: 0,
-        serverSyncTime: Date.now(),
-        wasPlaying: true,
-      });
-      this._syncAfterAction(botId, generation);
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/play-at`, { index });
+        if (generation !== this.sessionGeneration) return;
+        this._setTiming(botId, {
+          serverElapsed: 0,
+          serverSyncTime: Date.now(),
+          wasPlaying: true,
+        });
+        this._syncAfterAction(botId, generation);
+      }, '播放失败');
     },
 
     async play(query: string, platform = 'netease') {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/play`, { query, platform });
-      if (generation !== this.sessionGeneration) return;
-      this._setTiming(botId, {
-        serverElapsed: 0,
-        serverSyncTime: Date.now(),
-        wasPlaying: true,
-      });
-      this._syncAfterAction(botId, generation);
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/play`, { query, platform });
+        if (generation !== this.sessionGeneration) return;
+        this._setTiming(botId, {
+          serverElapsed: 0,
+          serverSyncTime: Date.now(),
+          wasPlaying: true,
+        });
+        this._syncAfterAction(botId, generation);
+      }, '播放失败');
     },
 
     async playById(songId: string, platform = 'netease') {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      const res = await axios.post(`/api/player/${botId}/play-by-id`, { songId, platform });
-      if (generation !== this.sessionGeneration) return;
-      if (res.data?.ok === false) { this.notify(res.data.message ?? '播放失败', 'error'); return; }
-      this._setTiming(botId, {
-        serverElapsed: 0,
-        serverSyncTime: Date.now(),
-        wasPlaying: true,
-      });
-      this._syncAfterAction(botId, generation);
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        const res = await axios.post(`/api/player/${botId}/play-by-id`, { songId, platform });
+        if (generation !== this.sessionGeneration) return;
+        if (res.data?.ok === false) { this.notify(res.data.message ?? '播放失败', 'error'); return; }
+        this._setTiming(botId, {
+          serverElapsed: 0,
+          serverSyncTime: Date.now(),
+          wasPlaying: true,
+        });
+        this._syncAfterAction(botId, generation);
+      }, '播放失败');
     },
 
     notify(message: string, type: 'error' | 'info' = 'info') {
       this.notification = { id: Date.now(), message, type };
     },
 
-    async playSong(song: Song) {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      // Guests use the non-destructive "play now" (insert-next + skip) so they
-      // can't wipe everyone else's queue; members/admins keep the normal behavior.
-      const endpoint = useSession().isGuest.value ? 'play-now-song' : 'play-song';
-      const res = await axios.post(`/api/player/${botId}/${endpoint}`, { song });
-      if (generation !== this.sessionGeneration) return;
-      if (res.data?.ok === false && res.data?.message) {
-        this.notify(res.data.message, 'error');
-        return;
+    /**
+     * P2-45: 这些 action 由模板直接调用（@click="store.next()"），没有 try/catch
+     * 时一次 403/网络失败就会变成未处理的 Promise 拒绝，界面却毫无反馈——与
+     * playPlaylist/playAlbum 已有的 catch 写法不一致。统一包一层：失败弹出可见
+     * 提示，并把原始错误留在控制台（不静默吞掉），便于诊断。
+     */
+    async _guard(fn: () => Promise<void>, failureMessage: string): Promise<void> {
+      try {
+        await fn();
+      } catch (e: any) {
+        // 403 多为权限不足，给更具体的文案；其余给调用方提供的通用文案。
+        const message = e?.response?.status === 403 ? '没有权限执行该操作' : failureMessage;
+        console.error(`[player] ${failureMessage}:`, e);
+        this.notify(message, 'error');
       }
-      this._setTiming(botId, {
-        serverElapsed: 0,
-        serverSyncTime: Date.now(),
-        wasPlaying: true,
-      });
-      this._syncAfterAction(botId, generation);
+    },
+
+    async playSong(song: Song) {
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        // Guests use the non-destructive "play now" (insert-next + skip) so they
+        // can't wipe everyone else's queue; members/admins keep the normal behavior.
+        const endpoint = useSession().isGuest.value ? 'play-now-song' : 'play-song';
+        const res = await axios.post(`/api/player/${botId}/${endpoint}`, { song });
+        if (generation !== this.sessionGeneration) return;
+        if (res.data?.ok === false && res.data?.message) {
+          this.notify(res.data.message, 'error');
+          return;
+        }
+        this._setTiming(botId, {
+          serverElapsed: 0,
+          serverSyncTime: Date.now(),
+          wasPlaying: true,
+        });
+        this._syncAfterAction(botId, generation);
+      }, '播放失败');
     },
 
     async playNextSong(song: Song) {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      const res = await axios.post(`/api/player/${botId}/play-next-song`, { song });
-      if (generation !== this.sessionGeneration) return;
-      if (res.data?.message) {
-        this.notify(res.data.message, res.data.ok === false ? 'error' : 'info');
-      }
-      // Refresh queue so the inserted item shows up in the side panel
-      this.fetchQueueForBot(botId);
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        const res = await axios.post(`/api/player/${botId}/play-next-song`, { song });
+        if (generation !== this.sessionGeneration) return;
+        if (res.data?.message) {
+          this.notify(res.data.message, res.data.ok === false ? 'error' : 'info');
+        }
+        // Refresh queue so the inserted item shows up in the side panel
+        this.fetchQueueForBot(botId);
+      }, '操作失败');
     },
 
     async addToQueue(query: string, platform = 'netease') {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/add`, { query, platform });
-      if (generation !== this.sessionGeneration) return;
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/add`, { query, platform });
+        if (generation !== this.sessionGeneration) return;
+      }, '加入队列失败');
     },
 
     async addToQueueById(songId: string, platform = 'netease') {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      const res = await axios.post(`/api/player/${botId}/add-by-id`, { songId, platform });
-      if (generation !== this.sessionGeneration) return;
-      if (res.data?.ok === false) { this.notify(res.data.message ?? '播放失败', 'error'); return; }
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        const res = await axios.post(`/api/player/${botId}/add-by-id`, { songId, platform });
+        if (generation !== this.sessionGeneration) return;
+        if (res.data?.ok === false) { this.notify(res.data.message ?? '播放失败', 'error'); return; }
+      }, '加入队列失败');
     },
 
     async addSong(song: Song) {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      const res = await axios.post(`/api/player/${botId}/add-song`, { song });
-      if (generation !== this.sessionGeneration) return;
-      if (res.data?.ok === false) { this.notify(res.data.message ?? '播放失败', 'error'); return; }
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        const res = await axios.post(`/api/player/${botId}/add-song`, { song });
+        if (generation !== this.sessionGeneration) return;
+        if (res.data?.ok === false) { this.notify(res.data.message ?? '播放失败', 'error'); return; }
+      }, '加入队列失败');
     },
 
     async playPlaylist(playlistId: string, platform = 'netease') {
@@ -574,131 +611,151 @@ export const usePlayerStore = defineStore('player', {
     },
 
     async pause(requestedBotId?: string) {
-      const botId = requestedBotId ?? this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      // Freeze elapsed at the current LIVE interpolated value. Using the cached
-      // `elapsed` getter here could snapshot a value up to a few seconds stale.
-      this._setTiming(botId, {
-        serverElapsed: interpolateElapsed(this.timings[botId] ?? defaultTiming(),
-          this.bots.find(b => b.id === botId)?.paused ?? false,
-          this.bots.find(b => b.id === botId)?.currentSong?.duration || Infinity),
-        serverSyncTime: Date.now(),
-        wasPlaying: false,
-      });
-      await axios.post(`/api/player/${botId}/pause`);
-      if (generation !== this.sessionGeneration) return;
+      return this._guard(async () => {
+        const botId = requestedBotId ?? this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        // Freeze elapsed at the current LIVE interpolated value. Using the cached
+        // `elapsed` getter here could snapshot a value up to a few seconds stale.
+        this._setTiming(botId, {
+          serverElapsed: interpolateElapsed(this.timings[botId] ?? defaultTiming(),
+            this.bots.find(b => b.id === botId)?.paused ?? false,
+            this.bots.find(b => b.id === botId)?.currentSong?.duration || Infinity),
+          serverSyncTime: Date.now(),
+          wasPlaying: false,
+        });
+        await axios.post(`/api/player/${botId}/pause`);
+        if (generation !== this.sessionGeneration) return;
+      }, '暂停失败');
     },
 
     async resume(requestedBotId?: string) {
-      const botId = requestedBotId ?? this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/resume`);
-      if (generation !== this.sessionGeneration) return;
-      this._setTiming(botId, {
-        serverSyncTime: Date.now(),
-        wasPlaying: true,
-      });
-      setTimeout(() => this.syncElapsed(botId, generation), 300);
+      return this._guard(async () => {
+        const botId = requestedBotId ?? this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/resume`);
+        if (generation !== this.sessionGeneration) return;
+        this._setTiming(botId, {
+          serverSyncTime: Date.now(),
+          wasPlaying: true,
+        });
+        setTimeout(() => this.syncElapsed(botId, generation), 300);
+      }, '继续播放失败');
     },
 
     async next(requestedBotId?: string) {
-      const botId = requestedBotId ?? this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/next`);
-      if (generation !== this.sessionGeneration) return;
-      this._setTiming(botId, {
-        serverElapsed: 0,
-        serverSyncTime: Date.now(),
-        wasPlaying: true,
-      });
-      this._syncAfterAction(botId, generation);
+      return this._guard(async () => {
+        const botId = requestedBotId ?? this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/next`);
+        if (generation !== this.sessionGeneration) return;
+        this._setTiming(botId, {
+          serverElapsed: 0,
+          serverSyncTime: Date.now(),
+          wasPlaying: true,
+        });
+        this._syncAfterAction(botId, generation);
+      }, '切歌失败');
     },
 
     async prev() {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/prev`);
-      if (generation !== this.sessionGeneration) return;
-      this._setTiming(botId, {
-        serverElapsed: 0,
-        serverSyncTime: Date.now(),
-        wasPlaying: true,
-      });
-      this._syncAfterAction(botId, generation);
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/prev`);
+        if (generation !== this.sessionGeneration) return;
+        this._setTiming(botId, {
+          serverElapsed: 0,
+          serverSyncTime: Date.now(),
+          wasPlaying: true,
+        });
+        this._syncAfterAction(botId, generation);
+      }, '切歌失败');
     },
 
     async clearQueue() {
-      const botId = this.activeBotId, generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/clear`);
-      if (generation !== this.sessionGeneration) return;
-      await this.fetchQueueForBot(botId);
+      return this._guard(async () => {
+        const botId = this.activeBotId, generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/clear`);
+        if (generation !== this.sessionGeneration) return;
+        await this.fetchQueueForBot(botId);
+      }, '清空队列失败');
     },
 
     async stop() {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/stop`);
-      if (generation !== this.sessionGeneration) return;
-      this._setTiming(botId, {
-        serverElapsed: 0,
-        serverSyncTime: 0,
-        wasPlaying: false,
-      });
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/stop`);
+        if (generation !== this.sessionGeneration) return;
+        this._setTiming(botId, {
+          serverElapsed: 0,
+          serverSyncTime: 0,
+          wasPlaying: false,
+        });
+      }, '停止播放失败');
     },
 
     async seek(position: number) {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      this._setTiming(botId, {
-        serverElapsed: position,
-        serverSyncTime: Date.now(),
-        wasPlaying: true,
-      });
-      await axios.post(`/api/player/${botId}/seek`, { position });
-      if (generation !== this.sessionGeneration) return;
-      this._syncAfterAction(botId, generation);
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        this._setTiming(botId, {
+          serverElapsed: position,
+          serverSyncTime: Date.now(),
+          wasPlaying: true,
+        });
+        await axios.post(`/api/player/${botId}/seek`, { position });
+        if (generation !== this.sessionGeneration) return;
+        this._syncAfterAction(botId, generation);
+      }, '跳转失败');
     },
 
     async setVolume(volume: number) {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/volume`, { volume });
-      if (generation !== this.sessionGeneration) return;
-      const bot = this.bots.find((b) => b.id === botId);
-      if (bot) bot.volume = volume;
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/volume`, { volume });
+        if (generation !== this.sessionGeneration) return;
+        const bot = this.bots.find((b) => b.id === botId);
+        if (bot) bot.volume = volume;
+      }, '设置音量失败');
     },
 
     async setMode(mode: string) {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      await axios.post(`/api/player/${botId}/mode`, { mode });
-      if (generation !== this.sessionGeneration) return;
-      const bot = this.bots.find((b) => b.id === botId);
-      if (bot) bot.playMode = mode;
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        await axios.post(`/api/player/${botId}/mode`, { mode });
+        if (generation !== this.sessionGeneration) return;
+        const bot = this.bots.find((b) => b.id === botId);
+        if (bot) bot.playMode = mode;
+      }, '设置播放模式失败');
     },
 
     async startFm(platform: Source = 'netease') {
-      const botId = this.activeBotId;
-      const generation = this.sessionGeneration;
-      if (!botId) return;
-      const res = await axios.post(`/api/player/${botId}/fm`, { platform });
-      if (generation !== this.sessionGeneration) return;
-      if (res.data?.message) {
-        this.notify(res.data.message, res.data.ok === false ? 'error' : 'info');
-      }
-      if (res.data?.ok === false) return;
-      this._setTiming(botId, { serverElapsed: 0 });
-      this._syncAfterAction(botId, generation);
-      this.fetchQueue();
+      return this._guard(async () => {
+        const botId = this.activeBotId;
+        const generation = this.sessionGeneration;
+        if (!botId) return;
+        const res = await axios.post(`/api/player/${botId}/fm`, { platform });
+        if (generation !== this.sessionGeneration) return;
+        if (res.data?.message) {
+          this.notify(res.data.message, res.data.ok === false ? 'error' : 'info');
+        }
+        if (res.data?.ok === false) return;
+        this._setTiming(botId, { serverElapsed: 0 });
+        this._syncAfterAction(botId, generation);
+        this.fetchQueue();
+      }, '私人电台启动失败');
     },
 
     async fetchFavorites() {

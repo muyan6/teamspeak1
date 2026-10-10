@@ -1,4 +1,5 @@
 import { ref, computed, readonly } from "vue";
+import { redirectToLogin } from "../utils/authRedirect.js";
 
 interface User {
   id: string;
@@ -60,7 +61,12 @@ async function refreshMe(): Promise<void> {
     currentUser.value = user;
     ensurePollStarted();
   } else if (res.status === 401) {
+    // P2-44: cookie 过期/会话失效时，原来只清空 currentUser，页面保持「看似已登录
+    // 但所有接口都 401」直到下一次手动导航。若此前是已登录用户（而不是首次加载时
+    // 本就未登录），统一跳转到登录页并带上 ?next。
+    const hadUser = currentUser.value !== null;
     currentUser.value = null;
+    if (hadUser) redirectToLogin();
   }
 }
 

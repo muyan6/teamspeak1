@@ -3,9 +3,14 @@ import { createPinia } from 'pinia';
 import App from './App.vue';
 import router from './router/index.js';
 import { installApiClient } from './api/http.js';
+import { registerAuthRouter } from './utils/authRedirect.js';
 import './styles/global.scss';
 import './styles/mobile.scss';
 
+// Wire the shared session-expiry redirect (used by the REST 401 handler, the
+// WebSocket close path and the session poll) to the live router before anything
+// can trigger it.
+registerAuthRouter(router);
 installApiClient();
 
 const app = createApp(App);

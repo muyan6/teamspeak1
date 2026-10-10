@@ -11,7 +11,7 @@
         @pointerdown="onProgressPointerDown"
         @pointermove="onProgressPointerMove"
         @pointerup="onProgressPointerUp"
-        @pointercancel="onProgressPointerUp"
+        @pointercancel="onProgressPointerCancel"
         @mouseleave="onProgressMouseLeave"
       >
         <div class="progress-bar-bg">
@@ -88,7 +88,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue';
 import { Icon } from '@iconify/vue';
 import { useRoute, useRouter } from 'vue-router';
 import { usePlayerStore } from '../stores/player.js';
@@ -151,20 +151,58 @@ function calculateProgressRatio(e: PointerEvent | MouseEvent): number {
   return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
 }
 
+// P2-49 / 优化建议#10: 无歌曲、暂停或后台标签页时无需每帧重算并重渲染。原来的
+// 循环无条件自我续帧，长驻页面会一直空转 60fps。只在真正需要时运行，条件恢复时
+// 由 watch / visibilitychange 重启。
+function shouldRunProgressClock(): boolean {
+  return !!currentSong.value
+    && store.isPlaying
+    && !(typeof document !== 'undefined' && document.hidden);
+}
+
+function startProgressRaf() {
+  if (rafId === null && shouldRunProgressClock()) rafId = requestAnimationFrame(updateProgress);
+}
+
+function stopProgressRaf() {
+  if (rafId !== null) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+}
+
 function updateProgress() {
+  rafId = null;
+  // 条件不满足就停帧，界面保留最后一帧（暂停位置即冻结值）。
+  if (!shouldRunProgressClock()) return;
+  refreshProgressOnce();
+  rafId = requestAnimationFrame(updateProgress);
+}
+
+/** One rAF tick of work, also usable as a one-shot when the loop is idle. */
+function refreshProgressOnce() {
+  // When the user is dragging the progress bar, do NOT overwrite the display.
+  if (isDraggingProgress.value) return;
   // liveElapsed() (an action, not the cached `elapsed` getter) re-interpolates
   // from the server anchor on every frame so the clock ticks each second (#107).
-  // When the user is dragging the progress bar, do NOT overwrite the display.
-  if (!isDraggingProgress.value) {
-    currentElapsed.value = store.liveElapsed();
+  currentElapsed.value = store.liveElapsed();
 
-    const duration = currentSong.value?.duration ?? 0;
-    progressPercent.value = duration > 0
-      ? Math.min((currentElapsed.value / duration) * 100, 100)
-      : 0;
-  }
+  const duration = currentSong.value?.duration ?? 0;
+  progressPercent.value = duration > 0
+    ? Math.min((currentElapsed.value / duration) * 100, 100)
+    : 0;
+}
 
-  rafId = requestAnimationFrame(updateProgress);
+// 歌曲出现/切换、播放与暂停的切换会改变时钟是否需要运行。停止时补一次刷新，
+// 让进度条对齐当前状态（例如暂停期间歌曲被其他客户端切走）。
+watch([() => currentSong.value?.id, () => store.isPlaying], () => {
+  if (shouldRunProgressClock()) startProgressRaf();
+  else { stopProgressRaf(); refreshProgressOnce(); }
+});
+
+function onVisibilityChange() {
+  if (shouldRunProgressClock()) startProgressRaf();
+  else stopProgressRaf();
 }
 
 function onProgressPointerDown(e: PointerEvent) {
@@ -214,6 +252,7 @@ async function onProgressPointerUp(e: PointerEvent) {
 
   if (!canTransport.value) {
     isDraggingProgress.value = false;
+    refreshProgressOnce();
     return;
   }
   const ratio = calculateProgressRatio(e);
@@ -223,7 +262,24 @@ async function onProgressPointerUp(e: PointerEvent) {
     await store.seek(seekTime);
   } finally {
     isDraggingProgress.value = false;
+    // 时钟在暂停/隐藏时会停帧，这里补一次刷新：成功则对齐新位置，失败则回退。
+    refreshProgressOnce();
   }
+}
+
+function onProgressPointerCancel(e: PointerEvent) {
+  // P2-50: pointercancel（系统手势 / 来电 / 元素被抢占）的坐标是陈旧且无意义的，
+  // 绝不能走 seek 提交路径——只做取消与复位，把进度条交回时钟。
+  if (!isDraggingProgress.value) return;
+  try {
+    (e.currentTarget as HTMLElement)?.releasePointerCapture?.(e.pointerId);
+  } catch { /* ignore */ }
+  if (e.pointerType === 'touch') {
+    progressTooltipVisible.value = false;
+  }
+  isDraggingProgress.value = false;
+  // 取消后把进度条交回时钟（时钟停帧时也保证显示正确，而不是陈旧的拖拽位置）。
+  refreshProgressOnce();
 }
 
 function onProgressMouseLeave() {
@@ -233,11 +289,13 @@ function onProgressMouseLeave() {
 }
 
 onMounted(() => {
-  rafId = requestAnimationFrame(updateProgress);
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibilityChange);
+  startProgressRaf();
 });
 
 onUnmounted(() => {
-  if (rafId !== null) cancelAnimationFrame(rafId);
+  stopProgressRaf();
+  if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibilityChange);
 });
 
 function togglePlay() {

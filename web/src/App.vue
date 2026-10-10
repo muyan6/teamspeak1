@@ -129,6 +129,14 @@ watch(() => session.currentUser.value?.id, (id, previous) => {
   }
 }, { immediate: true });
 const currentSong = computed(() => playerStore.currentSong);
+// P1-⑦: 服务端每次 getStatus() 都会 publicSong() 新建对象，updateBotStatus 又整对象
+// 替换 this.bots[index]，所以按「引用」watch(currentSong) 会把任意一次 WS 状态推送
+// （音量、模式、队列变化…）都误判成切歌。改为按歌曲「身份」(platform:id) 判断：
+// 只有真正换歌时才取消用户进行中的拖拽 seek。
+const currentSongKey = computed(() => {
+  const s = playerStore.currentSong;
+  return s ? `${s.platform}:${s.id}` : null;
+});
 // Volume slider decoupled from the 60fps updateMobileProgress() rAF re-render
 // so it isn't reset mid-drag (#111 — same root cause as the desktop player).
 const {
@@ -156,19 +164,62 @@ const mobileProgressPct = ref(0);
 let syncTimer: ReturnType<typeof setInterval> | null = null;
 let mobileRaf: number | null = null;
 
+// P2-49 / 优化建议#10: 无歌曲、暂停或后台标签页时，进度条不需要每帧重算——原来的
+// 循环无条件自我续帧，长驻页面会一直以 60fps 重渲染整棵 App 树。这里只在
+// 「有歌 + 正在播放 + 页面可见」时续帧，条件恢复时由 watch / visibilitychange 重启。
+function shouldRunMobileClock(): boolean {
+  return !!currentSong.value
+    && playerStore.isPlaying
+    && !(typeof document !== 'undefined' && document.hidden);
+}
+
+function startMobileRaf() {
+  if (mobileRaf === null && shouldRunMobileClock()) {
+    mobileRaf = requestAnimationFrame(updateMobileProgress);
+  }
+}
+
+function stopMobileRaf() {
+  if (mobileRaf !== null) {
+    cancelAnimationFrame(mobileRaf);
+    mobileRaf = null;
+  }
+}
+
 function updateMobileProgress() {
+  mobileRaf = null;
+  // 条件不再满足就停止续帧，界面保留最后一帧的进度值（暂停位置即冻结值）。
+  if (!shouldRunMobileClock()) return;
+  refreshMobileProgressOnce();
+  mobileRaf = requestAnimationFrame(updateMobileProgress);
+}
+
+/** Write the bar once from the current clock. Used by the rAF loop and as a
+ *  one-shot when the loop is idle (paused song change / paused seek) so the bar
+ *  never lags behind the state that stopped the loop. */
+function refreshMobileProgressOnce() {
   // While the finger owns the bar, the clock must keep its hands off it — see
   // seekBarPct below. Skipping the write (rather than letting it be overridden)
   // also avoids 60 pointless reactive re-renders per second mid-drag.
-  if (!seeking.value) {
-    const duration = currentSong.value?.duration ?? 0;
-    // liveElapsed() recomputes each frame; the cached `elapsed` getter would
-    // leave the mobile bar frozen between server pushes (#107).
-    mobileProgressPct.value = duration > 0
-      ? Math.min((playerStore.liveElapsed() / duration) * 100, 100)
-      : 0;
-  }
-  mobileRaf = requestAnimationFrame(updateMobileProgress);
+  if (seeking.value) return;
+  const duration = currentSong.value?.duration ?? 0;
+  // liveElapsed() recomputes each frame; the cached `elapsed` getter would
+  // leave the mobile bar frozen between server pushes (#107).
+  mobileProgressPct.value = duration > 0
+    ? Math.min((playerStore.liveElapsed() / duration) * 100, 100)
+    : 0;
+}
+
+// 歌曲出现/切换、播放与暂停的切换会改变时钟是否需要运行——精确地起/停循环。
+// 停止时补一次刷新，让进度条对齐当前状态（例如别人切歌但本机处于暂停）。
+watch([() => currentSong.value?.id, () => playerStore.isPlaying], () => {
+  if (shouldRunMobileClock()) startMobileRaf();
+  else { stopMobileRaf(); refreshMobileProgressOnce(); }
+});
+
+function onMobileVisibilityChange() {
+  if (shouldRunMobileClock()) startMobileRaf();
+  else stopMobileRaf();
 }
 
 // --- Mini-player seek (#143) -------------------------------------------------
@@ -284,7 +335,11 @@ async function onSeekUp(e: PointerEvent) {
     // the *old* position for one round-trip and then jump a second time.
     // (_syncAfterAction re-polls 500ms later, but that only nudges the bar by
     // the network delta — not worth freezing the clock for.)
-    if (generation === seekGeneration) seeking.value = false;
+    if (generation === seekGeneration) {
+      seeking.value = false;
+      // 若时钟(暂停/隐藏)已停，续帧不会再把 seek 后的新位置画出来，这里补一次。
+      refreshMobileProgressOnce();
+    }
   }
 }
 
@@ -302,7 +357,10 @@ function onSeekCancel(e: PointerEvent) {
 // `seeking` override would stay true and the progress bar would sit frozen for
 // the rest of the session. Bumping the generation also neuters the finally of
 // any seek still in flight.
-watch(currentSong, () => {
+// P1-⑦: watch 的是 currentSongKey（platform:id）而不是 currentSong 对象引用，
+// 否则服务端每次 getStatus() 新建对象都会让「音量/队列」等无关推送触发这里、
+// 静默取消用户正在进行的拖拽。
+watch(currentSongKey, () => {
   if (!seeking.value) return;
   seekGeneration += 1;
   seekPointerId = null;
@@ -358,14 +416,16 @@ onMounted(async () => {
       playerStore.syncElapsed();
     }
   }, 5000);
-  mobileRaf = requestAnimationFrame(updateMobileProgress);
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onMobileVisibilityChange);
+  startMobileRaf();
   // Identity watcher + shared acceptBotList reconcile dedicated scope on every
   // login and reconnect; this must not be a one-time mounted-only operation.
 });
 
 onUnmounted(() => {
   if (syncTimer) clearInterval(syncTimer);
-  if (mobileRaf !== null) cancelAnimationFrame(mobileRaf);
+  stopMobileRaf();
+  if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onMobileVisibilityChange);
 });
 </script>
 
