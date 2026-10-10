@@ -27,8 +27,16 @@ export function currentUid(): number | undefined {
  * then cannot read its own config.json and crash-loops under
  * `restart: unless-stopped`. Nothing inside the container can repair that,
  * so the only useful thing we can do is say exactly what to run on the host.
+ *
+ * `uid` is deliberately a REQUIRED argument with no default. It used to default
+ * to `currentUid()`, which made `dataDirPermissionHint(dir, undefined)` — the
+ * natural way to say "the uid is unknown" — silently substitute the real uid
+ * instead, because `undefined` triggers a default parameter. That only looked
+ * correct on Windows (where `process.getuid` does not exist, so the fallback
+ * fired anyway) and made the non-POSIX test fail on every Linux CI runner.
+ * Callers that mean "whatever this process is" must now pass `currentUid()`.
  */
-export function dataDirPermissionHint(dir: string, uid: number | undefined = currentUid()): string {
+export function dataDirPermissionHint(dir: string, uid: number | undefined): string {
   return [
     "",
     "──────────────────────────────────────────────────────────────────────",

@@ -11,6 +11,29 @@ import {
 
 const tempDirs: string[] = [];
 
+/**
+ * Run `fn` with `process.getuid` present/absent, so the POSIX and non-POSIX
+ * branches can both be exercised on any runner (CI covers Windows and Linux).
+ */
+function withGetuidProperty<T>(value: (() => number) | undefined, fn: () => T): T {
+  const original = Object.getOwnPropertyDescriptor(process, "getuid");
+  Object.defineProperty(process, "getuid", { value, configurable: true, writable: true });
+  try {
+    return fn();
+  } finally {
+    if (original) Object.defineProperty(process, "getuid", original);
+    else delete (process as { getuid?: unknown }).getuid;
+  }
+}
+
+function withGetuid<T>(uid: number, fn: () => T): T {
+  return withGetuidProperty(() => uid, fn);
+}
+
+function withoutGetuid<T>(fn: () => T): T {
+  return withGetuidProperty(undefined, fn);
+}
+
 function makeTempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "tsmb-data-dir-"));
   tempDirs.push(dir);
@@ -45,6 +68,16 @@ describe("isPermissionError", () => {
   });
 });
 
+describe("currentUid", () => {
+  it("reports undefined when the host has no getuid (non-POSIX)", () => {
+    withoutGetuid(() => expect(currentUid()).toBeUndefined());
+  });
+
+  it("reports the process uid when the host has one", () => {
+    withGetuid(4242, () => expect(currentUid()).toBe(4242));
+  });
+});
+
 describe("dataDirPermissionHint", () => {
   it("carries the exact host-side fix, uid and target directory", () => {
     const hint = dataDirPermissionHint("/app/data", 1000);
@@ -55,8 +88,22 @@ describe("dataDirPermissionHint", () => {
     expect(hint).toContain("docker compose up -d");
   });
 
+  it("prints the numeric uid when one is known", () => {
+    expect(dataDirPermissionHint("/app/data", 4242)).toContain("4242");
+  });
+
+  // Regression: `undefined` used to trigger the `uid = currentUid()` default
+  // parameter, so this assertion failed on every POSIX CI runner (the hint
+  // printed the real uid, not the fallback) and passed only on Windows. The
+  // default is gone now, so `undefined` means "unknown" everywhere.
+  it("treats an explicitly unknown uid as unknown even on a host that has one", () => {
+    const hint = withGetuid(4242, () => dataDirPermissionHint("/app/data", undefined));
+    expect(hint).toContain("n/a (非 POSIX 平台)");
+  });
+
   it("degrades gracefully when getuid is unavailable (non-POSIX host)", () => {
-    expect(dataDirPermissionHint("/app/data", undefined)).toContain("n/a (非 POSIX 平台)");
+    const hint = withoutGetuid(() => dataDirPermissionHint("/app/data", currentUid()));
+    expect(hint).toContain("n/a (非 POSIX 平台)");
   });
 
   it("defaults to the current process uid", () => {
