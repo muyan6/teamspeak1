@@ -202,9 +202,11 @@ function download(url, redirects = 0) {
 
 let tarModule = null;
 
-/** `tar` is not a declared dependency — it only resolves transitively through
- *  prebuild-install / @discordjs/node-pre-gyp. Fail with a sentence a user can
- *  act on instead of a raw MODULE_NOT_FOUND stack. */
+/** `tar` IS a declared dependency (package.json `dependencies.tar` +
+ *  `overrides.tar`, currently ^7.5.22), so it resolves from the project root
+ *  rather than only transitively via prebuild-install /
+ *  @discordjs/node-pre-gyp. Fail with a sentence a user can act on instead of a
+ *  raw MODULE_NOT_FOUND stack (e.g. when scripts run before `npm install`). */
 function loadTar() {
   if (tarModule) return tarModule;
   try {
