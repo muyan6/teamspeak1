@@ -8,6 +8,7 @@ import {
   spotifyRedirectUri,
 } from "./data/config.js";
 import { createDatabase, backupDatabase } from "./data/database.js";
+import { assertDataDirUsable } from "./data/data-dir.js";
 import { createLogger } from "./logger.js";
 import { createApiServerManager } from "./music/api-server.js";
 import { NeteaseProvider } from "./music/netease.js";
@@ -42,6 +43,12 @@ const SPOTIFY_DATA_DIR = path.join(DATA_DIR, "spotify");
 const STATIC_DIR = path.join(ROOT_DIR, "web", "dist");
 
 async function main() {
+  // The Docker image runs as a non-root UID, so a data dir bind-mounted by an
+  // older root-running image is unreadable and the bot crash-loops. Nothing in
+  // the container can fix that — surface the host-side command instead of a
+  // bare EACCES stack trace.
+  assertDataDirUsable(DATA_DIR);
+
   // Migrate a pre-#86 root-level config.json into the data dir so existing
   // installs keep their settings; no-op if already migrated or none exists.
   migrateLegacyConfig(LEGACY_CONFIG_PATH, CONFIG_PATH);
