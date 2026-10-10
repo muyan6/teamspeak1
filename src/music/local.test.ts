@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync, type SpawnOptions } from "node:child_process";
 import { createRequire } from "node:module";
 import { buildFfmpegArgs } from "../audio/player.js";
 import { tmpdir } from "node:os";
@@ -318,6 +318,46 @@ describe("LocalMusicProvider filename handling", () => {
 // #149 end-to-end: build real containers with the bundled ffmpeg and push
 // them through the actual upload path. Skipped automatically if the binary is
 // unavailable, so the suite still runs on a machine without it.
+
+/**
+ * Promise-based spawn collecting stdout/stderr.
+ *
+ * This used to be `spawnSync`, but its SYNCHRONOUS pipe setup can fail with
+ * EBUSY on every single call on some Windows configurations (observed
+ * machine-wide, across Node 22 and 24, while async `spawn` with the same
+ * pipes kept working), which turned the decode assertions below into
+ * deterministic failures unrelated to the code under test. Going through
+ * async `spawn` behaves identically everywhere.
+ */
+interface CollectResult {
+  status: number | null;
+  stdout: Buffer | string;
+  stderr: string;
+}
+
+function spawnCollect(
+  cmd: string,
+  args: string[],
+  opts: SpawnOptions & { encoding?: "utf8" } = {},
+): Promise<CollectResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { ...opts, stdio: ["ignore", "pipe", "pipe"] });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout!.on("data", (chunk: Buffer) => out.push(chunk));
+    child.stderr!.on("data", (chunk: Buffer) => err.push(chunk));
+    child.on("error", reject);
+    child.on("close", (status) => {
+      const stdout = Buffer.concat(out);
+      resolve({
+        status,
+        stdout: opts.encoding === "utf8" ? stdout.toString("utf8") : stdout,
+        stderr: Buffer.concat(err).toString("utf8"),
+      });
+    });
+  });
+}
+
 describe("LocalMusicProvider video upload, end to end (#149)", () => {
   const ffmpeg: string | null = (() => {
     try {
@@ -379,14 +419,13 @@ describe("LocalMusicProvider video upload, end to end (#149)", () => {
     });
     const url = (await p.getSongUrl(song.id))!.url;
 
-    const decoded = spawnSync(
+    const decoded = await spawnCollect(
       ffmpeg!,
       [...buildFfmpegArgs(url, 0).slice(0, -1), "-"],
-      { maxBuffer: 64 * 1024 * 1024 },
     );
     expect(decoded.status).toBe(0);
     // 2s of 48 kHz stereo s16le ≈ 384000 bytes; allow codec priming slack.
-    expect(decoded.stdout.length).toBeGreaterThan(300000);
+    expect((decoded.stdout as Buffer).length).toBeGreaterThan(300000);
   }, 60000);
 
   it.runIf(have)("aac extraction decodes bit-for-bit identically to the audio inside the video", async () => {
@@ -404,19 +443,18 @@ describe("LocalMusicProvider video upload, end to end (#149)", () => {
     });
     const url = (await p.getSongUrl(song.id))!.url;
 
-    const toPcm = (input: string, pre: string[] = []) => spawnSync(
+    const toPcm = (input: string, pre: string[] = []) => spawnCollect(
       ffmpeg!,
       ["-hide_banner", "-loglevel", "error", "-i", input, ...pre,
        "-f", "s16le", "-ar", "48000", "-ac", "2", "-acodec", "pcm_s16le", "-"],
-      { maxBuffer: 128 * 1024 * 1024 },
     );
 
-    const fromVideo = toPcm(sourceCopy, ["-vn", "-map", "0:a:0"]);
-    const fromExtract = toPcm(url);
+    const fromVideo = await toPcm(sourceCopy, ["-vn", "-map", "0:a:0"]);
+    const fromExtract = await toPcm(url);
     expect(fromVideo.status).toBe(0);
     expect(fromExtract.status).toBe(0);
-    expect(fromExtract.stdout.length).toBe(fromVideo.stdout.length);
-    expect(fromExtract.stdout.equals(fromVideo.stdout)).toBe(true);
+    expect((fromExtract.stdout as Buffer).length).toBe((fromVideo.stdout as Buffer).length);
+    expect((fromExtract.stdout as Buffer).equals(fromVideo.stdout as Buffer)).toBe(true);
   }, 90000);
 
   it.runIf(have)("refuses a video that genuinely has no audio track", async () => {

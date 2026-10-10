@@ -96,6 +96,7 @@ describe("resolvePermissionContext guest branch", () => {
     getCapabilities: () => [],
     getBotAccess: () => [] as string[],
     setPermissions: () => {},
+    grantBotAccess: () => {},
     pruneBot: () => {},
   };
 

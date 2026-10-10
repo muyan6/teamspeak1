@@ -15,7 +15,48 @@ vi.mock('node:child_process', async importOriginal => {
     return child;
   }) };
 });
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type SpawnOptions } from 'node:child_process';
+
+/**
+ * Promise-based spawn collecting stdout/stderr, run through the REAL
+ * `spawn` implementation passed in (this file mocks node:child_process).
+ *
+ * PB02's live powershell check used to be `spawnSync`, but its SYNCHRONOUS
+ * pipe setup can fail with EBUSY on every single call on some Windows
+ * configurations (observed machine-wide, across Node 22 and 24, while async
+ * `spawn` with the same pipes kept working). Going through async `spawn`
+ * behaves identically everywhere.
+ */
+interface CollectResult {
+  status: number | null;
+  stdout: Buffer | string;
+  stderr: string;
+}
+
+function spawnCollect(
+  spawnFn: typeof spawn,
+  cmd: string,
+  args: string[],
+  opts: SpawnOptions & { encoding?: 'utf8' } = {},
+): Promise<CollectResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawnFn(cmd, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout!.on('data', (chunk: Buffer) => out.push(chunk));
+    child.stderr!.on('data', (chunk: Buffer) => err.push(chunk));
+    child.on('error', reject);
+    child.on('close', (status) => {
+      const stdout = Buffer.concat(out);
+      resolve({
+        status,
+        stdout: opts.encoding === 'utf8' ? stdout.toString('utf8') : stdout,
+        stderr: Buffer.concat(err).toString('utf8'),
+      });
+    });
+  });
+}
+
 import { BotInstance } from './bot/instance.js';
 import { AudioPlayer } from './audio/player.js';
 import { PlayMode } from './audio/queue.js';
@@ -126,7 +167,7 @@ it.each([PlayMode.Loop, PlayMode.RandomLoop])('PB05: open FFmpeg circuit stops a
   expect(b.connected).toBe(true);
 });
 
-it('PB02: generated downloader initializes HttpClient in a fresh Windows PowerShell process', () => {
+it('PB02: generated downloader initializes HttpClient in a fresh Windows PowerShell process', async () => {
   vi.mocked(spawn).mockClear();
   const p: any = new AudioPlayer(logger); cleanups.push(() => p.stop());
   p.playViaPowerShellDownload('https://fixture.invalid/jdymusic/song.mp3', 0, p.sessionId, false);
@@ -137,7 +178,13 @@ it('PB02: generated downloader initializes HttpClient in a fresh Windows PowerSh
   if (process.platform === 'win32') {
     // Run only construction/disposal: never execute the URL/download portion.
     const prefix = script.slice(0, script.indexOf('$client.Timeout'));
-    const result = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', prefix + '$client.Dispose(); Write-Output HTTPCLIENT_CREATED'], { encoding: 'utf8' });
+    const { spawn: realSpawn } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const result = await spawnCollect(
+      realSpawn,
+      'powershell',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', prefix + '$client.Dispose(); Write-Output HTTPCLIENT_CREATED'],
+      { encoding: 'utf8' },
+    );
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain('HTTPCLIENT_CREATED');
   }
