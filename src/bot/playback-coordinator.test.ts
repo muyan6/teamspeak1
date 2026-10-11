@@ -55,6 +55,24 @@ describe("PlaybackCoordinator", () => {
     await expect(followUp).resolves.toBe("recovered");
   });
 
+  it("invalidates a late continuation without cancelling the following task", async () => {
+    const coordinator = new PlaybackCoordinator(20);
+    let release!: () => void;
+    let lateMutation = false;
+    const late = coordinator.run(async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      coordinator.assertCurrent();
+      lateMutation = true;
+    });
+    const followUp = coordinator.run(async () => "recovered");
+
+    await expect(late).rejects.toBeInstanceOf(PlaybackTimeoutError);
+    await expect(followUp).resolves.toBe("recovered");
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(lateMutation).toBe(false);
+  });
+
   it("does not time out a task that finishes in time", async () => {
     const coordinator = new PlaybackCoordinator(200);
     await expect(coordinator.run(async () => 42)).resolves.toBe(42);
