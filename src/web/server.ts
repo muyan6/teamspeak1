@@ -133,7 +133,26 @@ export function createWebServer(options: WebServerOptions): WebServer {
   });
 
   app.get("/api/health", (_req, res) => {
-    res.json({ status: "ok", version: "0.1.0" });
+    // 探针（Nezha）只判断 HTTP 请求是否成功、不做响应体关键词匹配，所以依赖不可用时
+    // 必须回非 200：数据库读不出来、或已加载的机器人全部掉线，都说明服务已不可用。
+    // 「没有已加载的机器人」不算故障 —— 那是运维没启用，不是服务坏了。
+    const bots = options.botManager.getAllBots();
+    const connectedBots = bots.filter((bot) => bot.isConnected()).length;
+    let databaseOk = true;
+    try {
+      options.database.db.prepare("SELECT 1").get();
+    } catch {
+      databaseOk = false;
+    }
+    const ok = databaseOk && (bots.length === 0 || connectedBots > 0);
+    res.status(ok ? 200 : 503).json({
+      status: ok ? "ok" : "error",
+      version: "0.1.0",
+      checks: {
+        database: databaseOk,
+        bots: { total: bots.length, connected: connectedBots },
+      },
+    });
   });
 
   // Public on purpose: the login/guest screen needs the base URL before it has a
