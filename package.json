@@ -49,7 +49,7 @@
     "supertest": "^7.2.2",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "allowScripts": {
     "@discordjs/opus@0.10.0": true,
@@ -63,7 +63,10 @@
     "tar": "$tar",
     "music-metadata": "^11.16.1",
     "file-type": "^21.3.4",
-    "qs": "^6.15.4",
+    "qs": "^6.17.1",
+    "body-parser": "^2.4.0",
+    "follow-redirects": "^1.16.2",
+    "ip-address": "^10.7.6",
     "basic-ftp": "6.2.2",
     "proxy-addr": "^2.0.8",
     "source-map-js": "^1.2.2",
