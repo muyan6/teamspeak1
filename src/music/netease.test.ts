@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { parseLyrics, mapNeteaseAlbums, mapNeteaseSongs, parseNeteaseTrial, NeteaseProvider } from "./netease.js";
+import { parseLyrics, mapNeteaseAlbums, mapNeteaseSongs, parseNeteaseTrial, NeteaseProvider, withNeteaseTransport } from "./netease.js";
 
 describe("NetEase adapter", () => {
   it("parses LRC format lyrics", () => {
@@ -197,5 +197,57 @@ describe("NeteaseProvider.search pagination", () => {
     const res = await p.search("q");
     expect(res.songs).toEqual([]);
     expect(res.error?.message).toBe("boom");
+  });
+});
+
+describe("NetEase transport — weapi 通道与取流重试", () => {
+  it("withNeteaseTransport 给业务接口注入 crypto=weapi", () => {
+    expect(withNeteaseTransport({ id: "1", level: "standard" }, "/song/url/v1")).toEqual({
+      id: "1",
+      level: "standard",
+      crypto: "weapi",
+    });
+    // 已有 params 不被丢弃
+    expect(withNeteaseTransport(undefined, "/cloudsearch")).toEqual({ crypto: "weapi" });
+  });
+
+  it("登录 / 验证码接口保持侧车默认，不注入 crypto", () => {
+    expect(withNeteaseTransport({ timestamp: 1 }, "/login/qr/key")).toEqual({ timestamp: 1 });
+    expect(withNeteaseTransport({ phone: "1" }, "/captcha/sent")).toEqual({ phone: "1" });
+  });
+
+  it("getSongUrl 在 -460 之后退避重试并成功", async () => {
+    const p = new NeteaseProvider("http://x");
+    const get = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Request failed with status code 400"))
+      .mockResolvedValueOnce({ data: { data: [{ id: 1, url: "http://a/1.mp3" }] } });
+    (p as any).api = { get };
+
+    const res = await p.getSongUrl("1", "standard");
+
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(res).toEqual({ url: "http://a/1.mp3", trialDuration: undefined });
+    // 重试请求必须带缓存穿透参数，否则会命中侧车 2 分钟的 200 缓存
+    expect(get.mock.calls[1][1].params._t).toBeTruthy();
+    expect(get.mock.calls[0][1].params._t).toBeUndefined();
+  }, 15_000);
+
+  it("getSongUrl 三次全失败后抛错（由调用方跳过该曲）", async () => {
+    const p = new NeteaseProvider("http://x");
+    const get = vi.fn().mockRejectedValue(new Error("400"));
+    (p as any).api = { get };
+
+    await expect(p.getSongUrl("1", "standard")).rejects.toThrow("400");
+    expect(get).toHaveBeenCalledTimes(3);
+  }, 15_000);
+
+  it("200 但没有 url（无版权）不重试，直接返回 null", async () => {
+    const p = new NeteaseProvider("http://x");
+    const get = vi.fn().mockResolvedValue({ data: { data: [{ id: 1, url: null }] } });
+    (p as any).api = { get };
+
+    await expect(p.getSongUrl("1", "standard")).resolves.toBeNull();
+    expect(get).toHaveBeenCalledTimes(1);
   });
 });

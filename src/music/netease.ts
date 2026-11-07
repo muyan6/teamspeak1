@@ -135,6 +135,37 @@ export function parseNeteaseTrial(item: any): number | undefined {
   return Math.round(secs);
 }
 
+/**
+ * 取流失败后的退避重试序列（毫秒）。
+ *
+ * 侧车返回 `-460 检测到您的网络环境存在风险` 是瞬时风控，同一首歌隔一会儿
+ * 再请求就能拿到地址；单次失败就判定"这首歌不能放"会让 `playNext` 直接跳歌，
+ * 连跳几首就把队列跳空、播放器停在 idle（前端表现为"等待播放"）。两次退避
+ * 重试足以覆盖绝大部分抖动，又不会让一次真正的换歌卡太久（最多 +2.8s）。
+ */
+const SONG_URL_RETRY_DELAYS_MS = [800, 2000];
+
+/** 侧车对 `/song/url` 不做缓存，但会缓存 2 分钟内的 200 响应（apicache）。
+ *  重试时带上时间戳可以确保拿到的是新一轮判定而不是同一份结果。 */
+let neteaseCacheBuster = 0;
+
+/**
+ * 给侧车请求补上传输层参数：强制走 weapi 加密通道。
+ *
+ * NeteaseCloudMusicApi 的 `util/config.json` 里 `APP_CONF.encrypt: true`，于是
+ * `util/request.js` 默认把请求加密成 eapi 打到 `interface.music.163.com/eapi/...`。
+ * 网易云对这条通道做风控：同一批 `/song/url/v1` 请求里约一半直接返回
+ * `-460 检测到您的网络环境存在风险`（实测 eapi 每 12 发被拒 4~8 次，weapi 连续
+ * 36 发全过，且与请求间隔无关）。表现就是"点歌时好时坏、播完一首就停在等待播放"。
+ * 侧车支持按请求传 `crypto`（util/option.js），注入 weapi 即可绕开。
+ *
+ * 登录 / 验证码路径保持侧车默认：它们不走这条风控，也避免影响扫码登录流程。
+ */
+export function withNeteaseTransport<T>(params: T, path: string): T & { crypto?: string } {
+  if (path.startsWith("/login") || path.startsWith("/captcha")) return params as T & { crypto?: string };
+  return { ...(params as object), crypto: "weapi" } as T & { crypto?: string };
+}
+
 // NetEase quality levels: standard(128k) higher(192k) exhigh(320k) lossless(flac) hires(hi-res) jyeffect jymaster
 export const NETEASE_QUALITY_LEVELS = [
   { value: "standard", label: "标准 (128kbps)", bitrate: 128 },
@@ -162,6 +193,8 @@ export class NeteaseProvider implements MusicProvider {
     // cookie 使用。拦截器每次请求读取最新 cookie，登录/刷新后立即生效。
     // 用可选链是为了兼容单测里替换成不含 interceptors 的假 api 对象。
     this.api.interceptors?.request?.use?.((config) => {
+      // 强制走 weapi 通道（原因见 withNeteaseTransport 的注释）。
+      config.params = withNeteaseTransport(config.params, config.url ?? "");
       if (this.cookie) {
         const headers = (config.headers ?? {}) as Record<string, unknown> & { set?: (k: string, v: string) => void };
         if (typeof headers.set === "function") headers.set("Cookie", this.cookie);
@@ -245,13 +278,32 @@ export class NeteaseProvider implements MusicProvider {
 
   async getSongUrl(songId: string, quality?: string): Promise<SongUrlResult | null> {
     const level = quality ?? this.quality;
-    const res = await this.api.get("/song/url/v1", {
-      params: { id: songId, level },
-    });
-    const item = res.data?.data?.[0];
-    const url = item?.url;
-    if (!url) return null;
-    return { url, trialDuration: parseNeteaseTrial(item) };
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt <= SONG_URL_RETRY_DELAYS_MS.length; attempt++) {
+      if (attempt > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, SONG_URL_RETRY_DELAYS_MS[attempt - 1]));
+      }
+      try {
+        const res = await this.api.get("/song/url/v1", {
+          params: {
+            id: songId,
+            level,
+            // 首次请求保持原样（可吃侧车缓存）；重试时绕过缓存，确保是新一轮
+            // 上游判定，而不是把同一份失败/成功结果再拿一遍。
+            ...(attempt > 0 ? { _t: `${Date.now()}${neteaseCacheBuster++}` } : {}),
+          },
+        });
+        const item = res.data?.data?.[0];
+        const url = item?.url;
+        // 200 但拿不到 url：无版权 / 地区限制，重试没有意义。
+        if (!url) return null;
+        return { url, trialDuration: parseNeteaseTrial(item) };
+      } catch (err) {
+        // 抛错的是传输层失败（-460 风控返回 HTTP 400、超时、5xx），退避后再试。
+        lastError = err;
+      }
+    }
+    throw lastError;
   }
 
   async getSongDetail(songId: string): Promise<Song | null> {
