@@ -200,6 +200,10 @@ export class BotInstance extends EventEmitter {
   private reconnectSnapshot: ReconnectSnapshot | null = null;
   voteSkipUsers = new Set<string>();
   private isAdvancing = false;
+  /** `${platform}:${id}` of tracks already pushed back to the queue tail after a
+   *  failed URL resolve. Bounded to one requeue per track per connection so a
+   *  permanently unplayable song can't ping-pong between head and tail forever. */
+  private readonly requeuedAfterFailure = new Set<string>();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private idlePollTimer: ReturnType<typeof setTimeout> | null = null;
   private jellyfinReportPollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -812,6 +816,8 @@ export class BotInstance extends EventEmitter {
     this.queueNotificationsSuppressed = true;
     this.queue.clear();
     this.queueNotificationsSuppressed = false;
+    // A fresh connection starts with a fresh requeue budget.
+    this.requeuedAfterFailure.clear();
     this.sweepLocalAudio("disconnected");
     this.connected = false;
     if (!this.disconnectEmitted) {
@@ -2002,10 +2008,16 @@ export class BotInstance extends EventEmitter {
       this.voteSkipUsers.clear();
       const next = this.queue.next();
       if (next) {
+        // Tracks consumed by the retry loop, in order. When the whole window
+        // fails they go back to the tail instead of disappearing (see
+        // requeueFailedSongs) — a -460 / timeout used to eat the song silently
+        // and the listener had to find and re-request it.
+        const unresolved: QueuedSong[] = [];
         const result = await resolve(next);
         if (result.stale) return false;
         started = result.ok;
         if (!started) {
+          unresolved.push(next);
           for (let i = 0; i < maxRetries && this.connected; i++) {
             const retry = this.queue.next();
             if (!retry) break;
@@ -2015,9 +2027,11 @@ export class BotInstance extends EventEmitter {
               started = true;
               break;
             }
+            unresolved.push(retry);
           }
         }
         if (!started) {
+          this.requeueFailedSongs(unresolved);
           this.player.stop();
           this.profileManager.onSongChange(null).catch(() => {});
         } else if (this.isFmMode && this.queue.unplayedCount() <= 3) {
@@ -2060,6 +2074,41 @@ export class BotInstance extends EventEmitter {
       // preserved; only uploads no longer referenced anywhere are deleted.
       this.sweepLocalAudio("playback_finished");
       this.isAdvancing = false;
+    }
+  }
+
+  /**
+   * Push tracks whose URL could not be resolved back to the tail of the queue.
+   *
+   * `playNext` consumes a song with `queue.next()` before it knows whether the
+   * provider can hand out a stream URL, so an upstream hiccup (NetEase's -460
+   * risk control, a timeout, a 5xx) silently dropped the track from the queue.
+   * Requeueing keeps the user's request alive for the next advance.
+   *
+   * Each track is requeued at most once per connection: a song that is
+   * genuinely unplayable (no copyright, region-locked, removed) would otherwise
+   * be picked again on every advance and stall playback in a loop.
+   */
+  private requeueFailedSongs(songs: QueuedSong[]): void {
+    if (songs.length === 0) return;
+    let requeued = 0;
+    for (const song of songs) {
+      const key = `${song.platform}:${song.id}`;
+      if (this.requeuedAfterFailure.has(key)) continue;
+      this.requeuedAfterFailure.add(key);
+      try {
+        this.queue.add(song);
+        requeued++;
+      } catch (err) {
+        // Queue at capacity — dropping the track is better than failing the advance.
+        this.logger.warn({ err, songId: song.id }, "Failed to requeue unresolved track");
+      }
+    }
+    if (requeued > 0) {
+      this.logger.info(
+        { requeued, attempted: songs.length },
+        "Requeued tracks whose URL could not be resolved",
+      );
     }
   }
 

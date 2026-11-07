@@ -921,6 +921,69 @@ describe("BotInstance.playNext — spotify teardown on queue exhaust (R3-6)", ()
   });
 });
 
+describe("BotInstance.playNext — unresolved tracks are requeued", () => {
+  function makeFailCtx(songs: any[]) {
+    let i = 0;
+    return {
+      connected: true,
+      isAdvancing: false,
+      isFmMode: false,
+      playGeneration: 0,
+      currentSourceIsSpotify: false,
+      voteSkipUsers: new Set<string>(),
+      requeuedAfterFailure: new Set<string>(),
+      queue: {
+        next: vi.fn(() => (i < songs.length ? songs[i++] : null)),
+        add: vi.fn(),
+        unplayedCount: vi.fn(() => 0),
+      },
+      player: makePlayer(),
+      spotifyController: makeController(),
+      profileManager: { onSongChange: vi.fn(async () => {}) },
+      // Real resolveAndPlay bumps playGeneration before it can fail; the stale
+      // guard in playNext compares against it, so the mock has to as well.
+      resolveAndPlay: vi.fn(async function (this: any) {
+        this.playGeneration = (this.playGeneration ?? 0) + 1;
+        return false;
+      }),
+      sweepLocalAudio: vi.fn(),
+      emit: vi.fn(),
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      // playNext is invoked against this plain object, so the helper it calls
+      // on the same `this` has to be carried over from the prototype.
+      requeueFailedSongs: (BotInstance.prototype as any).requeueFailedSongs,
+    } as any;
+  }
+
+  it("pushes every consumed track back to the tail when no retry resolves", async () => {
+    const songs = [
+      { id: "1", platform: "netease" },
+      { id: "2", platform: "netease" },
+      { id: "3", platform: "netease" },
+      { id: "4", platform: "netease" },
+    ];
+    const ctx = makeFailCtx(songs);
+
+    const started = await playNext.call(ctx, 3);
+
+    expect(started).toBe(false);
+    // 1 primary + 3 retries, all consumed, all requeued
+    expect(ctx.queue.add).toHaveBeenCalledTimes(4);
+    expect(ctx.queue.add.mock.calls.map((c: any) => c[0].id)).toEqual(["1", "2", "3", "4"]);
+    expect(ctx.player.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("requeues a given track only once (no ping-pong with an unplayable song)", async () => {
+    const ctx = makeFailCtx([{ id: "1", platform: "netease" }]);
+    ctx.requeuedAfterFailure.add("netease:1");
+
+    await playNext.call(ctx, 0);
+
+    expect(ctx.queue.add).not.toHaveBeenCalled();
+    expect(ctx.player.stop).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("BotInstance.handleOccupancy — spotify auto-pause delegation (C4)", () => {
   function makeOccupancyCtx(currentPlatform: string, state: string) {
     return {
